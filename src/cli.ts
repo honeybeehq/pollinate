@@ -309,6 +309,7 @@ async function cmdJobs(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const status = stringFlag(args, "status") as JobStatus | undefined;
   const triggerId = stringFlag(args, "trigger");
   const last = numberFlag(args, "last") ?? DEFAULT_JOBS_LIST_LIMIT;
+  if (!Number.isInteger(last) || last < 1) throw new Error("--last must be a positive whole number of jobs to show, e.g. --last 1000");
   const found = await store.listJobs({ status, triggerId, last: last + 1 });
   const jobs = found.slice(0, last);
   const truncated = found.length > last ? `showing the newest ${last} jobs; more exist, use --last <n> to see more` : "";

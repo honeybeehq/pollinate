@@ -52,6 +52,23 @@ describe("CLI", () => {
     }
   });
 
+  test("jobs --last refuses zero instead of silently listing nothing", async () => {
+    await withTempStore(async (store, root) => {
+      const env = { ...process.env, POLLINATE_STORE_ROOT: root };
+      const cli = join(process.cwd(), "dist", "cli.js");
+      for (const id of ["one", "two", "three"]) {
+        await store.saveJob({ id, triggerId: "t", source: "manual", status: "completed", context: {}, queuedAt: new Date().toISOString() });
+      }
+
+      const refused = execFileAsync(process.execPath, [cli, "jobs", "--last", "0", "--json"], { env });
+      await expect(refused).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("--last must be a positive whole number") });
+
+      const limited = await execFileAsync(process.execPath, [cli, "jobs", "--last", "2", "--json"], { env });
+      expect(JSON.parse(limited.stdout)).toHaveLength(2);
+      expect(limited.stderr).toContain("more exist");
+    });
+  });
+
   test("create registers a trigger entirely from CLI flags", async () => {
     await withTempStore(async (_store, root) => {
       const out = join(root, "created.txt");
