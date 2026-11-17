@@ -42,6 +42,10 @@ export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
   retention: {
     jobsMaxAge: "14d",
     jobsKeepLastPerTrigger: 50,
+    jobsMaxPerTrigger: 500,
+    jobsMaxTotal: 20_000,
+    jobsWarnFiles: 25_000,
+    jobsWarnMb: 1024,
     jobsGcMs: 3_600_000,
     ledgerMaxMb: 64,
   },
@@ -84,6 +88,11 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
   };
 }
 
+function positiveOr(value: unknown, fallback: number): number {
+  const number = numberOr(value, fallback);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
 function normalizeRetention(raw: AnyRecord): RetentionConfig {
   const jobsMaxAge = stringOr(raw.jobsMaxAge ?? raw.jobs_max_age, DEFAULT_DAEMON_CONFIG.retention.jobsMaxAge);
   parseDuration(jobsMaxAge);
@@ -93,6 +102,10 @@ function normalizeRetention(raw: AnyRecord): RetentionConfig {
       0,
       Math.floor(numberOr(raw.jobsKeepLastPerTrigger ?? raw.jobs_keep_last_per_trigger, DEFAULT_DAEMON_CONFIG.retention.jobsKeepLastPerTrigger)),
     ),
+    jobsMaxPerTrigger: Math.max(0, Math.floor(numberOr(raw.jobsMaxPerTrigger ?? raw.jobs_max_per_trigger, DEFAULT_DAEMON_CONFIG.retention.jobsMaxPerTrigger))),
+    jobsMaxTotal: Math.max(0, Math.floor(numberOr(raw.jobsMaxTotal ?? raw.jobs_max_total, DEFAULT_DAEMON_CONFIG.retention.jobsMaxTotal))),
+    jobsWarnFiles: positiveOr(raw.jobsWarnFiles ?? raw.jobs_warn_files, DEFAULT_DAEMON_CONFIG.retention.jobsWarnFiles),
+    jobsWarnMb: positiveOr(raw.jobsWarnMb ?? raw.jobs_warn_mb, DEFAULT_DAEMON_CONFIG.retention.jobsWarnMb),
     jobsGcMs: numberOr(raw.jobsGcMs ?? raw.jobs_gc_ms, DEFAULT_DAEMON_CONFIG.retention.jobsGcMs),
     ledgerMaxMb: numberOr(raw.ledgerMaxMb ?? raw.ledger_max_mb, DEFAULT_DAEMON_CONFIG.retention.ledgerMaxMb),
   };

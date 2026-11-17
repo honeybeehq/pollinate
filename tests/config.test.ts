@@ -297,10 +297,14 @@ shell_args = ["-lc"]
     expect(config.execution).toMatchObject({ shell: "/bin/zsh", shellArgs: ["-lc"] });
   });
 
-  test("defaults [retention] to a 14-day / 50-per-trigger / hourly / 64MB policy", () => {
+  test("defaults [retention] to a 14-day / 50-floor / 500-per-trigger / 20,000-total / hourly / 64MB policy", () => {
     expect(DEFAULT_DAEMON_CONFIG.retention).toEqual({
       jobsMaxAge: "14d",
       jobsKeepLastPerTrigger: 50,
+      jobsMaxPerTrigger: 500,
+      jobsMaxTotal: 20_000,
+      jobsWarnFiles: 25_000,
+      jobsWarnMb: 1024,
       jobsGcMs: 3_600_000,
       ledgerMaxMb: 64,
     });
@@ -311,18 +315,44 @@ shell_args = ["-lc"]
     const camel = parseDaemonConfigToml(`[retention]
 jobsMaxAge = "7d"
 jobsKeepLastPerTrigger = 10
+jobsMaxPerTrigger = 100
+jobsMaxTotal = 900
+jobsWarnFiles = 5000
+jobsWarnMb = 256
 jobsGcMs = 60000
 ledgerMaxMb = 8
 `);
-    expect(camel.retention).toEqual({ jobsMaxAge: "7d", jobsKeepLastPerTrigger: 10, jobsGcMs: 60_000, ledgerMaxMb: 8 });
+    expect(camel.retention).toEqual({
+      jobsMaxAge: "7d",
+      jobsKeepLastPerTrigger: 10,
+      jobsMaxPerTrigger: 100,
+      jobsMaxTotal: 900,
+      jobsWarnFiles: 5000,
+      jobsWarnMb: 256,
+      jobsGcMs: 60_000,
+      ledgerMaxMb: 8,
+    });
 
     const snake = parseDaemonConfigToml(`[retention]
 jobs_max_age = "3d"
 jobs_keep_last_per_trigger = 5
+jobs_max_per_trigger = 20
+jobs_max_total = 300
+jobs_warn_files = 1000
+jobs_warn_mb = 64
 jobs_gc_ms = 45000
 ledger_max_mb = 4
 `);
-    expect(snake.retention).toEqual({ jobsMaxAge: "3d", jobsKeepLastPerTrigger: 5, jobsGcMs: 45_000, ledgerMaxMb: 4 });
+    expect(snake.retention).toEqual({
+      jobsMaxAge: "3d",
+      jobsKeepLastPerTrigger: 5,
+      jobsMaxPerTrigger: 20,
+      jobsMaxTotal: 300,
+      jobsWarnFiles: 1000,
+      jobsWarnMb: 64,
+      jobsGcMs: 45_000,
+      ledgerMaxMb: 4,
+    });
   });
 
   test("floors and clamps a negative jobsKeepLastPerTrigger to 0", () => {
@@ -330,6 +360,12 @@ ledger_max_mb = 4
 jobsKeepLastPerTrigger = -5.7
 `);
     expect(config.retention.jobsKeepLastPerTrigger).toBe(0);
+  });
+
+  test("falls back to the default warn limits when they are not positive", () => {
+    const config = parseDaemonConfigToml(`[retention]\njobsWarnFiles = 0\njobsWarnMb = -1\n`);
+    expect(config.retention.jobsWarnFiles).toBe(DEFAULT_DAEMON_CONFIG.retention.jobsWarnFiles);
+    expect(config.retention.jobsWarnMb).toBe(DEFAULT_DAEMON_CONFIG.retention.jobsWarnMb);
   });
 
   test("rejects an invalid retention.jobsMaxAge duration", () => {

@@ -13,6 +13,7 @@ import { isSidebarTab, readSidebarTab, toggleSidebar, writeSidebarTab, type Side
 import { runSidebarTui, type NewTriggerDraft, type SidebarData } from "./sidebarTui.js";
 import { applyWebhookTransform } from "./webhook.js";
 import { runForeground } from "./daemon.js";
+import { crashLoopStatus, jobStoreWarnings, readDaemonRuns, readJobStoreHealth, topTriggersByFiles, type DaemonRun } from "./daemon-health.js";
 import { SatelliteServer } from "./satellite.js";
 import { createWebhookHook, gcTemporaryHooks, randomHookToken, type HookCreateResult } from "./hooks.js";
 import { atomicWriteFile, pathExists, routerPluginsDir } from "./fsx.js";
@@ -58,6 +59,7 @@ type ParsedArgs = {
 };
 
 const TERMINAL = new Set<JobStatus>(["completed", "errored", "timed-out", "cancelled"]);
+const DEFAULT_JOBS_LIST_LIMIT = 100;
 
 async function main(argv = process.argv.slice(2)): Promise<void> {
   const args = parseArgs(argv);
@@ -306,25 +308,31 @@ async function cmdJobs(store: PollinateStore, args: ParsedArgs): Promise<void> {
   }
   const status = stringFlag(args, "status") as JobStatus | undefined;
   const triggerId = stringFlag(args, "trigger");
-  const last = numberFlag(args, "last");
-  const jobs = await store.listJobs({ status, triggerId, last });
-  print(args, jobs, renderJobList(jobs));
+  const last = numberFlag(args, "last") ?? DEFAULT_JOBS_LIST_LIMIT;
+  if (!Number.isInteger(last) || last < 1) throw new Error("--last must be a positive whole number of jobs to show, e.g. --last 1000");
+  const found = await store.listJobs({ status, triggerId, last: last + 1 });
+  const jobs = found.slice(0, last);
+  const truncated = found.length > last ? `showing the newest ${last} jobs; more exist, use --last <n> to see more` : "";
+  print(args, jobs, truncated ? `${renderJobList(jobs)}\n${c.dim(truncated)}` : renderJobList(jobs));
+  if (truncated && args.json) console.error(truncated);
 }
 
 async function cmdJobsGc(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const config = await store.daemonConfig();
   const maxAge = stringFlag(args, "max-age") ?? config.retention.jobsMaxAge;
   const keepLast = numberFlag(args, "keep-last") ?? config.retention.jobsKeepLastPerTrigger;
+  const maxPerTrigger = numberFlag(args, "max-per-trigger") ?? config.retention.jobsMaxPerTrigger;
   const dryRun = Boolean(args.flags["dry-run"]);
   const terminalOlderThanDays = parseDuration(maxAge) / 86_400_000;
-  const result = await store.garbageCollectJobs({ terminalOlderThanDays, keepLastPerTrigger: keepLast, dryRun });
+  const maxTotal = numberFlag(args, "max-total") ?? config.retention.jobsMaxTotal;
+  const result = await store.garbageCollectJobs({ terminalOlderThanDays, keepLastPerTrigger: keepLast, maxPerTrigger, maxTotal, dryRun });
   print(args, result, renderJobsGcResult(result, dryRun));
 }
 
 function renderJobsGcResult(result: JobRetentionResult, dryRun: boolean): string {
   const verb = dryRun ? "would remove" : "removed";
   const lines = [
-    `${dryRun ? c.dim("[dry run] ") : ""}${c.bold(verb)} ${result.deleted} terminal ${plural(result.deleted, "job")} older than ${c.dim(result.cutoff)} ${c.dim(`(kept ${result.kept})`)}`,
+    `${dryRun ? c.dim("[dry run] ") : ""}${c.bold(verb)} ${result.deleted} terminal ${plural(result.deleted, "job")} ${c.dim(`(${result.deletedByCap} over a cap, rest older than ${result.cutoff}; kept ${result.kept}, ${formatBytes(result.keptBytes)})`)}`,
   ];
   const triggerIds = Object.keys(result.perTrigger).sort();
   if (triggerIds.length) {
@@ -1144,22 +1152,51 @@ function renderGithubWebhookInstall(result: Awaited<ReturnType<typeof installGit
 }
 
 async function cmdStatus(store: PollinateStore, args: ParsedArgs): Promise<void> {
-  const [triggers, jobs, scheduleState, deliveryState] = await Promise.all([
+  const [triggers, census, scheduleState, deliveryState, config, runs, lastSweep] = await Promise.all([
     store.loadTriggers(),
-    store.listJobs({ last: 1000 }),
+    store.censusJobs(),
     store.readScheduleState(),
     store.readDeliveryState(),
+    store.daemonConfig(),
+    readDaemonRuns(store.root),
+    readJobStoreHealth(store.root),
   ]);
   const active = triggers.filter((trigger) => trigger.enabled);
-  const queued = jobs.filter((job) => job.status === "queued").length;
-  const running = jobs.filter((job) => job.status === "running" || job.status === "resolving-context").length;
+  const queued = census.byStatus.queued ?? 0;
+  const running = (census.byStatus.running ?? 0) + (census.byStatus["resolving-context"] ?? 0);
+  const topTriggers = topTriggersByFiles(census.byTrigger);
+  const restarts = crashLoopStatus(runs, liveDaemonPid(runs));
+  const warnings = [
+    ...jobStoreWarnings(census.files, census.bytes, config.retention, topTriggers),
+    ...(restarts.crashLoop ? [`daemon crash loop: ${restarts.uncleanExits} unclean exits in the last hour (last start ${restarts.lastUncleanAt})`] : []),
+    ...(!restarts.crashLoop && restarts.uncleanExits ? [`daemon exited uncleanly ${restarts.uncleanExits} time(s) in the last hour`] : []),
+  ];
   const status = {
     triggers: { total: triggers.length, enabled: active.length, disabled: triggers.length - active.length },
-    jobs: { queued, running },
+    jobs: { queued, running, files: census.files, bytes: census.bytes, topTriggers, lastSweepAt: lastSweep?.checkedAt },
+    daemon: restarts,
+    warnings,
     nextFires: Object.fromEntries(Object.entries(scheduleState).map(([id, state]) => [id, state.nextFireAt])),
     delivery: deliveryState,
   };
-  print(args, status, renderStatus(store, triggers, active.length, queued, running, scheduleState, deliveryState));
+  const store_ = `${census.files} files ${c.dim(sym.mid)} ${formatBytes(census.bytes)}${lastSweep ? c.dim(` ${sym.mid} swept ${relativeTime(lastSweep.checkedAt)}`) : ""}`;
+  print(args, status, renderStatus(store, triggers, active.length, queued, running, store_, warnings, scheduleState, deliveryState));
+}
+
+function liveDaemonPid(runs: DaemonRun[]): number | undefined {
+  for (const run of [...runs].reverse()) {
+    if (run.stoppedAt) continue;
+    try {
+      process.kill(run.pid, 0);
+      return run.pid;
+    } catch {}
+  }
+  return undefined;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1_073_741_824) return `${(bytes / 1_073_741_824).toFixed(1)} GB`;
+  return `${(bytes / 1_048_576).toFixed(1)} MB`;
 }
 
 function renderStatus(
@@ -1168,6 +1205,8 @@ function renderStatus(
   enabled: number,
   queued: number,
   running: number,
+  jobStore: string,
+  warnings: string[],
   scheduleState: Awaited<ReturnType<PollinateStore["readScheduleState"]>>,
   deliveryState: Awaited<ReturnType<PollinateStore["readDeliveryState"]>>,
 ): string {
@@ -1177,8 +1216,10 @@ function renderStatus(
     [
       field("triggers", `${c.bold(c.green(String(enabled)))} ${c.dim("enabled")} ${c.dim(sym.mid)} ${c.dim(`${disabled} disabled`)}`, 9),
       field("jobs", `${countTag(queued, "queued", c.blue)} ${c.dim(sym.mid)} ${countTag(running, "running", c.yellow)}`, 9),
+      field("job files", jobStore, 9),
       field("delivery", pending ? countTag(pending, "pending", c.yellow) : c.dim("idle"), 9),
       field("store", c.dim(store.root), 9),
+      ...warnings.map((warning) => say.warn(c.yellow(warning))),
     ],
     { title: "pollinate" },
   );
@@ -2052,8 +2093,8 @@ async function printHelp(): Promise<void> {
   out.push(
     helpSection("Fire & inspect", [
       ["trigger <id> [--dry-run]", "fire now; --payload '{…}' to pass data"],
-      ["jobs [--status <s>] [--last n]", "list recent jobs"],
-      ["jobs gc [--max-age 14d] [--keep-last 50] [--dry-run]", "remove old terminal job files"],
+      ["jobs [--status <s>] [--last 100]", "list recent jobs"],
+      ["jobs gc [--max-age 14d] [--keep-last 50] [--max-per-trigger 500] [--max-total 20000] [--dry-run]", "remove terminal job files by age and by the configured per-trigger and total caps (flags override config)"],
       ["job <jobId> | job cancel <id>", "inspect or cancel a job"],
       ["sidebar [--tab <t>]", "live TUI: triggers, active jobs, history (cmd+option+B)"],
       ["sidebar --toggle-sidebar", "open/close the tmux sidebar pane on the right"],

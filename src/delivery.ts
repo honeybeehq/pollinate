@@ -18,6 +18,7 @@ export class DeliveryManager {
   private runtime = new Map<string, RuntimeState>();
   private triggers = new Map<string, Trigger>();
   private restored = false;
+  private readonly inFlight = new Set<string>();
 
   constructor(
     private readonly store: PollinateStore,
@@ -48,6 +49,12 @@ export class DeliveryManager {
     if (mode.strategy === "debounced") return this.handleDebounced(trigger, activation);
     const neverMode: never = mode;
     throw new Error(`Unsupported delivery mode: ${JSON.stringify(neverMode)}`);
+  }
+
+  ownsJob(jobId: string): boolean {
+    if (this.inFlight.has(jobId)) return true;
+    for (const runtime of this.runtime.values()) if (runtime.queue.some((item) => item.job.id === jobId)) return true;
+    return false;
   }
 
   async shutdown(): Promise<void> {
@@ -200,6 +207,7 @@ export class DeliveryManager {
       const next = runtime.queue.shift();
       if (!next) return;
       runtime.running += 1;
+      this.inFlight.add(next.job.id);
       let handedOff = false;
       try {
         await this.saveQueue(trigger.id);
@@ -217,6 +225,7 @@ export class DeliveryManager {
             }).catch((ledgerError) => this.logAsyncError("job error ledger", next.trigger, ledgerError));
           })
           .finally(() => {
+            this.inFlight.delete(next.job.id);
             runtime.running = Math.max(0, runtime.running - 1);
             this.runDrain(trigger);
           });
@@ -225,7 +234,10 @@ export class DeliveryManager {
         await this.saveQueue(trigger.id).catch(() => undefined);
         throw error;
       } finally {
-        if (!handedOff) runtime.running = Math.max(0, runtime.running - 1);
+        if (!handedOff) {
+          this.inFlight.delete(next.job.id);
+          runtime.running = Math.max(0, runtime.running - 1);
+        }
       }
     }
   }

@@ -1,6 +1,7 @@
-import { stat } from "node:fs/promises";
-import { describe, expect, test } from "vitest";
-import { ledgerPath, rotateLedgerIfLarge, type Job, type JobStatus } from "../src/index.js";
+import { readFile, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { describe, expect, test, vi } from "vitest";
+import { jobsDir, ledgerPath, readJobSummary, rotateLedgerIfLarge, type Job, type JobStatus } from "../src/index.js";
 import { withTempStore } from "./helpers.js";
 
 function isoAgo(ms: number): string {
@@ -19,6 +20,18 @@ function job(overrides: Partial<Job> & { id: string; triggerId: string; status: 
 
 const DAY = 86_400_000;
 
+const failingReaddir = vi.hoisted(() => ({ path: undefined as string | undefined }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const readdir = (async (path: Parameters<typeof actual.readdir>[0], ...rest: unknown[]) => {
+    if (failingReaddir.path && String(path) === failingReaddir.path) {
+      throw Object.assign(new Error(`EMFILE: too many open files, scandir '${String(path)}'`), { code: "EMFILE" });
+    }
+    return (actual.readdir as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
+  }) as typeof actual.readdir;
+  return { ...actual, readdir };
+});
+
 describe("PollinateStore.garbageCollectJobs", () => {
   test("removes terminal jobs past max-age, keeping the newest N per trigger regardless of age", async () => {
     await withTempStore(async (store) => {
@@ -30,7 +43,7 @@ describe("PollinateStore.garbageCollectJobs", () => {
       await store.saveJob(job({ id: "t2-oldest", triggerId: "t2", status: "completed", queuedAt: isoAgo(40 * DAY), completedAt: isoAgo(40 * DAY) }));
       await store.saveJob(job({ id: "t2-newest", triggerId: "t2", status: "completed", queuedAt: isoAgo(25 * DAY), completedAt: isoAgo(25 * DAY) }));
 
-      const result = await store.garbageCollectJobs({ terminalOlderThanDays: 14, keepLastPerTrigger: 1 });
+      const result = await store.garbageCollectJobs({ terminalOlderThanDays: 14, keepLastPerTrigger: 1, liveTriggerIds: new Set(["t1", "t2"]) });
 
       expect(result.deletedJobIds.sort()).toEqual(["t1-older", "t1-oldest", "t2-oldest"]);
       expect(result.deleted).toBe(3);
@@ -86,6 +99,102 @@ describe("PollinateStore.garbageCollectJobs", () => {
   test("rejects a non-positive retention window", async () => {
     await withTempStore(async (store) => {
       await expect(store.garbageCollectJobs({ terminalOlderThanDays: 0 })).rejects.toThrow(/terminalOlderThanDays/);
+    });
+  });
+});
+
+describe("job store bounds", () => {
+  test("caps terminal jobs per trigger regardless of age and keeps the newest", async () => {
+    await withTempStore(async (store) => {
+      for (let i = 0; i < 6; i += 1) {
+        await store.saveJob(job({ id: `chatty-${i}`, triggerId: "chatty", status: "completed", queuedAt: isoAgo((10 - i) * 60_000), completedAt: isoAgo((10 - i) * 60_000) }));
+      }
+      await store.saveJob(job({ id: "chatty-live", triggerId: "chatty", status: "running", queuedAt: isoAgo(DAY) }));
+      await store.saveJob(job({ id: "quiet-0", triggerId: "quiet", status: "completed", completedAt: isoAgo(60_000) }));
+
+      const result = await store.garbageCollectJobs({ terminalOlderThanDays: 14, keepLastPerTrigger: 50, maxPerTrigger: 2 });
+
+      expect(result.deletedJobIds.sort()).toEqual(["chatty-0", "chatty-1", "chatty-2", "chatty-3"]);
+      expect(result.deletedByCap).toBe(4);
+      expect(result.perTrigger.chatty).toEqual({ deleted: 4, kept: 2 });
+      expect(result.kept).toBe(4);
+      expect((await store.listJobs({ triggerId: "chatty" })).map((j) => j.id)).toEqual(["chatty-5", "chatty-4", "chatty-live"]);
+    });
+  });
+
+  test("jobs of removed triggers age out without the keep-last floor, and a total cap bounds distinct one-fire triggers", async () => {
+    await withTempStore(async (store) => {
+      await store.addTriggerFromToml(`[trigger]\nid = "live"\n[trigger.source]\nkind = "manual"\n[trigger.action]\nkind = "emit"\nsubject = "x"\n`);
+      await store.saveJob(job({ id: "live-old", triggerId: "live", status: "completed", queuedAt: isoAgo(30 * DAY), completedAt: isoAgo(30 * DAY) }));
+      await store.saveJob(job({ id: "gone-old", triggerId: "gone", status: "completed", queuedAt: isoAgo(30 * DAY), completedAt: isoAgo(30 * DAY) }));
+      for (let i = 0; i < 40; i += 1) {
+        await store.saveJob(job({ id: `once-${i}`, triggerId: `once-${i}`, status: "completed", queuedAt: isoAgo((100 - i) * 60_000), completedAt: isoAgo((100 - i) * 60_000) }));
+      }
+
+      const byAge = await store.garbageCollectJobs({ terminalOlderThanDays: 14, keepLastPerTrigger: 50, maxPerTrigger: 500 });
+      expect(byAge.deletedJobIds).toEqual(["gone-old"]);
+
+      const byTotal = await store.garbageCollectJobs({ terminalOlderThanDays: 14, keepLastPerTrigger: 50, maxPerTrigger: 500, maxTotal: 10 });
+      const remaining = (await store.listJobs({ last: 100 })).map((j) => j.id).sort();
+      expect(remaining).toEqual(Array.from({ length: 10 }, (_, i) => `once-${30 + i}`).sort());
+      expect(byTotal.deletedByCap).toBe(31);
+    });
+  });
+
+  test("summaries come from the file head for new files and from a full parse for old key order", async () => {
+    await withTempStore(async (store, root) => {
+      const big = { blob: "x".repeat(20_000) };
+      await store.saveJob(job({ id: "AP.new", uuid: "0123456789abcdef0123456789abcdef", triggerId: "ap", status: "completed", batch: [big], completedAt: isoAgo(5) }));
+      const written = await readFile(join(jobsDir(root), "AP.new.json"), "utf8");
+      expect(Object.keys(JSON.parse(written)).slice(0, 4)).toEqual(["id", "uuid", "triggerId", "source"]);
+
+      const legacy = { id: "AP.old", triggerId: "ap", source: "manual", status: "running", context: big, queuedAt: isoAgo(5) };
+      await writeFile(join(jobsDir(root), "AP.old.json"), `${JSON.stringify(legacy, null, 2)}\n`);
+
+      expect(await readJobSummary(join(jobsDir(root), "AP.new.json"), "AP.new.json")).toMatchObject({ id: "AP.new", status: "completed", uuid: "0123456789abcdef0123456789abcdef" });
+      expect(await readJobSummary(join(jobsDir(root), "AP.old.json"), "AP.old.json")).toMatchObject({ id: "AP.old", status: "running", queuedAt: legacy.queuedAt });
+      expect((await store.getJob("0123"))?.id).toBe("AP.new");
+    });
+  });
+
+  test("gc drops job-id index entries whose job files are gone", async () => {
+    await withTempStore(async (store, root) => {
+      const kept = "11111111111111111111111111111111";
+      const orphan = "22222222222222222222222222222222";
+      await store.saveJob(job({ id: "KE.111", uuid: kept, triggerId: "keep", status: "completed", completedAt: isoAgo(5) }));
+      await writeFile(join(root, "state", "job-id-index.json"), JSON.stringify({ used: [kept, orphan] }));
+
+      const result = await store.garbageCollectJobs({ terminalOlderThanDays: 14 });
+
+      expect(result.prunedJobUuids).toBe(1);
+      expect(JSON.parse(await readFile(join(root, "state", "job-id-index.json"), "utf8")).used).toEqual([kept]);
+    });
+  });
+});
+
+describe("job store failure handling", () => {
+  test("a sweep that cannot list the trigger folder fails instead of treating every trigger as removed", async () => {
+    await withTempStore(async (store, root) => {
+      await store.addTriggerFromToml(`[trigger]\nid = "t1"\n[trigger.source]\nkind = "manual"\n[trigger.action]\nkind = "emit"\nsubject = "x"\n`);
+      await store.saveJob(job({ id: "t1-protected", triggerId: "t1", status: "completed", queuedAt: isoAgo(30 * DAY), completedAt: isoAgo(30 * DAY) }));
+      failingReaddir.path = join(root, "triggers");
+      try {
+        await expect(store.garbageCollectJobs({ terminalOlderThanDays: 14, keepLastPerTrigger: 50 })).rejects.toThrow(/EMFILE/);
+      } finally {
+        failingReaddir.path = undefined;
+      }
+      expect(await store.getJob("t1-protected")).not.toBeNull();
+    });
+  });
+
+  test("a malformed job file over 4 KB is skipped by listings and the sweep instead of failing them", async () => {
+    await withTempStore(async (store, root) => {
+      await store.saveJob(job({ id: "good", triggerId: "t1", status: "completed", completedAt: isoAgo(5) }));
+      await writeFile(join(jobsDir(root), "broken.json"), `{\n  "id": "\\x",\n  "context": "${"y".repeat(5_000)}"\n}\n`);
+
+      expect((await store.listJobs({ last: 10 })).map((j) => j.id)).toEqual(["good"]);
+      const result = await store.garbageCollectJobs({ terminalOlderThanDays: 14 });
+      expect(result.kept).toBe(1);
     });
   });
 });

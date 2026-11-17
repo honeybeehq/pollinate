@@ -306,6 +306,10 @@ export type RetentionConfig = {
   jobsMaxAge: string;
   /** Safety floor: newest N terminal jobs per trigger are kept regardless of age. */
   jobsKeepLastPerTrigger: number;
+  jobsMaxPerTrigger: number;
+  jobsMaxTotal: number;
+  jobsWarnFiles: number;
+  jobsWarnMb: number;
   /** How often the daemon runs the jobs/ledger retention sweep. */
   jobsGcMs: number;
   /** ledger.jsonl is rotated to ledger.jsonl.1 once it exceeds this size. */
