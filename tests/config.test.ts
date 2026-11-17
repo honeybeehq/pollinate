@@ -303,7 +303,7 @@ shell_args = ["-lc"]
       jobsKeepLastPerTrigger: 50,
       jobsMaxPerTrigger: 500,
       jobsMaxTotal: 20_000,
-      jobsWarnFiles: 15_000,
+      jobsWarnFiles: 25_000,
       jobsWarnMb: 1024,
       jobsGcMs: 3_600_000,
       ledgerMaxMb: 64,
