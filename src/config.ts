@@ -42,6 +42,10 @@ export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
   retention: {
     jobsMaxAge: "14d",
     jobsKeepLastPerTrigger: 50,
+    jobsMaxPerTrigger: 500,
+    jobsMaxTotal: 20_000,
+    jobsWarnFiles: 15_000,
+    jobsWarnMb: 1024,
     jobsGcMs: 3_600_000,
     ledgerMaxMb: 64,
   },
@@ -93,6 +97,10 @@ function normalizeRetention(raw: AnyRecord): RetentionConfig {
       0,
       Math.floor(numberOr(raw.jobsKeepLastPerTrigger ?? raw.jobs_keep_last_per_trigger, DEFAULT_DAEMON_CONFIG.retention.jobsKeepLastPerTrigger)),
     ),
+    jobsMaxPerTrigger: Math.max(0, Math.floor(numberOr(raw.jobsMaxPerTrigger ?? raw.jobs_max_per_trigger, DEFAULT_DAEMON_CONFIG.retention.jobsMaxPerTrigger))),
+    jobsMaxTotal: Math.max(0, Math.floor(numberOr(raw.jobsMaxTotal ?? raw.jobs_max_total, DEFAULT_DAEMON_CONFIG.retention.jobsMaxTotal))),
+    jobsWarnFiles: numberOr(raw.jobsWarnFiles ?? raw.jobs_warn_files, DEFAULT_DAEMON_CONFIG.retention.jobsWarnFiles),
+    jobsWarnMb: numberOr(raw.jobsWarnMb ?? raw.jobs_warn_mb, DEFAULT_DAEMON_CONFIG.retention.jobsWarnMb),
     jobsGcMs: numberOr(raw.jobsGcMs ?? raw.jobs_gc_ms, DEFAULT_DAEMON_CONFIG.retention.jobsGcMs),
     ledgerMaxMb: numberOr(raw.ledgerMaxMb ?? raw.ledger_max_mb, DEFAULT_DAEMON_CONFIG.retention.ledgerMaxMb),
   };

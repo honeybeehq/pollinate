@@ -8,16 +8,13 @@ import { nowIso, parseDuration } from "./time.js";
 import { appendTextLine, daemonLogPath, rotateLedgerIfLarge } from "./fsx.js";
 import { gcTemporaryHooks } from "./hooks.js";
 import { gcRouterBindings, routerGcSummary } from "./router-gc.js";
+import { jobStoreWarnings, recordDaemonStart, recordDaemonStop, topTriggersByFiles, writeJobStoreHealth } from "./daemon-health.js";
 import type { DaemonConfig, JobStatus, Trigger } from "./types.js";
 
 const STALE_JOB_RECOVERY_MS = 60_000;
-// recoverStaleJobs only ever needs non-terminal jobs, so listJobs({ statuses })
-// never materializes the (potentially huge) terminal job backlog into memory.
-// See the jobs-gc incident: 61,812 terminal job files under ~/.pollinate/jobs/
-// OOM'd the daemon at startup because listJobs() used to parse every job
-// before filtering.
 const NON_TERMINAL_JOB_STATUSES: JobStatus[] = ["queued", "resolving-context", "running"];
 const MS_PER_DAY = 86_400_000;
+const MIN_PRESSURE_GC_SPACING_MS = 60_000;
 let daemonProcessGuardsInstalled = false;
 
 export class PollinateDaemon {
@@ -33,6 +30,10 @@ export class PollinateDaemon {
   private bindingGcRunning = false;
   private jobsGcTimer?: NodeJS.Timeout;
   private jobsGcRunning = false;
+  private jobsGcLastStartedAt = 0;
+  private jobsGcPressureTimer?: NodeJS.Timeout;
+  private jobsAllocatedSinceGc = new Map<string, number>();
+  private jobsAllocatedTotalSinceGc = 0;
   private triggerSignature = "";
   private stopping = false;
   private daemonConfigSignature = "";
@@ -41,7 +42,14 @@ export class PollinateDaemon {
 
   async start(): Promise<void> {
     await this.store.ensure();
-    const recoveredJobs = await this.recoverStaleJobs();
+    const restarts = await recordDaemonStart(this.store.root).catch(() => ({ uncleanExits: 0, crashLoop: false }));
+    if (restarts.crashLoop) {
+      await this.store.appendLedger({ event: "pollinate.daemon.crash_loop", unclean_exits: restarts.uncleanExits });
+      await this.log(`WARNING crash loop: ${restarts.uncleanExits} unclean daemon exits in the last hour`);
+    } else if (restarts.uncleanExits > 0) {
+      await this.log(`previous daemon run exited uncleanly (${restarts.uncleanExits} unclean exits in the last hour)`);
+    }
+    const startedAtMs = Date.now();
     const config = await this.store.daemonConfig();
     await gcTemporaryHooks(this.store);
     const triggers = await this.store.loadTriggers();
@@ -51,6 +59,7 @@ export class PollinateDaemon {
       execution: config.execution,
     });
     this.config = config;
+    this.store.onJobAllocated = (triggerId) => this.noteJobAllocated(triggerId);
     this.daemonConfigSignature = signatureForConfig(config);
     this.executor = executor;
     this.triggers = triggers;
@@ -78,15 +87,21 @@ export class PollinateDaemon {
       webhook_bind: config.webhook.bind,
       webhook_port: config.webhook.port,
       webhook_relay_enabled: Boolean(config.webhook.relay.secret),
-      recovered_jobs: recoveredJobs,
     });
     await this.log(
-      `daemon started: ${triggers.length} triggers, webhook ${config.webhook.bind}:${config.webhook.port}, binding gc every ${config.defaults.bindingGcMs}ms, jobs gc every ${config.retention.jobsGcMs}ms${
-        recoveredJobs ? `, recovered ${recoveredJobs} stale jobs` : ""
-      }`,
+      `daemon started in ${Date.now() - startedAtMs}ms: ${triggers.length} triggers, webhook ${config.webhook.bind}:${config.webhook.port}, binding gc every ${config.defaults.bindingGcMs}ms, jobs gc every ${config.retention.jobsGcMs}ms`,
     );
     void this.runBindingGc();
-    void this.runJobsGc();
+    void this.runStartupJobMaintenance(startedAtMs);
+  }
+
+  private async runStartupJobMaintenance(startedAtMs: number): Promise<void> {
+    try {
+      await this.recoverStaleJobs(startedAtMs);
+    } catch (error) {
+      await this.log(`stale job recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    await this.runJobsGc("startup");
   }
 
   async stop(): Promise<void> {
@@ -95,11 +110,14 @@ export class PollinateDaemon {
     if (this.reloadTimer) clearInterval(this.reloadTimer);
     if (this.bindingGcTimer) clearInterval(this.bindingGcTimer);
     if (this.jobsGcTimer) clearInterval(this.jobsGcTimer);
+    if (this.jobsGcPressureTimer) clearTimeout(this.jobsGcPressureTimer);
+    this.store.onJobAllocated = undefined;
     await this.webhook?.stop();
     await this.poll?.stop();
     await this.schedule?.stop();
     await this.delivery?.shutdown();
     await this.store.appendLedger({ event: "pollinate.daemon.stopped" });
+    await recordDaemonStop(this.store.root).catch(() => undefined);
     await this.log("daemon stopped");
   }
 
@@ -165,37 +183,72 @@ export class PollinateDaemon {
     }
   }
 
-  /**
-   * Job + ledger retention sweep. This is what stops ~/.pollinate/jobs/ from
-   * growing without bound the way it did before the jobs-gc incident (61,812
-   * terminal job files, unbounded readdir+JSON.parse in listJobs() at daemon
-   * start OOM'd the process). Runs on retention.jobsGcMs (default hourly) and
-   * once more at startup; failures are logged, never thrown, so a bad
-   * retention config or a transient fs error can't take the daemon down.
-   */
-  private async runJobsGc(): Promise<void> {
+  private noteJobAllocated(triggerId: string): void {
+    const retention = this.config?.retention;
+    if (!retention || this.stopping) return;
+    const count = (this.jobsAllocatedSinceGc.get(triggerId) ?? 0) + 1;
+    this.jobsAllocatedSinceGc.set(triggerId, count);
+    this.jobsAllocatedTotalSinceGc += 1;
+    const triggerPressure = retention.jobsMaxPerTrigger > 0 && count >= Math.max(1, Math.floor(retention.jobsMaxPerTrigger / 2));
+    const totalPressure = retention.jobsMaxTotal > 0 && this.jobsAllocatedTotalSinceGc >= Math.max(1, Math.floor(retention.jobsMaxTotal / 4));
+    if ((!triggerPressure && !totalPressure) || this.jobsGcPressureTimer) return;
+    const reason = triggerPressure
+      ? `${triggerId} created ${count}+ jobs since the last sweep`
+      : `${this.jobsAllocatedTotalSinceGc}+ jobs created since the last sweep`;
+    const delay = Math.max(0, this.jobsGcLastStartedAt + MIN_PRESSURE_GC_SPACING_MS - Date.now());
+    this.jobsGcPressureTimer = setTimeout(() => {
+      this.jobsGcPressureTimer = undefined;
+      void this.runJobsGc(reason);
+    }, delay);
+  }
+
+  private async runJobsGc(reason?: string): Promise<void> {
     if (this.stopping || this.jobsGcRunning || !this.config) return;
     this.jobsGcRunning = true;
+    this.jobsGcLastStartedAt = Date.now();
+    this.jobsAllocatedSinceGc.clear();
+    this.jobsAllocatedTotalSinceGc = 0;
     try {
       const retention = this.config.retention;
       const terminalOlderThanDays = parseDuration(retention.jobsMaxAge) / MS_PER_DAY;
       const result = await this.store.garbageCollectJobs({
         terminalOlderThanDays,
         keepLastPerTrigger: retention.jobsKeepLastPerTrigger,
+        maxPerTrigger: retention.jobsMaxPerTrigger,
+        maxTotal: retention.jobsMaxTotal,
+      });
+      const topTriggers = topTriggersByFiles(
+        Object.fromEntries(Object.entries(result.perTrigger).map(([id, bucket]) => [id, { files: bucket.kept }])),
+      );
+      const warnings = jobStoreWarnings(result.kept, result.keptBytes, retention, topTriggers);
+      await writeJobStoreHealth(this.store.root, {
+        checkedAt: nowIso(),
+        files: result.kept,
+        bytes: result.keptBytes,
+        deleted: result.deleted,
+        topTriggers,
+        warnings,
       });
       if (result.deleted > 0) {
         await this.store.appendLedger({
           event: "pollinate.jobs.gc",
           deleted: result.deleted,
+          deleted_by_cap: result.deletedByCap,
           kept: result.kept,
+          kept_bytes: result.keptBytes,
           cutoff: result.cutoff,
           pruned_job_uuids: result.prunedJobUuids,
         });
-        await this.log(`jobs gc: removed ${result.deleted} terminal jobs older than ${result.cutoff} (kept ${result.kept})`);
+      }
+      await this.log(
+        `jobs store: ${result.kept} files, ${formatMb(result.keptBytes)}; gc removed ${result.deleted} (${result.deletedByCap} over the ${retention.jobsMaxPerTrigger}/trigger or ${retention.jobsMaxTotal} total cap, rest older than ${result.cutoff})${reason ? `; reason: ${reason}` : ""}`,
+      );
+      for (const warning of warnings) {
+        await this.store.appendLedger({ event: "pollinate.jobs.store_warning", warning, files: result.kept, bytes: result.keptBytes });
+        await this.log(`WARNING ${warning}`);
       }
       const rotated = await rotateLedgerIfLarge(this.store.root, retention.ledgerMaxMb);
       if (rotated) {
-        // Log after rotating (this line lands in the freshly recreated ledger.jsonl).
         await this.store.appendLedger({ event: "pollinate.ledger.rotated", max_mb: retention.ledgerMaxMb });
         await this.log(`ledger rotated: exceeded ${retention.ledgerMaxMb}MB, moved to ledger.jsonl.1`);
       }
@@ -219,13 +272,10 @@ export class PollinateDaemon {
   }
 
   private async recoverStaleJobs(now = Date.now(), staleMs = STALE_JOB_RECOVERY_MS): Promise<number> {
-    // statuses: NON_TERMINAL_JOB_STATUSES filters inside listJobs(), before a
-    // job is pushed into the result array — the (usually huge) terminal
-    // backlog is never held in memory here, only the handful of in-flight
-    // jobs a crash could have interrupted.
     const jobs = await this.store.listJobs({ statuses: NON_TERMINAL_JOB_STATUSES });
     let recovered = 0;
     for (const job of jobs) {
+      if (this.delivery?.ownsJob(job.id)) continue;
       const touchedAt = job.startedAt ?? job.queuedAt;
       const touchedMs = new Date(touchedAt).getTime();
       if (Number.isFinite(touchedMs) && now - touchedMs < staleMs) continue;
@@ -248,6 +298,10 @@ export class PollinateDaemon {
     if (recovered > 0) await this.log(`recovered ${recovered} stale non-terminal jobs`);
     return recovered;
   }
+}
+
+function formatMb(bytes: number): string {
+  return `${(bytes / 1_048_576).toFixed(1)} MB`;
 }
 
 function signatureForTriggers(triggers: Array<{ id: string; updatedAt: string; enabled: boolean }>): string {

@@ -9,6 +9,8 @@ export * from "./fsx.js";
 export * from "./hooks.js";
 export * from "./jsonpath.js";
 export * from "./job-ids.js";
+export * from "./job-scan.js";
+export * from "./daemon-health.js";
 export * from "./poll.js";
 export * from "./providers/github.js";
 export * from "./router.js";

@@ -20,13 +20,17 @@ import {
 import { idFromPath, parseDaemonConfigToml, parseTriggerToml, triggerToToml } from "./config.js";
 import type { CursorState, DaemonConfig, DeliveryState, Job, JobStatus, LedgerEvent, RouterBinding, ScheduleState, Trigger } from "./types.js";
 import { nowIso } from "./time.js";
-import { allocateJobIdentity, matchesJobReference, pruneJobIdIndex, type JobIdentity } from "./job-ids.js";
+import { allocateJobIdentity, jobUuidsOf, matchesJobReference, readJobIdIndexSnapshot, reconcileJobIdIndex, type JobIdentity } from "./job-ids.js";
+import { insertNewestFirst, jobFileNames, orderJobForWrite, readJobSummary, scanJobSummaries, type JobSummary } from "./job-scan.js";
 
 export type JobRetentionOptions = {
   /** Required opt-in retention window; terminal jobs newer than this are never deleted. */
   terminalOlderThanDays: number;
   /** Optional safety floor that keeps the newest N terminal jobs per trigger even when older than the window. */
   keepLastPerTrigger?: number;
+  maxPerTrigger?: number;
+  maxTotal?: number;
+  liveTriggerIds?: ReadonlySet<string>;
   now?: Date;
   /** Compute what would be removed without unlinking anything or pruning the job-id index. */
   dryRun?: boolean;
@@ -35,11 +39,20 @@ export type JobRetentionOptions = {
 export type JobRetentionResult = {
   cutoff: string;
   deleted: number;
+  deletedByCap: number;
   kept: number;
+  keptBytes: number;
   prunedJobUuids: number;
   deletedJobIds: string[];
   /** Per-trigger breakdown of terminal jobs removed vs. retained. */
   perTrigger: Record<string, { deleted: number; kept: number }>;
+};
+
+export type JobStoreCensus = {
+  files: number;
+  bytes: number;
+  byStatus: Partial<Record<JobStatus, number>>;
+  byTrigger: Record<string, { files: number; bytes: number }>;
 };
 
 type LedgerCache = {
@@ -52,6 +65,7 @@ type LedgerCache = {
 export class PollinateStore {
   readonly root: string;
   private ledgerCache?: LedgerCache;
+  onJobAllocated?: (triggerId: string) => void;
 
   constructor(root = storeRoot()) {
     this.root = root;
@@ -233,7 +247,7 @@ export class PollinateStore {
   async saveJob(job: Job): Promise<void> {
     await this.ensure();
     assertStoreId("job", job.id);
-    await writeJson(this.jobPath(job.id), job);
+    await writeJson(this.jobPath(job.id), orderJobForWrite(job));
   }
 
   async getRouterBinding(triggerId: string, subjectKey: string): Promise<RouterBinding | null> {
@@ -269,7 +283,9 @@ export class PollinateStore {
 
   async allocateJobIdentity(trigger: Trigger): Promise<JobIdentity> {
     await this.ensure();
-    return allocateJobIdentity({ root: this.root, trigger });
+    const identity = await allocateJobIdentity({ root: this.root, trigger });
+    this.onJobAllocated?.(trigger.id);
+    return identity;
   }
 
   async getJob(id: string): Promise<Job | null> {
@@ -291,27 +307,37 @@ export class PollinateStore {
     });
   }
 
-  /**
-   * `statuses` (unlike the singular `status`) filters before jobs are pushed
-   * into the result array, so callers that only need a small status subset
-   * (e.g. daemon startup recovery scanning for non-terminal jobs) never hold
-   * every terminal job in memory at once — see recoverStaleJobs.
-   */
   async listJobs(options: { status?: JobStatus; statuses?: JobStatus[]; triggerId?: string; last?: number } = {}): Promise<Job[]> {
     await this.ensure();
-    const entries = await readdir(jobsDir(this.root)).catch(() => []);
-    const statusSet = options.statuses ? new Set(options.statuses) : undefined;
-    const jobs: Job[] = [];
-    for (const entry of entries.filter((item) => item.endsWith(".json"))) {
-      const job = await readJsonOr<Job | null>(join(jobsDir(this.root), entry), null);
-      if (!job) continue;
-      if (options.status && job.status !== options.status) continue;
-      if (statusSet && !statusSet.has(job.status)) continue;
-      if (options.triggerId && job.triggerId !== options.triggerId) continue;
-      jobs.push(job);
+    const statusSet = new Set(options.statuses ?? (options.status ? [options.status] : []));
+    const last = options.last && options.last > 0 ? Math.floor(options.last) : 0;
+    const selected: JobSummary[] = [];
+    for await (const summary of scanJobSummaries(jobsDir(this.root))) {
+      if (statusSet.size && !statusSet.has(summary.status)) continue;
+      if (options.triggerId && summary.triggerId !== options.triggerId) continue;
+      insertNewestFirst(selected, summary, (item) => item.queuedAt ?? "", last);
     }
-    jobs.sort((a, b) => b.queuedAt.localeCompare(a.queuedAt));
-    return options.last ? jobs.slice(0, options.last) : jobs;
+    const jobs: Job[] = [];
+    for (const summary of selected) {
+      const job = await readJsonOr<Job | null>(join(jobsDir(this.root), summary.file), null);
+      if (job) jobs.push(job);
+    }
+    return jobs;
+  }
+
+  async censusJobs(): Promise<JobStoreCensus> {
+    await this.ensure();
+    const census: JobStoreCensus = { files: 0, bytes: 0, byStatus: {}, byTrigger: {} };
+    for await (const summary of scanJobSummaries(jobsDir(this.root))) {
+      census.files += 1;
+      census.bytes += summary.bytes;
+      census.byStatus[summary.status] = (census.byStatus[summary.status] ?? 0) + 1;
+      const bucket = census.byTrigger[summary.triggerId] ?? { files: 0, bytes: 0 };
+      bucket.files += 1;
+      bucket.bytes += summary.bytes;
+      census.byTrigger[summary.triggerId] = bucket;
+    }
+    return census;
   }
 
   async cancelJob(id: string): Promise<Job> {
@@ -335,65 +361,113 @@ export class PollinateStore {
 
   private async resolveJobReference(reference: string): Promise<Job | null> {
     await this.ensure();
-    const entries = await readdir(jobsDir(this.root)).catch(() => []);
-    const matches: Job[] = [];
-    for (const entry of entries.filter((item) => item.endsWith(".json"))) {
-      const job = await readJsonOr<Job | null>(join(jobsDir(this.root), entry), null);
-      if (job && matchesJobReference(job, reference)) matches.push(job);
+    const query = reference.trim();
+    if (!query) return null;
+    const matches: JobSummary[] = [];
+    for await (const file of jobFileNames(jobsDir(this.root))) {
+      if (!couldMatchJobReference(file.slice(0, -".json".length), query)) continue;
+      const summary = await readJobSummary(join(jobsDir(this.root), file), file);
+      if (summary && matchesJobReference(summary, query)) matches.push(summary);
     }
     if (matches.length === 0) return null;
-    if (matches.length === 1) return matches[0];
-    const ids = matches.map((job) => job.id).sort().join(", ");
-    throw new Error(`Job reference "${reference}" is ambiguous: ${ids}`);
+    if (matches.length > 1) {
+      const ids = matches.map((job) => job.id).sort().join(", ");
+      throw new Error(`Job reference "${reference}" is ambiguous: ${ids}`);
+    }
+    return readJsonOr<Job | null>(join(jobsDir(this.root), matches[0].file), null);
   }
 
   async garbageCollectJobs(options: JobRetentionOptions): Promise<JobRetentionResult> {
     if (!Number.isFinite(options.terminalOlderThanDays) || options.terminalOlderThanDays <= 0) {
       throw new Error("Job retention requires terminalOlderThanDays > 0");
     }
+    await this.ensure();
     const keepLastPerTrigger = Math.max(0, Math.floor(options.keepLastPerTrigger ?? 0));
+    const maxPerTrigger = Math.max(0, Math.floor(options.maxPerTrigger ?? 0));
+    const maxTotal = Math.max(0, Math.floor(options.maxTotal ?? 0));
     const now = options.now ?? new Date();
     const cutoffMs = now.getTime() - options.terminalOlderThanDays * 24 * 60 * 60_000;
     const cutoff = new Date(cutoffMs).toISOString();
-    const jobs = await this.listJobs();
-    const terminal = jobs.filter((job) => isTerminalJobStatus(job.status));
-    const protectedIds = keepLastPerTrigger > 0 ? newestTerminalJobsByTrigger(terminal, keepLastPerTrigger) : new Set<string>();
-    const deleteCandidates = terminal.filter((job) => {
-      if (protectedIds.has(job.id)) return false;
-      const finishedAt = job.completedAt ?? job.queuedAt;
-      return new Date(finishedAt).getTime() < cutoffMs;
-    });
-    const deleteSet = new Set(deleteCandidates.map((job) => job.id));
-
+    const dir = jobsDir(this.root);
+    const liveTriggerIds = options.liveTriggerIds ?? (await this.triggerIdsOnDisk());
+    const indexSnapshot = options.dryRun ? new Set<string>() : await readJobIdIndexSnapshot(this.root);
+    const liveUuids = new Set<string>();
+    const keptByTrigger = new Map<string, JobSummary[]>();
+    const keptOverall: JobSummary[] = [];
+    const perTrigger: Record<string, { deleted: number; kept: number }> = {};
     const deletedJobIds: string[] = [];
-    const deletedUuids: string[] = [];
-    for (const job of deleteCandidates) {
+    let files = 0;
+    let bytes = 0;
+    let deletedBytes = 0;
+    let deletedByCap = 0;
+
+    const remove = async (job: JobSummary, byCap: boolean) => {
       if (!options.dryRun) {
-        await unlink(this.jobPath(job.id)).catch((error) => {
+        await unlink(join(dir, job.file)).catch((error) => {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         });
       }
       deletedJobIds.push(job.id);
-      if (job.uuid) deletedUuids.push(job.uuid);
-    }
-    const prunedJobUuids = options.dryRun ? 0 : await pruneJobIdIndex(this.root, deletedUuids);
+      deletedBytes += job.bytes;
+      if (byCap) deletedByCap += 1;
+      perTrigger[job.triggerId].deleted += 1;
+      perTrigger[job.triggerId].kept -= 1;
+    };
+    const dropFrom = (list: JobSummary[] | undefined, job: JobSummary) => {
+      const at = list?.indexOf(job) ?? -1;
+      if (list && at >= 0) list.splice(at, 1);
+    };
 
-    const perTrigger: Record<string, { deleted: number; kept: number }> = {};
-    for (const job of terminal) {
+    for await (const job of scanJobSummaries(dir)) {
+      files += 1;
+      bytes += job.bytes;
+      if (!isTerminalJobStatus(job.status)) {
+        for (const uuid of jobUuidsOf(job)) liveUuids.add(uuid);
+        continue;
+      }
       if (!perTrigger[job.triggerId]) perTrigger[job.triggerId] = { deleted: 0, kept: 0 };
-      const bucket = perTrigger[job.triggerId];
-      if (deleteSet.has(job.id)) bucket.deleted += 1;
-      else bucket.kept += 1;
+      perTrigger[job.triggerId].kept += 1;
+      const kept = keptByTrigger.get(job.triggerId) ?? [];
+      keptByTrigger.set(job.triggerId, kept);
+      const overTriggerCap = insertNewestFirst(kept, job, finishedAt, maxPerTrigger);
+      if (overTriggerCap) {
+        if (overTriggerCap !== job) dropFrom(keptOverall, overTriggerCap);
+        await remove(overTriggerCap, true);
+        if (overTriggerCap === job) continue;
+      }
+      const overTotalCap = insertNewestFirst(keptOverall, job, finishedAt, maxTotal);
+      if (overTotalCap) {
+        const list = keptByTrigger.get(overTotalCap.triggerId);
+        dropFrom(list, overTotalCap);
+        if (list?.length === 0) keptByTrigger.delete(overTotalCap.triggerId);
+        await remove(overTotalCap, true);
+      }
     }
 
+    for (const [triggerId, kept] of keptByTrigger) {
+      const floor = liveTriggerIds.has(triggerId) ? keepLastPerTrigger : 0;
+      for (const [rank, job] of kept.entries()) {
+        if (rank >= floor && new Date(finishedAt(job)).getTime() < cutoffMs) await remove(job, false);
+        else for (const uuid of jobUuidsOf(job)) liveUuids.add(uuid);
+      }
+    }
+
+    const prunedJobUuids = options.dryRun ? 0 : await reconcileJobIdIndex(this.root, indexSnapshot, liveUuids);
     return {
       cutoff,
       deleted: deletedJobIds.length,
-      kept: jobs.length - deletedJobIds.length,
+      deletedByCap,
+      kept: files - deletedJobIds.length,
+      keptBytes: bytes - deletedBytes,
       prunedJobUuids,
       deletedJobIds,
       perTrigger,
     };
+  }
+
+  private async triggerIdsOnDisk(): Promise<Set<string>> {
+    const entries = await readdir(triggerDir(this.root)).catch(() => []);
+    return new Set(entries.filter((entry) => entry.endsWith(".toml")).map((entry) => entry.slice(0, -".toml".length)));
   }
 
   async appendLedger(event: LedgerEvent): Promise<void> {
@@ -502,21 +576,15 @@ function isTerminalJobStatus(status: JobStatus): boolean {
   return status === "completed" || status === "errored" || status === "timed-out" || status === "cancelled";
 }
 
-function newestTerminalJobsByTrigger(jobs: Job[], keepLastPerTrigger: number): Set<string> {
-  const byTrigger = new Map<string, Job[]>();
-  for (const job of jobs) {
-    const group = byTrigger.get(job.triggerId) ?? [];
-    group.push(job);
-    byTrigger.set(job.triggerId, group);
-  }
-  const keep = new Set<string>();
-  for (const group of byTrigger.values()) {
-    group
-      .sort((a, b) => (b.completedAt ?? b.queuedAt).localeCompare(a.completedAt ?? a.queuedAt))
-      .slice(0, keepLastPerTrigger)
-      .forEach((job) => keep.add(job.id));
-  }
-  return keep;
+function finishedAt(job: Pick<JobSummary, "completedAt" | "queuedAt">): string {
+  return job.completedAt ?? job.queuedAt ?? "";
+}
+
+function couldMatchJobReference(fileId: string, query: string): boolean {
+  const dot = fileId.indexOf(".");
+  const display = dot >= 0 ? fileId.slice(dot + 1) : fileId;
+  if (!/^[0-9a-f]+$/.test(display)) return true;
+  return query.startsWith(fileId) || query.startsWith(display) || fileId.startsWith(query);
 }
 
 async function readLedgerTail(path: string, lines: number): Promise<string[]> {

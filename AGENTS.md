@@ -29,6 +29,8 @@ everything here is otherwise only discoverable by reading the source.
   state/cursors.json              poll cursors
   state/job-id-index.json         UUIDs used for visible job ID suffixes
   state/job-id-index.lock         lock for the job ID index
+  state/jobs-store.json           last retention sweep: job file count, bytes, largest triggers, warnings
+  state/daemon-runs.json          last 20 daemon starts/clean stops (crash-loop detection)
   state/trigger-locks/<id>.lock   per-trigger write locks
   state/job-locks/<jobId>.lock    per-job write locks
   state/router-bindings/<trigger>/<subject>.json   binding records
@@ -48,15 +50,15 @@ everything here is otherwise only discoverable by reading the source.
 |---|---|
 | `pol add / create / list / get / enable / disable / edit / remove` | trigger CRUD; `edit` validates the TOML on editor exit |
 | `pol trigger <id> [--payload '{…}'] [--dry-run]` | fire manually |
-| `pol jobs / job <id> / job cancel <id>` | job inspection |
-| `pol jobs gc [--max-age 14d] [--keep-last 50] [--dry-run]` | remove old terminal job files (see Job retention) |
+| `pol jobs [--last 100] / job <id> / job cancel <id>` | job inspection; `pol jobs` lists the newest 100 unless `--last` says otherwise |
+| `pol jobs gc [--max-age 14d] [--keep-last 50] [--max-per-trigger 500] [--max-total 20000] [--dry-run]` | remove terminal job files (see Job retention) |
 | `pol bindings [--trigger <id>] / bindings get <id>` | router binding inspection |
 | `pol routers [list] / routers init <name>` | router plugin management |
 | `pol hooks / hook create|inbox|wait|gc|test` | webhook endpoints, temporary hooks |
 | `pol github create-pr-router / install-pr-router` | PR review router scaffolding + GitHub webhook install |
 | `pol daemon install|uninstall|start|stop|restart|status|logs|run` | service management |
 | `pol satellite run --target … --secret …` | public relay → local daemon |
-| `pol status / ledger [-n N] [--follow]` | dashboard / event stream |
+| `pol status / ledger [-n N] [--follow]` | dashboard (incl. job file count, size, store and crash-loop warnings) / event stream |
 
 Answering "why didn't my trigger fire?": check `pol ledger -n 200` for
 `delivery.filtered`, `router.open_filtered`, `webhook.rejected`,
@@ -297,44 +299,58 @@ PATH = "…"
 
 [retention]
 jobsMaxAge = "14d"           # terminal jobs older than this are GC-eligible
-jobsKeepLastPerTrigger = 50  # safety floor: newest N terminal jobs/trigger are kept regardless of age
+jobsKeepLastPerTrigger = 50  # floor: newest N terminal jobs of each *existing* trigger survive the age rule
+jobsMaxPerTrigger = 500      # cap: only the newest N terminal jobs per trigger id are kept, regardless of age
+jobsMaxTotal = 20000         # cap: only the newest N terminal jobs overall are kept, regardless of age or trigger
+jobsWarnFiles = 15000        # warn (daemon.log, ledger, pol status) when the jobs folder holds this many files
+jobsWarnMb = 1024            # ... or this many MB
 jobsGcMs = 3600000           # jobs + ledger retention sweep interval (default: hourly)
 ledgerMaxMb = 64             # ledger.jsonl is rotated to ledger.jsonl.1 past this size
 ```
 
 ## Job retention
 
-`~/.pollinate/jobs/<jobId>.json` accumulates one file per execution and is
-**never pruned automatically except by this GC** — a daemon that runs for
-months without it will eventually `readdir` + `JSON.parse` tens of thousands
-of files on every `pol jobs` listing and on every startup (`recoverStaleJobs`
-scans for stuck jobs), which is exactly what caused a production OOM
-crash-loop (61,812 accumulated terminal job files).
+`~/.pollinate/jobs/<jobId>.json` gets one file per execution. Nothing but this
+sweep removes them. In November 2026, 56,531 files (3.4 GB, one PR router made
+46k of them inside 14 days) made every daemon start parse all of them and run
+out of heap; launchd restarted it every 16 s for seven hours.
 
-- The daemon runs a jobs + ledger retention sweep on `retention.jobsGcMs`
-  (default hourly) and once immediately at startup, in addition to the
-  binding GC. Only **terminal** jobs (`completed`, `errored`, `timed-out`,
-  `cancelled`) are ever touched — `queued`, `resolving-context`, and
-  `running` jobs are never removed.
-- A terminal job is eligible once it's older than `retention.jobsMaxAge`
-  (by `completedAt`, falling back to `queuedAt`), *unless* it's one of the
-  newest `retention.jobsKeepLastPerTrigger` terminal jobs for its trigger —
-  that floor keeps `pol job <id>` / sidebar history usable even if a trigger
-  has been idle for a while.
+- Job files are written with the small fields first (`id`, `uuid`, `triggerId`,
+  `source`, `status`, `queuedAt`, `startedAt`, `completedAt`). Scans (startup
+  recovery, the sweep, `pol jobs`, `pol status`, `pol job <ref>`, job-id
+  repair) read only the first 4 KB of each file and stream the folder; files
+  in the older key order fall back to reading that one file. Only the jobs a
+  listing returns are parsed in full, so memory does not grow with the number
+  of files.
+- The daemon listens first, then recovers stale jobs and runs the sweep in the
+  background at startup, then every `retention.jobsGcMs`. A trigger that
+  creates `jobsMaxPerTrigger / 2` jobs, or all triggers together
+  `jobsMaxTotal / 4`, since the last sweep start an early sweep (at most one a
+  minute). Failures are logged and never crash the daemon.
+- Only **terminal** jobs (`completed`, `errored`, `timed-out`, `cancelled`) are
+  ever removed. Rules, in order of strength:
+  1. caps: beyond the newest `jobsMaxPerTrigger` of a trigger id, or the newest
+     `jobsMaxTotal` overall, a job is removed whatever its age (by
+     `completedAt`, falling back to `queuedAt`);
+  2. age: a job older than `jobsMaxAge` is removed unless it is one of the
+     newest `jobsKeepLastPerTrigger` of a trigger that still has a trigger
+     file. Jobs of removed triggers (one-shot hooks, cancelled wake-ups) get no
+     floor and age out.
+- Each sweep removes job-id index entries whose job files are gone, and writes
+  `state/jobs-store.json`. The daemon log gets one `jobs store: N files, X MB`
+  line per sweep and a `WARNING` line (plus ledger `pollinate.jobs.store_warning`)
+  past `jobsWarnFiles` / `jobsWarnMb`.
+- Crash loops: every start is recorded in `state/daemon-runs.json`; a start that
+  finds 3+ runs without a clean stop in 10 minutes logs `WARNING crash loop` and
+  ledgers `pollinate.daemon.crash_loop`. `pol status` reads the same file, so it
+  shows unclean exits even while the daemon is down.
 - Ledger rotation is size-based: once `ledger.jsonl` exceeds
   `retention.ledgerMaxMb`, it's renamed to `ledger.jsonl.1` (replacing any
   previous generation) and lazily recreated on the next append. `pol ledger`
-  only reads the active file; `ledger.jsonl.1` is a manually-inspectable
-  backstop, not part of `pol ledger`'s output.
-- Failures in the sweep are logged (`pol daemon logs`) and never crash the
-  daemon.
+  only reads the active file.
 - Manual control: `pol jobs gc [--max-age <dur>] [--keep-last <n>]
-  [--dry-run]`. Flags default to the `[retention]` config; `--dry-run` reports
-  what would be removed, per trigger, without deleting anything.
-- `recoverStaleJobs` (startup stuck-job recovery) queries
-  `store.listJobs({ statuses: [...] })` for the non-terminal statuses only,
-  so it never has to hold the terminal backlog in memory even before the
-  first GC sweep runs.
+  [--max-per-trigger <n>] [--max-total <n>] [--dry-run]`. Flags default to the
+  `[retention]` config; `--dry-run` reports what would be removed, per trigger.
 
 ## Ledger events
 
@@ -349,8 +365,8 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 - `pollinate.hook.{created,delivered,expired,gc_removed}`
 - `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,already_bound,unbound,open_filtered,activity_errored,gc}`
 - `pollinate.router.plugin.created` · `pollinate.github.webhook.installed`
-- `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored}`
-- `pollinate.jobs.gc` · `pollinate.ledger.rotated` (job/ledger retention, see Job retention)
+- `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored,crash_loop}`
+- `pollinate.jobs.{gc,store_warning}` · `pollinate.ledger.rotated` (job/ledger retention, see Job retention)
 - `pollinate.comb.run_started` (fresh created runs only; joined/replayed
   deliveries do not emit it)
 - `pollinate.emit` (from `emit` actions)
