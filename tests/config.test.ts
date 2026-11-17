@@ -362,6 +362,12 @@ jobsKeepLastPerTrigger = -5.7
     expect(config.retention.jobsKeepLastPerTrigger).toBe(0);
   });
 
+  test("falls back to the default warn limits when they are not positive", () => {
+    const config = parseDaemonConfigToml(`[retention]\njobsWarnFiles = 0\njobsWarnMb = -1\n`);
+    expect(config.retention.jobsWarnFiles).toBe(DEFAULT_DAEMON_CONFIG.retention.jobsWarnFiles);
+    expect(config.retention.jobsWarnMb).toBe(DEFAULT_DAEMON_CONFIG.retention.jobsWarnMb);
+  });
+
   test("rejects an invalid retention.jobsMaxAge duration", () => {
     expect(() => parseDaemonConfigToml(`[retention]\njobsMaxAge = "not-a-duration"\n`)).toThrow(/Invalid duration/);
   });

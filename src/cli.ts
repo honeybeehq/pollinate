@@ -309,8 +309,11 @@ async function cmdJobs(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const status = stringFlag(args, "status") as JobStatus | undefined;
   const triggerId = stringFlag(args, "trigger");
   const last = numberFlag(args, "last") ?? DEFAULT_JOBS_LIST_LIMIT;
-  const jobs = await store.listJobs({ status, triggerId, last });
-  print(args, jobs, renderJobList(jobs));
+  const found = await store.listJobs({ status, triggerId, last: last + 1 });
+  const jobs = found.slice(0, last);
+  const truncated = found.length > last ? `showing the newest ${last} jobs; more exist, use --last <n> to see more` : "";
+  print(args, jobs, truncated ? `${renderJobList(jobs)}\n${c.dim(truncated)}` : renderJobList(jobs));
+  if (truncated && args.json) console.error(truncated);
 }
 
 async function cmdJobsGc(store: PollinateStore, args: ParsedArgs): Promise<void> {
@@ -2090,7 +2093,7 @@ async function printHelp(): Promise<void> {
     helpSection("Fire & inspect", [
       ["trigger <id> [--dry-run]", "fire now; --payload '{…}' to pass data"],
       ["jobs [--status <s>] [--last 100]", "list recent jobs"],
-      ["jobs gc [--max-age 14d] [--keep-last 50] [--max-per-trigger 500] [--max-total 20000] [--dry-run]", "remove old terminal job files"],
+      ["jobs gc [--max-age 14d] [--keep-last 50] [--max-per-trigger 500] [--max-total 20000] [--dry-run]", "remove terminal job files by age and by the configured per-trigger and total caps (flags override config)"],
       ["job <jobId> | job cancel <id>", "inspect or cancel a job"],
       ["sidebar [--tab <t>]", "live TUI: triggers, active jobs, history (cmd+option+B)"],
       ["sidebar --toggle-sidebar", "open/close the tmux sidebar pane on the right"],

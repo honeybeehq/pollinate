@@ -50,8 +50,8 @@ everything here is otherwise only discoverable by reading the source.
 |---|---|
 | `pol add / create / list / get / enable / disable / edit / remove` | trigger CRUD; `edit` validates the TOML on editor exit |
 | `pol trigger <id> [--payload '{…}'] [--dry-run]` | fire manually |
-| `pol jobs [--last 100] / job <id> / job cancel <id>` | job inspection; `pol jobs` lists the newest 100 unless `--last` says otherwise |
-| `pol jobs gc [--max-age 14d] [--keep-last 50] [--max-per-trigger 500] [--max-total 20000] [--dry-run]` | remove terminal job files (see Job retention) |
+| `pol jobs [--last 100] / job <id> / job cancel <id>` | job inspection; `pol jobs` lists the newest 100 unless `--last` says otherwise, and says so (stderr with `--json`) when more exist |
+| `pol jobs gc [--max-age 14d] [--keep-last 50] [--max-per-trigger 500] [--max-total 20000] [--dry-run]` | remove terminal job files by age and by the per-trigger and total caps; unset flags come from `[retention]`, so the caps apply even when only `--max-age`/`--keep-last` are given (see Job retention) |
 | `pol bindings [--trigger <id>] / bindings get <id>` | router binding inspection |
 | `pol routers [list] / routers init <name>` | router plugin management |
 | `pol hooks / hook create|inbox|wait|gc|test` | webhook endpoints, temporary hooks |

@@ -274,26 +274,29 @@ export class PollinateDaemon {
   private async recoverStaleJobs(now = Date.now(), staleMs = STALE_JOB_RECOVERY_MS): Promise<number> {
     const jobs = await this.store.listJobs({ statuses: NON_TERMINAL_JOB_STATUSES });
     let recovered = 0;
-    for (const job of jobs) {
-      if (this.delivery?.ownsJob(job.id)) continue;
-      const touchedAt = job.startedAt ?? job.queuedAt;
-      const touchedMs = new Date(touchedAt).getTime();
-      if (Number.isFinite(touchedMs) && now - touchedMs < staleMs) continue;
-      const previousStatus = job.status;
-      const error = `daemon restarted mid-execution; marking stale ${previousStatus} job errored`;
-      await this.store.updateJob(job.id, {
-        status: "errored",
-        error,
-        completedAt: nowIso(),
-      });
-      await this.store.appendLedger({
-        event: "pollinate.job.errored",
-        job_id: job.id,
-        trigger_id: job.triggerId,
-        error,
-        recovered_from: previousStatus,
-      });
-      recovered += 1;
+    for (const listed of jobs) {
+      try {
+        if (this.delivery?.ownsJob(listed.id)) continue;
+        const job = await this.store.getJob(listed.id);
+        if (!job || !NON_TERMINAL_JOB_STATUSES.includes(job.status)) continue;
+        const touchedAt = job.startedAt ?? job.queuedAt;
+        const touchedMs = new Date(touchedAt).getTime();
+        if (Number.isFinite(touchedMs) && now - touchedMs < staleMs) continue;
+        const previousStatus = job.status;
+        const error = `daemon restarted mid-execution; marking stale ${previousStatus} job errored`;
+        const updated = await this.store.updateJob(job.id, { status: "errored", error, completedAt: nowIso() }, { onlyFrom: NON_TERMINAL_JOB_STATUSES });
+        if (updated.status !== "errored" || updated.error !== error) continue;
+        await this.store.appendLedger({
+          event: "pollinate.job.errored",
+          job_id: job.id,
+          trigger_id: job.triggerId,
+          error,
+          recovered_from: previousStatus,
+        });
+        recovered += 1;
+      } catch (error) {
+        await this.log(`stale job recovery failed for ${listed.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     if (recovered > 0) await this.log(`recovered ${recovered} stale non-terminal jobs`);
     return recovered;

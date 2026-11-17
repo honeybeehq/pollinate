@@ -294,13 +294,14 @@ export class PollinateStore {
     return this.resolveJobReference(id);
   }
 
-  async updateJob(id: string, patch: Partial<Job>): Promise<Job> {
+  async updateJob(id: string, patch: Partial<Job>, options: { onlyFrom?: readonly JobStatus[] } = {}): Promise<Job> {
     const current = await this.getJob(id);
     if (!current) throw new Error(`No job found with id "${id}"`);
     return withFileLock(this.jobLockPath(current.id), async () => {
       const fresh = await this.getJob(current.id);
       if (!fresh) throw new Error(`No job found with id "${current.id}"`);
       if (fresh.status === "cancelled" && patch.status && patch.status !== "cancelled") return fresh;
+      if (options.onlyFrom && !options.onlyFrom.includes(fresh.status)) return fresh;
       const updated = { ...fresh, ...patch };
       await this.saveJob(updated);
       return updated;
@@ -401,12 +402,9 @@ export class PollinateStore {
     let deletedBytes = 0;
     let deletedByCap = 0;
 
-    const remove = async (job: JobSummary, byCap: boolean) => {
-      if (!options.dryRun) {
-        await unlink(join(dir, job.file)).catch((error) => {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        });
-      }
+    const filesToUnlink: string[] = [];
+    const remove = (job: JobSummary, byCap: boolean) => {
+      filesToUnlink.push(job.file);
       deletedJobIds.push(job.id);
       deletedBytes += job.bytes;
       if (byCap) deletedByCap += 1;
@@ -432,7 +430,7 @@ export class PollinateStore {
       const overTriggerCap = insertNewestFirst(kept, job, finishedAt, maxPerTrigger);
       if (overTriggerCap) {
         if (overTriggerCap !== job) dropFrom(keptOverall, overTriggerCap);
-        await remove(overTriggerCap, true);
+        remove(overTriggerCap, true);
         if (overTriggerCap === job) continue;
       }
       const overTotalCap = insertNewestFirst(keptOverall, job, finishedAt, maxTotal);
@@ -440,18 +438,25 @@ export class PollinateStore {
         const list = keptByTrigger.get(overTotalCap.triggerId);
         dropFrom(list, overTotalCap);
         if (list?.length === 0) keptByTrigger.delete(overTotalCap.triggerId);
-        await remove(overTotalCap, true);
+        remove(overTotalCap, true);
       }
     }
 
     for (const [triggerId, kept] of keptByTrigger) {
       const floor = liveTriggerIds.has(triggerId) ? keepLastPerTrigger : 0;
       for (const [rank, job] of kept.entries()) {
-        if (rank >= floor && new Date(finishedAt(job)).getTime() < cutoffMs) await remove(job, false);
+        if (rank >= floor && new Date(finishedAt(job)).getTime() < cutoffMs) remove(job, false);
         else for (const uuid of jobUuidsOf(job)) liveUuids.add(uuid);
       }
     }
 
+    if (!options.dryRun) {
+      for (const file of filesToUnlink) {
+        await unlink(join(dir, file)).catch((error) => {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        });
+      }
+    }
     const prunedJobUuids = options.dryRun ? 0 : await reconcileJobIdIndex(this.root, indexSnapshot, liveUuids);
     return {
       cutoff,
@@ -466,7 +471,10 @@ export class PollinateStore {
   }
 
   private async triggerIdsOnDisk(): Promise<Set<string>> {
-    const entries = await readdir(triggerDir(this.root)).catch(() => []);
+    const entries = await readdir(triggerDir(this.root)).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [] as string[];
+      throw error;
+    });
     return new Set(entries.filter((entry) => entry.endsWith(".toml")).map((entry) => entry.slice(0, -".toml".length)));
   }
 

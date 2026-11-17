@@ -78,11 +78,9 @@ export async function readJobSummary(path: string, file: string): Promise<JobSum
   } catch {
     return null;
   }
-  if (bytes > HEAD_BYTES) {
-    const fromHead = summaryFromHead(head, file, bytes);
-    if (fromHead) return fromHead;
-  }
   try {
+    const fromHead = bytes > HEAD_BYTES ? summaryFromHead(head, file, bytes) : null;
+    if (fromHead) return fromHead;
     const buffer = bytes > HEAD_BYTES ? await readFile(path) : Buffer.from(head);
     return summaryFromTopLevelKeys(buffer, file, bytes) ?? summaryFromJob(JSON.parse(buffer.toString("utf8")) as Job, file, bytes);
   } catch {
