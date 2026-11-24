@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
-import { execArgv, execShell } from "./process.js";
+import { execShell } from "./process.js";
+import { execHive } from "./hive-exec.js";
 import { selectJsonPath } from "./jsonpath.js";
 import { renderShellCommand, renderString, type Rendered } from "./templates.js";
 import { parseDuration, withTimeout } from "./time.js";
@@ -19,7 +20,7 @@ type RenderedContextSource =
 export async function resolveContext(
   trigger: Trigger,
   activation: Activation,
-  options: { defaultTimeoutMs: number; cwd?: string; execution?: ExecutionProfile },
+  options: { defaultTimeoutMs: number; cwd?: string; execution?: ExecutionProfile; hiveStartingWaitMs?: number },
 ): Promise<ResolvedContext> {
   const context: Record<string, string> = {
     trigger_id: trigger.id,
@@ -34,7 +35,7 @@ export async function resolveContext(
   const defaultCwd = renderCwd(options.cwd, context);
   warnings.push(...defaultCwd.warnings);
   const sourceResults = await Promise.all(
-    (resolver.sources ?? []).map((source) => resolveSource(resolver, source, options.defaultTimeoutMs, defaultCwd.value, context, options.execution)),
+    (resolver.sources ?? []).map((source) => resolveSource(resolver, source, options.defaultTimeoutMs, defaultCwd.value, context, options)),
   );
   for (const result of sourceResults) {
     warnings.push(...result.warnings);
@@ -50,7 +51,7 @@ async function resolveSource(
   defaultTimeoutMs: number,
   defaultCwd: string | undefined,
   context: Record<string, string>,
-  execution: ExecutionProfile | undefined,
+  options: { execution?: ExecutionProfile; hiveStartingWaitMs?: number },
 ): Promise<{ ok: true; variable: string; value: string; warnings: string[] } | { ok: false; warning: string; warnings: string[] }> {
   const timeoutMs = parseDuration(source.timeout, defaultTimeoutMs);
   const cwd =
@@ -63,8 +64,10 @@ async function resolveSource(
   try {
     const renderedSource = renderSource(source, context);
     warnings.push(...renderedSource.warnings);
-    const sourceValue = startSourceValue(renderedSource.value, cwd.value, execution, timeoutMs);
-    const value = await withTimeout(sourceValue.promise, timeoutMs, `context source ${source.var}`, sourceValue.cancel);
+    const sourceValue = startSourceValue(renderedSource.value, cwd.value, options, timeoutMs);
+    const value = sourceValue.boundsItsOwnTime
+      ? await sourceValue.promise
+      : await withTimeout(sourceValue.promise, timeoutMs, `context source ${source.var}`, sourceValue.cancel);
     return { ok: true, variable: source.var, value, warnings };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -75,9 +78,9 @@ async function resolveSource(
 function startSourceValue(
   source: RenderedContextSource,
   cwd: string | undefined,
-  execution: ExecutionProfile | undefined,
+  { execution, hiveStartingWaitMs }: { execution?: ExecutionProfile; hiveStartingWaitMs?: number },
   timeoutMs: number,
-): { promise: Promise<string>; cancel?: () => void } {
+): { promise: Promise<string>; cancel?: () => void; boundsItsOwnTime?: boolean } {
   if (source.kind === "command") {
     return {
       promise: execShell(source.command, { cwd, execution, timeoutMs }).then((result) => {
@@ -106,7 +109,8 @@ function startSourceValue(
   }
   if (source.kind === "honeybee") {
     return {
-      promise: execArgv("hive", source.args, { cwd, execution, timeoutMs }).then((result) => {
+      boundsItsOwnTime: true,
+      promise: execHive(source.args, { label: `hive ${source.args[0] ?? ""}`.trim(), cwd, execution, timeoutMs, startingWaitMs: hiveStartingWaitMs }).then((result) => {
         if (result.timedOut) throw new Error(`hive timed out after ${timeoutMs}ms`);
         if (result.exitCode !== 0) throw new Error(`hive exited ${result.exitCode}: ${result.stderr.trim()}`);
         return result.stdout.trimEnd();

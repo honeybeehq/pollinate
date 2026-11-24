@@ -32,7 +32,7 @@ const DEFAULT_MAX_BATCH = 1_000;
 
 export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
   webhook: { bind: "127.0.0.1", port: 3978, relay: { maxAgeSeconds: 300 } },
-  defaults: { contextTimeout: "5s", commandTimeout: "10m", tickMs: 1_000, triggerReloadMs: 1_000, bindingGcMs: 60_000 },
+  defaults: { contextTimeout: "5s", commandTimeout: "10m", hiveStartingWait: "15m", tickMs: 1_000, triggerReloadMs: 1_000, bindingGcMs: 60_000 },
   execution: {
     shell: "/bin/sh",
     shellArgs: ["-c"],
@@ -79,6 +79,7 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
     defaults: {
       contextTimeout: stringOr(defaults.contextTimeout ?? defaults.context_timeout, DEFAULT_DAEMON_CONFIG.defaults.contextTimeout),
       commandTimeout: stringOr(defaults.commandTimeout ?? defaults.command_timeout, DEFAULT_DAEMON_CONFIG.defaults.commandTimeout),
+      hiveStartingWait: stringOr(defaults.hiveStartingWait ?? defaults.hive_starting_wait, DEFAULT_DAEMON_CONFIG.defaults.hiveStartingWait),
       tickMs: numberOr(defaults.tickMs ?? defaults.tick_ms, DEFAULT_DAEMON_CONFIG.defaults.tickMs),
       triggerReloadMs: numberOr(defaults.triggerReloadMs ?? defaults.trigger_reload_ms, DEFAULT_DAEMON_CONFIG.defaults.triggerReloadMs),
       bindingGcMs: numberOr(defaults.bindingGcMs ?? defaults.binding_gc_ms, DEFAULT_DAEMON_CONFIG.defaults.bindingGcMs),

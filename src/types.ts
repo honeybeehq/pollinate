@@ -216,6 +216,13 @@ export type Job = {
   startedAt?: string;
   completedAt?: string;
   batch?: JsonValue[];
+  hiveStarting?: {
+    refusals: number;
+    firstRefusedAt: string;
+    lastRefusedAt: string;
+    lastCommand: string;
+    lastMessage: string;
+  };
 };
 
 export type Activation = {
@@ -326,6 +333,7 @@ export type DaemonConfig = {
   defaults: {
     contextTimeout: string;
     commandTimeout: string;
+    hiveStartingWait: string;
     tickMs: number;
     triggerReloadMs: number;
     bindingGcMs: number;

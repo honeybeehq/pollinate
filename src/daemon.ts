@@ -1,4 +1,5 @@
 import { ActionExecutor } from "./actions.js";
+import { DEFAULT_HIVE_STARTING_WAIT_MS } from "./hive-exec.js";
 import { DeliveryManager } from "./delivery.js";
 import { PollEngine } from "./poll.js";
 import { ScheduleEngine } from "./schedule.js";
@@ -56,6 +57,7 @@ export class PollinateDaemon {
     const executor = new ActionExecutor(this.store, {
       contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
       commandTimeoutMs: parseDuration(config.defaults.commandTimeout, 600_000),
+      hiveStartingWaitMs: parseDuration(config.defaults.hiveStartingWait, DEFAULT_HIVE_STARTING_WAIT_MS),
       execution: config.execution,
     });
     this.config = config;

@@ -3,6 +3,7 @@ import type { PollinateStore } from "./store.js";
 import { resolveContext } from "./context.js";
 import { renderAction, renderString } from "./templates.js";
 import { execArgv, execShell, type ExecResult } from "./process.js";
+import { DEFAULT_HIVE_STARTING_WAIT_MS, execHive, withHiveStartingObserver, type HiveStartingObserver } from "./hive-exec.js";
 import { nowIso, parseDuration } from "./time.js";
 import { executeRouter } from "./router.js";
 import { CombActionError, executeCombRun } from "./comb-transport.js";
@@ -10,6 +11,7 @@ import { CombActionError, executeCombRun } from "./comb-transport.js";
 export type ActionExecutorOptions = {
   contextTimeoutMs: number;
   commandTimeoutMs: number;
+  hiveStartingWaitMs?: number;
   execution?: ExecutionProfile;
 };
 
@@ -74,7 +76,42 @@ export class ActionExecutor {
   async executeJob(job: Job, trigger: Trigger, activation: Activation, batch: JsonValue[]): Promise<Job> {
     const cancellation = await this.store.getJob(job.id);
     if (cancellation?.status === "cancelled") return cancellation;
-    if (trigger.router && !job.action) return this.executeRouterJob(job, trigger, activation, batch);
+    return withHiveStartingObserver(this.hiveStartingObserver(job), () =>
+      trigger.router && !job.action ? this.executeRouterJob(job, trigger, activation, batch) : this.executePlainJob(job, trigger, activation, batch),
+    );
+  }
+
+  private hiveStartingObserver(job: Job): HiveStartingObserver {
+    return {
+      onRefused: async (refusal) => {
+        const refusedAt = nowIso();
+        const previous = (await this.store.getJob(job.id))?.hiveStarting;
+        await this.store.updateJob(job.id, {
+          hiveStarting: {
+            refusals: (previous?.refusals ?? 0) + 1,
+            firstRefusedAt: previous?.firstRefusedAt ?? refusedAt,
+            lastRefusedAt: refusedAt,
+            lastCommand: refusal.label,
+            lastMessage: refusal.message,
+          },
+        });
+        await this.store.appendLedger({
+          event: "pollinate.job.hive_starting",
+          job_id: job.id,
+          trigger_id: job.triggerId,
+          command: refusal.label,
+          attempt: refusal.attempt,
+          waited_ms: refusal.waitedMs,
+          retry_in_ms: refusal.retryInMs,
+          ...(refusal.phase ? { phase: refusal.phase } : {}),
+          message: refusal.message,
+        });
+      },
+      shouldStop: async () => ((await this.store.getJob(job.id))?.status === "cancelled" ? "job cancelled" : undefined),
+    };
+  }
+
+  private async executePlainJob(job: Job, trigger: Trigger, activation: Activation, batch: JsonValue[]): Promise<Job> {
     await this.store.updateJob(job.id, { status: "resolving-context" });
     try {
       const jobCwd = job.cwd ?? trigger.cwd;
@@ -166,7 +203,12 @@ export class ActionExecutor {
   }
 
   private async buildContext(trigger: Trigger, activation: Activation, batch: JsonValue[], cwd?: string) {
-    const resolved = await resolveContext(trigger, activation, { defaultTimeoutMs: this.options.contextTimeoutMs, cwd, execution: this.options.execution });
+    const resolved = await resolveContext(trigger, activation, {
+      defaultTimeoutMs: this.options.contextTimeoutMs,
+      cwd,
+      execution: this.options.execution,
+      hiveStartingWaitMs: this.hiveStartingWaitMs,
+    });
     return {
       context: {
         ...resolved.context,
@@ -296,6 +338,7 @@ export class ActionExecutor {
       const result = await executeCombRun(action, cwd, executionContext, {
         timeoutMs: this.options.commandTimeoutMs,
         execution: this.options.execution,
+        hiveStartingWaitMs: this.hiveStartingWaitMs,
       });
       if (result.created && !result.replayedDelivery) {
         await this.store.appendLedger({
@@ -384,11 +427,17 @@ export class ActionExecutor {
     throw new Error(`Unsupported honeybee action: ${JSON.stringify(neverAction)}`);
   }
 
+  private get hiveStartingWaitMs(): number {
+    return this.options.hiveStartingWaitMs ?? DEFAULT_HIVE_STARTING_WAIT_MS;
+  }
+
   private async execHive(args: string[], label: string, options: { cwd?: string; timeoutMs?: number }): Promise<ActionResult & ExecResult> {
-    const result = await execArgv("hive", args, {
+    const result = await execHive(args, {
+      label,
       cwd: options.cwd,
       timeoutMs: options.timeoutMs ?? this.options.commandTimeoutMs,
       execution: this.options.execution,
+      startingWaitMs: this.hiveStartingWaitMs,
     });
     if (result.exitCode !== 0) throw new Error(`${label} exited ${result.exitCode}: ${result.stderr.trim()}`);
     return { ...result };
@@ -419,6 +468,7 @@ export async function createExecutor(store: PollinateStore): Promise<ActionExecu
   return new ActionExecutor(store, {
     contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
     commandTimeoutMs: parseDuration(config.defaults.commandTimeout, 600_000),
+    hiveStartingWaitMs: parseDuration(config.defaults.hiveStartingWait, DEFAULT_HIVE_STARTING_WAIT_MS),
     execution: config.execution,
   });
 }

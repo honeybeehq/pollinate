@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
-import { execArgv, type ExecOptions, type ExecResult } from "./process.js";
+import type { ExecOptions, ExecResult } from "./process.js";
+import { execHive } from "./hive-exec.js";
 import type {
   CombCliErrorCode,
   CombRunAction,
@@ -91,12 +92,14 @@ export async function executeCombRun(
   action: CombRunAction,
   cwd: string | undefined,
   provenance: CombRunProvenance,
-  options: { timeoutMs: number; execution?: ExecOptions["execution"] },
+  options: { timeoutMs: number; execution?: ExecOptions["execution"]; hiveStartingWaitMs?: number },
 ): Promise<CombRunJobSuccess> {
   const invocation = buildCombRunInvocation(action, cwd, provenance);
   let processResult: ExecResult;
   try {
-    processResult = await execArgv("hive", invocation.args, {
+    processResult = await execHive(invocation.args, {
+      label: "hive comb run",
+      startingWaitMs: options.hiveStartingWaitMs,
       cwd: invocation.cwd,
       input: invocation.input,
       timeoutMs: options.timeoutMs,

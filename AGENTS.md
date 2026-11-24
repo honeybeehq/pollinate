@@ -286,6 +286,7 @@ maxAgeSeconds = 300
 [defaults]
 contextTimeout = "5s"
 commandTimeout = "10m"
+hiveStartingWait = "15m"     # how long a hive call keeps retrying while Honeybee is starting (see below)
 tickMs = 1000
 triggerReloadMs = 1000
 bindingGcMs = 60000          # router binding GC sweep interval
@@ -307,6 +308,34 @@ jobsWarnMb = 1024            # ... or this many MB
 jobsGcMs = 3600000           # jobs + ledger retention sweep interval (default: hourly)
 ledgerMaxMb = 64             # ledger.jsonl is rotated to ledger.jsonl.1 past this size
 ```
+
+## Honeybee starting window
+
+While Honeybee backs up and migrates its store, `hive` refuses every call with
+`daemon_starting` (the CLI holds 15 s first, then exits 1) and `hive health`
+exits 75. A first start on a large store on a loaded Mac can take minutes.
+
+- Every `hive` call Pollinate makes (honeybee actions, router actions, comb
+  runs, honeybee context sources) retries on exactly those two signals:
+  `error (daemon_starting)` on stderr or `error.code = "daemon_starting"` in
+  `--json` output, or `hive health` exit 75. Any other failure, including a
+  timeout, fails as before.
+- Backoff 1 s, doubling, capped at 15 s, on top of the CLI's own 15 s hold.
+  The wait is bounded by `defaults.hiveStartingWait` (default `15m`) from the
+  first refusal; the final attempt can add one 15 s hold. 15 min covers a
+  1.3 GB store on the worst measured Mac load (21 s on Linux × 23 ≈ 8 min)
+  with about 2× headroom, and still fails a daemon that is stuck.
+- Exactly once: only the refused call is retried, inside the same job. A
+  refused call was never accepted by Honeybee, the scheduler reserved the fire
+  before queueing the job, and no new job is created, so a retry cannot
+  deliver twice. In a spawn+message action a succeeded spawn is not repeated.
+- Each refusal ledgers `pollinate.job.hive_starting` and updates the job's
+  `hiveStarting` field (`refusals`, `firstRefusedAt`, `lastRefusedAt`,
+  `lastCommand`, `lastMessage`). Cancelling the job stops the wait.
+- Honeybee context sources apply their `timeout` per attempt; give them more
+  than 15 s if they should ride out the CLI hold.
+- Pollinate restarting during the wait still marks the job errored at startup
+  ("daemon restarted mid-execution"), as for any running job.
 
 ## Job retention
 
@@ -358,7 +387,7 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 `event`. Stream with `pol ledger --follow`.
 
 - `pollinate.trigger.{added,enabled,disabled,removed}`
-- `pollinate.job.{queued,started,completed,errored,cancelled}`
+- `pollinate.job.{queued,started,completed,errored,cancelled,hive_starting}`
 - `pollinate.delivery.{filtered,throttled}`
 - `pollinate.schedule.{fired,missed}` · `pollinate.poll.{checked,detected,errored}`
 - `pollinate.webhook.{received,rejected,duplicate}`
