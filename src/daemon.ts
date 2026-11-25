@@ -165,6 +165,7 @@ export class PollinateDaemon {
     await this.health.load();
     this.delivery = new DeliveryManager(this.store, executor, this.health);
     await this.delivery.init(triggers);
+    await this.recoverStaleJobsAtStartup(startedAtMs);
     this.webhook = new WebhookServer(this.store, this.delivery, triggers, config.webhook.bind, config.webhook.port, config.webhook.relay);
     await this.webhook.start();
     this.schedule = new ScheduleEngine(this.store, this.delivery, triggers, config.defaults.tickMs, this.health);
@@ -193,7 +194,7 @@ export class PollinateDaemon {
       `daemon started in ${Date.now() - startedAtMs}ms: ${triggers.length} triggers, webhook ${config.webhook.bind}:${config.webhook.port}, binding gc every ${config.defaults.bindingGcMs}ms, jobs gc every ${config.retention.jobsGcMs}ms`,
     );
     void this.runBindingGc();
-    void this.runStartupJobMaintenance(startedAtMs);
+    void this.runJobsGc("startup");
   }
 
   private async pruneOrphanedTriggerState(): Promise<void> {
@@ -205,13 +206,12 @@ export class PollinateDaemon {
     }
   }
 
-  private async runStartupJobMaintenance(startedAtMs: number): Promise<void> {
+  private async recoverStaleJobsAtStartup(startedAtMs: number): Promise<void> {
     try {
       await this.recoverStaleJobs(startedAtMs);
     } catch (error) {
       await this.log(`stale job recovery failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    await this.runJobsGc("startup");
   }
 
   async stop(): Promise<void> {

@@ -624,8 +624,11 @@ out of heap; launchd restarted it every 16 s for seven hours.
   in the older key order fall back to reading that one file. Only the jobs a
   listing returns are parsed in full, so memory does not grow with the number
   of files.
-- The daemon listens first, then recovers stale jobs and runs the sweep in the
-  background at startup, then every `retention.jobsGcMs`. A trigger that
+- At startup the daemon recovers stale jobs before it starts the webhook
+  server, schedules and polls, so the trigger health that onFailure reads is
+  settled before the first fire (an interrupted notification releases its
+  cooldown first; about 0.5 s with 20,000 job files). It then listens and runs
+  the sweep in the background, then every `retention.jobsGcMs`. A trigger that
   creates `jobsMaxPerTrigger / 2` jobs, or all triggers together
   `jobsMaxTotal / 4`, since the last sweep start an early sweep (at most one a
   minute). Failures are logged and never crash the daemon.
@@ -747,7 +750,8 @@ config, so only the default applies to it.
   failure or success of the trigger and never triggers `onFailure` itself.
 - If it cannot be delivered: `pollinate.trigger.on_failure_errored {trigger_id,
   job_id, error, attempts}`. A daemon restart in the middle marks it errored at
-  startup (whatever its age) and ledgers the same event; it is not resumed.
+  startup (whatever its age), before any trigger fires, and ledgers the same
+  event; it is not resumed.
 - An undelivered notification does not start the cooldown: `notifiedAt` goes
   back to its value before that notification (it is cleared after a restart),
   so the next failure notifies again.
