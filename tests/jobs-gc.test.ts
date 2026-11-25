@@ -233,7 +233,7 @@ describe("rotateLedgerIfLarge", () => {
       await store.appendLedger({ event: "pollinate.test.first-generation" });
       // Force a rotation with a cap so small any content trips it.
       const firstRotation = await rotateLedgerIfLarge(root, 0.00001);
-      expect(firstRotation).toBe(true);
+      expect(firstRotation).toBe(2);
 
       const rotatedContent = await stat(`${ledgerPath(root)}.1`);
       expect(rotatedContent.isFile()).toBe(true);
@@ -246,7 +246,7 @@ describe("rotateLedgerIfLarge", () => {
 
       // Rotating again replaces the previous .1 generation instead of erroring.
       const secondRotation = await rotateLedgerIfLarge(root, 0.00001);
-      expect(secondRotation).toBe(true);
+      expect(secondRotation).toBe(3);
       const replaced = await stat(`${ledgerPath(root)}.1`);
       expect(replaced.isFile()).toBe(true);
     });

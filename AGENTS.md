@@ -138,13 +138,15 @@ symlinks, then
   state/daemon-runs.json          last 20 daemon starts/clean stops (crash-loop detection)
   state/daemon.lock               one daemon per store: pid, start time, token; mtime is the heartbeat
   state/store.json                store metadata {schema: 1}; a newer schema refuses the daemon start
+  state/ledger.json               ledger generation {generation, rotating?} (see Events stream)
+  state/trigger-tags.json         tags of live and recently removed triggers, for the events tag filter
   state/trigger-locks/<id>.lock   per-trigger write locks
   state/job-locks/<jobId>.lock    per-job write locks
   state/router-bindings/<trigger>/<subject>.json   binding records
   state/router-bindings/<trigger>/<subject>.lock   binding write locks
   jobs/<jobId>.json               one job per execution
   ledger.jsonl                    append-only event log (the source of truth)
-  ledger.jsonl.1                  previous ledger generation (size-based rotation, see Job retention)
+  ledger.jsonl.1                  previous ledger generation (size-based rotation, see Job retention and Events stream)
   daemon.log                      daemon lifecycle + GC log (pol daemon logs)
   daemon.log.1                    previous daemon.log (pol doctor --fix rotates it past 10 MB)
   daemon.out.log                  macOS launchd stdout log
@@ -814,7 +816,8 @@ out of heap; launchd restarted it every 16 s for seven hours.
   shows unclean exits even while the daemon is down.
 - Ledger rotation is size-based: once `ledger.jsonl` exceeds
   `retention.ledgerMaxMb`, it's renamed to `ledger.jsonl.1` (replacing any
-  previous generation) and lazily recreated on the next append. `pol ledger`
+  previous generation) and lazily recreated on the next append. Each rotation
+  bumps the generation in `state/ledger.json` (see Events stream). `pol ledger`
   only reads the active file.
 - Manual control: `pol jobs gc [--max-age <dur>] [--keep-last <n>]
   [--max-per-trigger <n>] [--max-total <n>] [--dry-run]`. Flags default to the
@@ -953,6 +956,50 @@ delivery (see Retry: admissions); a lost write of the record allows one
 duplicate. Receivers should key on
 `Idempotency-Key` / `{{delivery_id}}`.
 
+## Events stream
+
+`GET /v1/events?after=<cursor>&follow=1&tag=&trigger=&types=` on the daemon
+socket streams the ledger as `application/x-ndjson` (`src/events.ts`).
+
+- Each ledger line is sent as is, plus `cursor`. A cursor is
+  `<generation>-<byte offset>`, the offset just past that line in that
+  generation's file. Store the last cursor you processed; pass it as `after`
+  to resume with exactly the lines after it. Unparsable lines are skipped.
+  A partial line (a writer mid-append) is never sent; it goes out once its
+  newline lands.
+- Generations: `state/ledger.json` holds `{generation}` (1 when absent).
+  `ledger.jsonl` is the current generation, `ledger.jsonl.1` the one before.
+  Rotation writes `{generation, rotating: {ino}}` (inode of the file being
+  rotated), renames, then writes `{generation: n + 1}`. A reader that finds
+  `rotating` decides by whether `ledger.jsonl.1` has that inode, so a crash
+  at any step never labels one file with two generations. Readers open a file
+  between two generation reads and retry if they differ.
+  `pollinate.ledger.rotated` carries the new `generation`.
+- No `after`: the stream starts at the current end and first sends
+  `{"heartbeat": true, "cursor"}` so a client can store a starting point.
+- `after` names a generation that is gone (older than the previous file, newer
+  than the current one, or an offset past the file's end): the first line is
+  `{"gap": true, "cursor"}` naming the oldest available position, and the
+  stream continues from there. A cursor that does not parse, or does not sit at
+  a line end, answers 400 `invalid_cursor`.
+- Without `follow`: sends what exists, then a final heartbeat with the end
+  cursor (only when `after` was given), and closes. With `follow`: keeps the
+  connection open; a heartbeat every 15 s (`POLLINATE_EVENTS_HEARTBEAT_MS`
+  overrides it) carries the current cursor, which moves past filtered-out
+  lines too. Following uses `fs.watch` on the store directory plus a 1 s
+  poll; idle it does a few stats per second and nothing else.
+- Rotation while following: the stream finishes the previous file (waiting
+  until it has been quiet for 500 ms, so appends that opened it just before
+  the rename are included), then moves to the new generation at offset 0.
+  A follower more than one rotation behind gets a `gap`.
+- Filters, all optional and combined with AND: `trigger=<id>` matches
+  `trigger_id`; `types=a,b` matches `event`; `tag=<tag>` matches events whose
+  `trigger_id` has that tag. Tags come from the daemon's trigger map, a trigger
+  file read for an id it has not seen yet (one added since the last reload),
+  and the tags of the last 512 removed triggers, kept in
+  `state/trigger-tags.json` so triggers removed while the daemon was down
+  still match. Events without `trigger_id` never match `tag` or `trigger`.
+
 ## Ledger events
 
 Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
@@ -981,7 +1028,7 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
   compares them);
   `refused` carries `reason: "locked" | "lock_lost"` and the lock holder's `pid`
   (see One daemon per store)
-- `pollinate.jobs.{gc,store_warning}` · `pollinate.ledger.rotated` (job/ledger retention, see Job retention)
+- `pollinate.jobs.{gc,store_warning}` · `pollinate.ledger.rotated` with `generation` (job/ledger retention, see Job retention and Events stream)
 - `pollinate.emit` (from `emit` actions)
 - `pollinate.hive.probed {path, version, ok, error?}` (daemon start, when a trigger uses hive; see Action kinds)
 - `pollinate.doctor.fixed {fixes}` (`pol doctor --fix` changed something; see Doctor)

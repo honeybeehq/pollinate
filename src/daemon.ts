@@ -28,6 +28,7 @@ import { TriggerHealthMonitor } from "./health.js";
 import { jobStoreWarnings, recordDaemonStart, recordDaemonStop, topTriggersByFiles, writeJobStoreHealth } from "./daemon-health.js";
 import { readBuildCommit } from "./build-info.js";
 import { realpath } from "node:fs/promises";
+import { TriggerTagIndex } from "./events.js";
 import type { DaemonConfig, Job, JobStatus, JsonValue, Trigger } from "./types.js";
 
 const STALE_JOB_RECOVERY_MS = 60_000;
@@ -59,6 +60,7 @@ export class PollinateDaemon {
   private health?: TriggerHealthMonitor;
   private config?: DaemonConfig;
   private triggers: Trigger[] = [];
+  readonly eventTags: TriggerTagIndex;
   private triggerById = new Map<string, Trigger>();
   private reloadTimer?: NodeJS.Timeout;
   private bindingGcTimer?: NodeJS.Timeout;
@@ -80,7 +82,9 @@ export class PollinateDaemon {
   private hiveStatus?: { path: string; version: string | null } | null;
   private hiveProbing?: Promise<void>;
 
-  constructor(private readonly store = new PollinateStore()) {}
+  constructor(private readonly store = new PollinateStore()) {
+    this.eventTags = TriggerTagIndex.forStore(store.root, (id) => store.getTrigger(id));
+  }
 
   async start(): Promise<void> {
     await this.store.ensure();
@@ -172,6 +176,7 @@ export class PollinateDaemon {
     this.store.onJobAllocated = (triggerId) => this.noteJobAllocated(triggerId);
     this.daemonConfigSignature = signatureForConfig(config);
     this.executor = executor;
+    await this.eventTags.load().catch((error) => this.log(`event tag index load failed: ${error instanceof Error ? error.message : String(error)}`));
     this.setTriggers(triggers);
     this.health = new TriggerHealthMonitor(this.store, executor, {
       defaults: config.defaults.onFailure,
@@ -402,6 +407,7 @@ export class PollinateDaemon {
   private setTriggers(triggers: Trigger[]): void {
     this.triggers = triggers;
     this.triggerById = new Map(triggers.map((trigger) => [trigger.id, trigger]));
+    void this.eventTags.observe(triggers).catch((error) => this.log(`event tag index update failed: ${error instanceof Error ? error.message : String(error)}`));
   }
 
   private async runBindingGc(): Promise<void> {
@@ -505,9 +511,9 @@ export class PollinateDaemon {
         await this.store.appendLedger({ event: "pollinate.jobs.store_warning", warning, files: result.kept, bytes: result.keptBytes });
         await this.log(`WARNING ${warning}`);
       }
-      const rotated = await rotateLedgerIfLarge(this.store.root, retention.ledgerMaxMb);
-      if (rotated) {
-        await this.store.appendLedger({ event: "pollinate.ledger.rotated", max_mb: retention.ledgerMaxMb });
+      const generation = await rotateLedgerIfLarge(this.store.root, retention.ledgerMaxMb);
+      if (generation !== false) {
+        await this.store.appendLedger({ event: "pollinate.ledger.rotated", max_mb: retention.ledgerMaxMb, generation });
         await this.log(`ledger rotated: exceeded ${retention.ledgerMaxMb}MB, moved to ledger.jsonl.1`);
       }
     } catch (error) {

@@ -35,25 +35,61 @@ export function daemonLogPath(root = storeRoot()): string {
   return join(root, "daemon.log");
 }
 
-/**
- * Rotates ledger.jsonl to ledger.jsonl.1 (replacing any previous generation)
- * once it exceeds maxMb. `rename` atomically replaces the destination on
- * POSIX, and any append already in flight keeps writing to the descriptor it
- * opened (which now lives at the rotated name) — appendTextLine opens,
- * writes, and closes per call, so nothing is lost mid-write. The next
- * appendJsonLine call lazily recreates ledger.jsonl via its `mkdir` + `open`
- * "a" semantics.
- */
-export async function rotateLedgerIfLarge(root: string, maxMb: number): Promise<boolean> {
+export function previousLedgerPath(root = storeRoot()): string {
+  return `${ledgerPath(root)}.1`;
+}
+
+export function ledgerStatePath(root = storeRoot()): string {
+  return join(stateDir(root), "ledger.json");
+}
+
+export const FIRST_LEDGER_GENERATION = 1;
+
+type LedgerState = { generation: number; rotating?: { ino: string } };
+
+export async function readLedgerGeneration(root = storeRoot()): Promise<number> {
+  const state = await readLedgerState(root);
+  if (!state.rotating) return state.generation;
+  const previousIno = await inodeOf(previousLedgerPath(root));
+  return previousIno === state.rotating.ino ? state.generation + 1 : state.generation;
+}
+
+export async function rotateLedgerIfLarge(root: string, maxMb: number): Promise<number | false> {
   if (!Number.isFinite(maxMb) || maxMb <= 0) return false;
   const path = ledgerPath(root);
-  const info = await stat(path).catch((error) => {
+  const info = await stat(path, { bigint: true }).catch((error) => {
     if (isEnoent(error)) return undefined;
     throw error;
   });
-  if (!info || info.size <= maxMb * 1024 * 1024) return false;
-  await rename(path, `${path}.1`);
-  return true;
+  if (!info || Number(info.size) <= maxMb * 1024 * 1024) return false;
+  const generation = await readLedgerGeneration(root);
+  await writeJson(ledgerStatePath(root), { generation, rotating: { ino: String(info.ino) } } satisfies LedgerState, { sync: true });
+  await rename(path, previousLedgerPath(root));
+  const next = generation + 1;
+  await writeJson(ledgerStatePath(root), { generation: next } satisfies LedgerState, { sync: true });
+  return next;
+}
+
+async function readLedgerState(root: string): Promise<LedgerState> {
+  const fallback: LedgerState = { generation: FIRST_LEDGER_GENERATION };
+  const text = await readTextOrNull(ledgerStatePath(root));
+  if (!text) return fallback;
+  try {
+    const parsed = JSON.parse(text) as Partial<LedgerState>;
+    if (typeof parsed.generation !== "number" || !Number.isSafeInteger(parsed.generation) || parsed.generation < 0) return fallback;
+    const ino = parsed.rotating?.ino;
+    return typeof ino === "string" ? { generation: parsed.generation, rotating: { ino } } : { generation: parsed.generation };
+  } catch {
+    return fallback;
+  }
+}
+
+async function inodeOf(path: string): Promise<string | undefined> {
+  const info = await stat(path, { bigint: true }).catch((error) => {
+    if (isEnoent(error)) return undefined;
+    throw error;
+  });
+  return info ? String(info.ino) : undefined;
 }
 
 export function daemonLockPath(root = storeRoot()): string {
