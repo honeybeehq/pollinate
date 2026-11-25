@@ -14,7 +14,9 @@ import { crashLoopStatus, jobStoreWarnings, readDaemonRuns, readJobStoreHealth, 
 import { SatelliteServer } from "./satellite.js";
 import { API_VERSION, readBuildInfo, readVersion } from "./version.js";
 import { createWebhookHook, gcTemporaryHooks, randomHookToken, type HookCreateResult } from "./hooks.js";
-import { atomicWriteFile, pathExists, routerPluginsDir } from "./fsx.js";
+import { apiSocketPath, atomicWriteFile, pathExists, routerPluginsDir } from "./fsx.js";
+import { ApiClientError, PollinateClient } from "./client.js";
+import type { PutTriggerResponse } from "./api-types.js";
 import { listRouterPlugins, routerPluginTemplate } from "./router-plugins/index.js";
 import { GITHUB_PR_ROUTER_EVENTS, installGithubWebhook } from "./providers/github.js";
 import { resolveSecret } from "./secrets.js";
@@ -160,8 +162,43 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
 async function cmdAdd(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const file = requiredArg(args.rest[0], "Usage: pollinate add <config.toml>");
   const text = await readFile(file, "utf8");
+  const answer = await throughDaemon(store, (client) => client.putTrigger(parseTriggerToml(text).id, text));
+  if (answer) {
+    print(args, addedJson(answer), renderAdded(answer));
+    return;
+  }
   const trigger = await store.addTriggerFromToml(text);
-  print(args, trigger, `${say.ok(`added ${c.bold(trigger.id)}`)}  ${c.dim(triggerSummary(trigger))}`);
+  print(args, { ...trigger, via: "files" }, `${say.ok(`added ${c.bold(trigger.id)}`)}  ${c.dim(triggerSummary(trigger))}`);
+}
+
+function addedJson(answer: PutTriggerResponse): Record<string, unknown> {
+  return {
+    ...answer.trigger,
+    via: "daemon",
+    created: answer.created,
+    ...(answer.webhook ? { webhook: answer.webhook } : {}),
+    ...(answer.schedule ? { nextFireAt: answer.schedule.nextFireAt } : {}),
+    ...(answer.poll ? { poll: answer.poll } : {}),
+  };
+}
+
+function renderAdded(answer: PutTriggerResponse): string {
+  const trigger = answer.trigger;
+  const lines = [`${say.ok(`added ${c.bold(trigger.id)}`)}  ${c.dim(triggerSummary(trigger))}`];
+  if (answer.webhook) lines.push(field("webhook", answer.webhook.url));
+  if (answer.schedule?.nextFireAt) lines.push(field("next fire", answer.schedule.nextFireAt));
+  if (answer.poll && "baseline" in answer.poll) lines.push(field("poll", `baseline recorded ${plural(answer.poll.baseline.items, "item")}`));
+  if (answer.poll && "checked" in answer.poll) lines.push(field("poll", `checked ${plural(answer.poll.checked.items, "item")}, ${answer.poll.checked.new} new`));
+  return lines.join("\n");
+}
+
+async function throughDaemon<T>(store: PollinateStore, call: (client: PollinateClient) => Promise<T>): Promise<T | undefined> {
+  try {
+    return await call(new PollinateClient(apiSocketPath(store.root)));
+  } catch (error) {
+    if (error instanceof ApiClientError && error.daemonDidNotAct) return undefined;
+    throw error;
+  }
 }
 
 async function cmdCreate(store: PollinateStore, args: ParsedArgs): Promise<void> {
@@ -235,15 +272,18 @@ async function cmdGet(store: PollinateStore, args: ParsedArgs): Promise<void> {
 }
 
 async function cmdEnable(store: PollinateStore, args: ParsedArgs, enabled: boolean): Promise<void> {
-  const trigger = await store.setTriggerEnabled(requiredArg(args.rest[0], `Usage: pollinate ${enabled ? "enable" : "disable"} <id>`), enabled);
+  const id = requiredArg(args.rest[0], `Usage: pollinate ${enabled ? "enable" : "disable"} <id>`);
+  const answer = await throughDaemon(store, (client) => client.setTriggerEnabled(id, enabled));
+  const trigger = answer ? { ...answer.trigger, via: "daemon" } : { ...(await store.setTriggerEnabled(id, enabled)), via: "files" };
   const verb = enabled ? c.green("enabled") : c.yellow("disabled");
   print(args, trigger, `${statusDot(enabled)} ${verb} ${c.bold(trigger.id)}`);
 }
 
 async function cmdRemove(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const id = requiredArg(args.rest[0], "Usage: pollinate remove <id>");
-  await store.removeTrigger(id);
-  print(args, { removed: id }, say.ok(`removed ${c.bold(id)}`));
+  const answer = await throughDaemon(store, (client) => client.removeTrigger(id));
+  if (!answer) await store.removeTrigger(id);
+  print(args, { removed: id, via: answer ? "daemon" : "files" }, say.ok(`removed ${c.bold(id)}`));
 }
 
 async function cmdEdit(store: PollinateStore, args: ParsedArgs): Promise<void> {
@@ -278,15 +318,58 @@ async function cmdTrigger(store: PollinateStore, args: ParsedArgs): Promise<void
     print(args, dryRun, renderDryRun(trigger, dryRun));
     return;
   }
+  const fired = await fireThroughDaemon(store, trigger, payload, deliveryId);
+  if (fired) {
+    printFired(args, trigger, fired);
+    return;
+  }
   try {
     const completed = await runWithSpinner(args, `firing ${c.bold(trigger.id)}…`, () =>
       fireTriggerNow(store, trigger, payload, { executor, deliveryId }),
     );
-    print(args, completed, renderJobOutcome(completed));
+    print(args, { ...completed, via: "files" }, renderJobOutcome(completed));
   } catch (error) {
     if (!(error instanceof DuplicateDeliveryError)) throw error;
-    print(args, { duplicate: true, trigger_id: trigger.id, delivery_id: error.deliveryId }, say.ok(`duplicate delivery ${c.bold(error.deliveryId)}; not fired again`));
+    printDuplicate(args, trigger.id, error.deliveryId, "files");
   }
+}
+
+type DaemonFire = { job: Job | null } | { duplicate: string };
+
+async function fireThroughDaemon(store: PollinateStore, trigger: Trigger, payload: JsonValue, deliveryId: string | undefined): Promise<DaemonFire | undefined> {
+  try {
+    return await throughDaemon(store, (client) => client.fireTrigger(trigger.id, { payload, ...(deliveryId ? { deliveryId } : {}) }));
+  } catch (error) {
+    if (error instanceof ApiClientError && error.code === "conflict" && deliveryId && isDuplicateDetails(error.details)) {
+      return { duplicate: `${trigger.id}:${deliveryId}` };
+    }
+    throw error;
+  }
+}
+
+function isDuplicateDetails(details: unknown): boolean {
+  return typeof details === "object" && details !== null && (details as { reason?: unknown }).reason === "duplicate";
+}
+
+function printFired(args: ParsedArgs, trigger: Trigger, fired: DaemonFire): void {
+  if ("duplicate" in fired) {
+    printDuplicate(args, trigger.id, fired.duplicate, "daemon");
+    return;
+  }
+  if (fired.job) {
+    print(args, { ...fired.job, via: "daemon" }, `${renderJobOutcome(fired.job)}  ${c.dim(`${sym.mid} handed to the daemon; follow with pol job ${shortId(fired.job.id)}`)}`);
+    return;
+  }
+  const mode = trigger.delivery.mode.strategy;
+  print(
+    args,
+    { job: null, held: true, trigger_id: trigger.id, delivery_mode: mode, via: "daemon" },
+    say.ok(`${c.bold(trigger.id)} accepted; ${mode} delivery holds it, no job yet (it runs when the ${mode} window releases it, or a filter or full queue dropped it)`),
+  );
+}
+
+function printDuplicate(args: ParsedArgs, triggerId: string, deliveryId: string, via: "daemon" | "files"): void {
+  print(args, { duplicate: true, trigger_id: triggerId, delivery_id: deliveryId, via }, say.ok(`duplicate delivery ${c.bold(deliveryId)}; not fired again`));
 }
 
 type DryRunResult = Awaited<ReturnType<ActionExecutor["dryRun"]>>;
@@ -460,7 +543,9 @@ function renderJobList(jobs: Job[]): string {
 
 async function cmdJob(store: PollinateStore, args: ParsedArgs): Promise<void> {
   if (args.rest[0] === "cancel") {
-    const job = await store.cancelJob(requiredArg(args.rest[1], "Usage: pollinate job cancel <jobId>"));
+    const id = requiredArg(args.rest[1], "Usage: pollinate job cancel <jobId>");
+    const answer = await throughDaemon(store, (client) => client.cancelJob(id));
+    const job = answer ? { ...answer.job, via: "daemon" } : { ...(await store.cancelJob(id)), via: "files" };
     print(args, job, `${jobBadge(job.status)}  ${c.dim("job")} ${c.bold(shortId(job.id))}`);
     return;
   }
@@ -1960,7 +2045,7 @@ async function printHelp(): Promise<void> {
 function reportError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   if (process.argv.includes("--json")) {
-    console.error(JSON.stringify({ error: message }));
+    console.error(JSON.stringify(error instanceof ApiClientError ? { error: message, code: error.code, ...(error.details === undefined ? {} : { details: error.details }) } : { error: message }));
   } else {
     const usage = message.startsWith("Usage:");
     console.error(usage ? c.dim(message) : say.fail(message));

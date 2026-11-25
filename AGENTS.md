@@ -158,7 +158,7 @@ symlinks, then
 | Command | Purpose |
 |---|---|
 | `pol add / create / list / get / enable / disable / edit / remove` | trigger CRUD; `edit` validates the TOML on editor exit |
-| `pol trigger <id> [--payload '{…}'] [--delivery-id <id>] [--dry-run]` | fire manually; a repeated `--delivery-id` answers `duplicate` and does not fire |
+| `pol trigger <id> [--payload '{…}'] [--delivery-id <id>] [--dry-run]` | fire manually (through the daemon's queue when it runs, see Local API); a repeated `--delivery-id` answers `duplicate` and does not fire |
 | `pol jobs [--last 100] / job <id> / job cancel <id>` | job inspection; `pol jobs` lists the newest 100 unless `--last <n>` (n ≥ 1; `--last 0` is refused) says otherwise, and says so (stderr with `--json`) when more exist |
 | `pol jobs gc [--max-age 14d] [--keep-last 50] [--max-per-trigger 500] [--max-total 20000] [--dry-run]` | remove terminal job files by age and by the per-trigger and total caps; unset flags come from `[retention]`, so the caps apply even when only `--max-age`/`--keep-last` are given (see Job retention) |
 | `pol bindings [--trigger <id>] / bindings get <id>` | router binding inspection |
@@ -573,14 +573,39 @@ The daemon serves the v1 API (HTTP/1.1 + JSON, `node:http`) on
   answering. API writes and the file reload run one at a time through a single
   queue, and each pushes the daemon's current trigger list to every engine, so
   neither can leave an engine on an older list. A PUT that arrives during a
-  file reload waits for it. CLI writes still arrive through the 1 s file reload.
+  file reload waits for it. CLI writes that fall back to files (see below)
+  still arrive through the 1 s file reload.
 - `PUT` of an enabled poll runs the first check inside the call: a failure is
   `422 poll_failed` and nothing is stored; otherwise the fetched result goes
   through the normal check (baseline or dispatch), and the next check follows
   one interval later.
-- `POST /v1/triggers/:id/fire` uses the daemon's delivery queue, unlike
-  `pol trigger`, so `maxConcurrent`, delivery modes and dedup hold. A repeated
-  `deliveryId` answers `409 conflict` and ledgers `pollinate.delivery.duplicate`.
+- `POST /v1/triggers/:id/fire` uses the daemon's delivery queue, so
+  `maxConcurrent`, delivery modes and dedup hold. A repeated `deliveryId`
+  answers `409 conflict` and ledgers `pollinate.delivery.duplicate`.
+- The CLI talks to the socket (`src/client.ts`) for `pol add` (`PUT`),
+  `remove` (`DELETE`), `enable`/`disable` (`PATCH`), `trigger` (`POST …/fire`)
+  and `job cancel` (`POST /v1/jobs/:id/cancel`). `pol trigger --dry-run` and
+  every other command stay local. `--json` output carries `via: "daemon"` or
+  `via: "files"`; `pol add` through the daemon also carries `created`,
+  `webhook` (`path`, `url`, `localUrl`), `nextFireAt` for schedules and `poll`
+  for the first check.
+- Fallback rule: the CLI writes files instead only when the daemon cannot be
+  reached (no socket file, `ENOENT`/`ECONNREFUSED`/`ENOTSOCK`, or no connect
+  within 1 s) or answers `503 stopping` / `501 unsupported`, both of which come
+  before the daemon acts. Once a request was sent, a lost connection, a broken
+  answer or no answer within 5 min is reported as `code: "interrupted"` and
+  never retried through files, so `pol trigger` cannot fire twice. API errors
+  (`invalid_trigger`, `poll_failed`, `conflict`, `not_found`, …) are reported
+  as they are: exit 1, and with `--json` stderr is
+  `{"error": message, "code", "details"?}` (`code`/`details` are added to the
+  usual `{"error"}`).
+- `pol trigger` through the daemon answers as soon as the job is queued (it no
+  longer waits for the job to finish; follow with `pol job <id>`). `{job: null}`
+  (a debounced, throttled or batched mode holding the activation, a filter
+  miss or a full queue) prints `held: true` with `delivery_mode`; a repeated
+  `--delivery-id` prints the usual `duplicate: true` answer with exit 0. Firing
+  a disabled trigger is `409 conflict` (reason `disabled`); the file path still
+  fires it in the CLI process.
 - `state/store.json` is `{"schema": 1}`, written when missing. A higher schema
   refuses the start: `store schema N in … is newer than this Pollinate supports`.
 

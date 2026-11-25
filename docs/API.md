@@ -9,7 +9,10 @@ directory) is trusted, the same as whoever can write the store.
 - Prefix: `/v1`. Changes inside v1 are additive only.
 - Ready test: `GET /v1/health` answers once schedules, polls and webhooks run.
 - Writes made through the API reach the engines before the answer. Writes made
-  by the CLI to trigger files are still picked up by the 1 s file reload.
+  to trigger files are still picked up by the 1 s file reload.
+- `pol add`, `remove`, `enable`, `disable`, `trigger` and `job cancel` use this
+  API when the daemon answers and fall back to files only when it cannot be
+  reached or answers `503`/`501` (see Local API in AGENTS.md).
 
 ```sh
 curl -s --unix-socket ~/.pollinate/pollinated.sock http://pollinate/v1/health
