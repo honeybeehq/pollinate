@@ -82,6 +82,17 @@ export type InvalidTrigger = { id: string; path: string; error: string };
 
 export type LoadedTriggerFiles = { triggers: Trigger[]; invalid: InvalidTrigger[] };
 
+export class TriggerExistsError extends Error {
+  constructor(readonly triggerId: string) {
+    super(`Trigger "${triggerId}" already exists`);
+    this.name = "TriggerExistsError";
+  }
+}
+
+export function isValidStoreId(id: string): boolean {
+  return /^[A-Za-z0-9._-]+$/.test(id) && id !== "." && id !== "..";
+}
+
 export class PollinateStore {
   readonly root: string;
   private ledgerCache?: LedgerCache;
@@ -261,6 +272,37 @@ export class PollinateStore {
       Object.assign(trigger, updated);
       await this.writeTriggerUnlocked(updated);
     });
+  }
+
+  async putTrigger(trigger: Trigger, options: { ifAbsent?: boolean } = {}): Promise<{ trigger: Trigger; created: boolean }> {
+    await this.ensure();
+    assertStoreId("trigger", trigger.id);
+    const created = await withFileLock(this.triggerLockPath(trigger.id), async () => {
+      const current = await this.getTriggerUnlocked(trigger.id).catch(() => null);
+      const exists = current !== null || (await readTextOrNull(this.triggerPath(trigger.id))) !== null;
+      if (options.ifAbsent && exists) throw new TriggerExistsError(trigger.id);
+      await this.writeTriggerUnlocked(prepareTriggerForSave(trigger, current));
+      return !exists;
+    });
+    await this.appendLedger({ event: "pollinate.trigger.added", trigger_id: trigger.id });
+    return { trigger: await this.requireTrigger(trigger.id), created };
+  }
+
+  async latestJobsByTrigger(triggerIds: ReadonlySet<string>): Promise<Map<string, Job>> {
+    const latest = new Map<string, JobSummary>();
+    if (triggerIds.size === 0) return new Map();
+    await this.ensure();
+    for await (const summary of scanJobSummaries(jobsDir(this.root))) {
+      if (!triggerIds.has(summary.triggerId)) continue;
+      const known = latest.get(summary.triggerId);
+      if (!known || (summary.queuedAt ?? "") > (known.queuedAt ?? "")) latest.set(summary.triggerId, summary);
+    }
+    const jobs = new Map<string, Job>();
+    for (const [triggerId, summary] of latest) {
+      const job = await readJsonOr<Job | null>(join(jobsDir(this.root), summary.file), null);
+      if (job) jobs.set(triggerId, job);
+    }
+    return jobs;
   }
 
   async addTriggerFromToml(text: string, fallbackId?: string): Promise<Trigger> {
@@ -707,7 +749,7 @@ function safePathPart(value: string): string {
 }
 
 function assertStoreId(kind: "trigger" | "job", id: string): string {
-  if (/^[A-Za-z0-9._-]+$/.test(id) && id !== "." && id !== "..") return id;
+  if (isValidStoreId(id)) return id;
   throw new Error(`Invalid ${kind} id "${id}"; use only letters, numbers, ".", "_", and "-"`);
 }
 

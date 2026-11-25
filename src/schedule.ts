@@ -50,6 +50,16 @@ export class ScheduleEngine {
     if (this.running) void this.initializeScheduleState("updateTriggers");
   }
 
+  async applyNow(triggers: Trigger[]): Promise<void> {
+    this.triggers = triggers;
+    if (this.running) await this.initializeScheduleState("applyNow");
+  }
+
+  stateFor(triggerId: string): { nextFireAt?: string; lastFireAt?: string } {
+    const entry = this.state[triggerId];
+    return { nextFireAt: entry?.nextFireAt, lastFireAt: entry?.lastFireAt };
+  }
+
   private async restoreMissedFires(): Promise<void> {
     try {
       const now = new Date();

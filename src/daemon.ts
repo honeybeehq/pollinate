@@ -1,14 +1,18 @@
-import { ActionExecutor, executorOptionsFor } from "./actions.js";
+import { ActionExecutor, executorOptionsFor, manualActivation } from "./actions.js";
+import { ApiError, ApiServer, type ApiHost } from "./api.js";
+import { DEFAULT_DAEMON_CONFIG } from "./config.js";
 import { probeHive, triggerUsesHive } from "./hive-exec.js";
 import { DeliveryManager } from "./delivery.js";
-import { PollEngine } from "./poll.js";
+import { PollEngine, type PollCheck } from "./poll.js";
 import { ScheduleEngine } from "./schedule.js";
 import { PollinateStore } from "./store.js";
 import { WebhookServer } from "./webhook.js";
 import { nowIso, parseDuration } from "./time.js";
 import {
   acquireDaemonLock,
+  apiSocketPath,
   appendTextLine,
+  ensureStoreSchema,
   DAEMON_LOCK_HEARTBEAT_MS,
   daemonLockPath,
   daemonLogPath,
@@ -22,7 +26,7 @@ import { gcTemporaryHooks } from "./hooks.js";
 import { DEFAULT_BINDING_RETENTION, gcRouterBindings, routerGcSummary } from "./router-gc.js";
 import { TriggerHealthMonitor } from "./health.js";
 import { jobStoreWarnings, recordDaemonStart, recordDaemonStop, topTriggersByFiles, writeJobStoreHealth } from "./daemon-health.js";
-import type { DaemonConfig, JobStatus, Trigger } from "./types.js";
+import type { DaemonConfig, Job, JobStatus, JsonValue, Trigger } from "./types.js";
 
 const STALE_JOB_RECOVERY_MS = 60_000;
 const NON_TERMINAL_JOB_STATUSES: JobStatus[] = ["queued", "resolving-context", "running", "retrying"];
@@ -66,6 +70,13 @@ export class PollinateDaemon {
   private triggerSignature = "";
   private stopping = false;
   private daemonConfigSignature = "";
+  private api?: ApiServer;
+  private applyGeneration = 0;
+  private appliesInFlight = 0;
+  private startedAt = nowIso();
+  private reloadedAt = this.startedAt;
+  private hiveStatus?: { path: string; version: string | null } | null;
+  private hiveProbing?: Promise<void>;
 
   constructor(private readonly store = new PollinateStore()) {}
 
@@ -73,7 +84,12 @@ export class PollinateDaemon {
     await this.store.ensure();
     await this.acquireLock();
     try {
+      await ensureStoreSchema(this.store.root);
+      const api = new ApiServer(this.apiHost(), apiSocketPath(this.store.root));
+      await api.prepare();
+      this.api = api;
       await this.startEngines();
+      await this.startApi(api);
     } catch (error) {
       await this.log(`daemon start failed: ${error instanceof Error ? error.message : String(error)}`);
       await this.abandonStart();
@@ -119,6 +135,7 @@ export class PollinateDaemon {
     this.stopping = true;
     this.clearTimers();
     this.health?.shutdown();
+    await this.api?.stop().catch(() => undefined);
     await this.webhook?.stop().catch(() => undefined);
     await this.poll?.stop().catch(() => undefined);
     await this.schedule?.stop().catch(() => undefined);
@@ -142,6 +159,8 @@ export class PollinateDaemon {
       await this.log(`previous daemon run exited uncleanly (${restarts.uncleanExits} unclean exits in the last hour)`);
     }
     const startedAtMs = Date.now();
+    this.startedAt = new Date(startedAtMs).toISOString();
+    this.reloadedAt = this.startedAt;
     const config = await this.store.daemonConfig();
     await gcTemporaryHooks(this.store);
     await this.pruneOrphanedTriggerState();
@@ -184,6 +203,7 @@ export class PollinateDaemon {
       webhook_bind: config.webhook.bind,
       webhook_port: config.webhook.port,
       webhook_relay_enabled: Boolean(config.webhook.relay.secret),
+      socket: apiSocketPath(this.store.root),
     });
     await this.log(
       `daemon started in ${Date.now() - startedAtMs}ms: ${triggers.length} triggers, webhook ${config.webhook.bind}:${config.webhook.port}, binding gc every ${config.defaults.bindingGcMs}ms, jobs gc every ${config.retention.jobsGcMs}ms`,
@@ -193,8 +213,14 @@ export class PollinateDaemon {
     if (triggers.some(triggerUsesHive)) void this.probeHive(config);
   }
 
-  private async probeHive(config: DaemonConfig): Promise<void> {
+  private probeHive(config: DaemonConfig): Promise<void> {
+    this.hiveProbing ??= this.runHiveProbe(config);
+    return this.hiveProbing;
+  }
+
+  private async runHiveProbe(config: DaemonConfig): Promise<void> {
     const probe = await probeHive(config.honeybee.bin, config.execution);
+    this.hiveStatus = probe.path ? { path: probe.path, version: probe.version } : null;
     await this.store.appendLedger({ event: "pollinate.hive.probed", ...probe });
     if (!probe.ok) await this.log(`hive probe failed for ${probe.path ?? config.honeybee.bin ?? "hive"}: ${probe.error ?? "unknown error"}`);
   }
@@ -219,12 +245,14 @@ export class PollinateDaemon {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.api?.beginStopping();
     this.clearTimers();
     this.health?.shutdown();
     await this.webhook?.stop();
     await this.poll?.stop();
     await this.schedule?.stop();
     await this.delivery?.shutdown();
+    await this.api?.stop().catch(() => undefined);
     await this.store.appendLedger({ event: "pollinate.daemon.stopped" });
     await recordDaemonStop(this.store.root).catch(() => undefined);
     await this.releaseLock();
@@ -241,6 +269,7 @@ export class PollinateDaemon {
 
   private async reloadTriggers(): Promise<void> {
     if (this.stopping || !this.delivery || !this.schedule || !this.poll || !this.webhook) return;
+    const generation = this.applyGeneration;
     try {
       const config = await this.store.daemonConfig();
       const configSignature = signatureForConfig(config);
@@ -250,6 +279,7 @@ export class PollinateDaemon {
       }
       await gcTemporaryHooks(this.store, { hasLiveJobs: (triggerId) => this.delivery?.hasLiveJobs(triggerId) ?? false });
       const { triggers, invalid } = await this.store.loadTriggerFiles();
+      if (this.appliesInFlight > 0 || generation !== this.applyGeneration) return;
       const signature = signatureForTriggers(triggers);
       if (signature === this.triggerSignature) {
         await this.health?.syncTriggerFiles(triggers, invalid);
@@ -257,6 +287,7 @@ export class PollinateDaemon {
       }
       this.triggerSignature = signature;
       this.setTriggers(triggers);
+      this.reloadedAt = nowIso();
       await this.health?.syncTriggerFiles(triggers, invalid);
       await this.delivery.init(triggers);
       this.schedule.updateTriggers(triggers);
@@ -272,6 +303,81 @@ export class PollinateDaemon {
       });
       await this.log(`trigger reload failed: ${message}`);
     }
+  }
+
+  private async startApi(api: ApiServer): Promise<void> {
+    await api.start();
+    await this.log(`api listening on ${api.socketPath}`);
+  }
+
+  private apiHost(): ApiHost {
+    const daemon = this;
+    return {
+      store: this.store,
+      get startedAt() {
+        return daemon.startedAt;
+      },
+      get reloadedAt() {
+        return daemon.reloadedAt;
+      },
+      config: () => this.config ?? DEFAULT_DAEMON_CONFIG,
+      webhookAddress: () => this.webhook?.address() ?? null,
+      triggers: () => this.triggers,
+      trigger: (id) => this.triggerById.get(id),
+      preflightPoll: (trigger) => this.requirePoll().preflight(trigger),
+      applyTrigger: (id, write, fetchedPoll) => this.applyTrigger(id, write, fetchedPoll),
+      scheduleState: (id) => this.schedule?.stateFor(id) ?? {},
+      fire: (trigger, payload, deliveryId) => this.fireTrigger(trigger, payload, deliveryId),
+      hive: () => this.hive(),
+    };
+  }
+
+  private requirePoll(): PollEngine {
+    if (!this.poll) throw new Error("poll engine is not running");
+    return this.poll;
+  }
+
+  private async applyTrigger<T extends Trigger | null>(id: string, write: () => Promise<T>, fetchedPoll?: string): Promise<{ stored: T; poll?: PollCheck }> {
+    const { delivery, schedule, poll, webhook } = this;
+    if (this.stopping || !delivery || !schedule || !poll || !webhook) throw new ApiError("stopping", "the daemon is stopping");
+    this.appliesInFlight += 1;
+    this.applyGeneration += 1;
+    try {
+      const stored = await write();
+      this.applyGeneration += 1;
+      const triggers = this.triggers.filter((trigger) => trigger.id !== id);
+      if (stored) triggers.push(stored);
+      triggers.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      this.setTriggers(triggers);
+      this.triggerSignature = signatureForTriggers(triggers);
+      this.reloadedAt = nowIso();
+      webhook.updateTriggers(triggers);
+      await delivery.init(triggers);
+      await schedule.applyNow(triggers);
+      if (stored && fetchedPoll !== undefined && stored.enabled && stored.source.kind === "poll") {
+        return { stored, poll: await poll.adoptChecked(triggers, stored, fetchedPoll) };
+      }
+      poll.updateTriggers(triggers);
+      return { stored };
+    } finally {
+      this.appliesInFlight -= 1;
+    }
+  }
+
+  private async fireTrigger(trigger: Trigger, payload: JsonValue, deliveryId?: string): Promise<{ job: Job | null; duplicate: boolean }> {
+    if (!this.delivery) throw new Error("delivery is not running");
+    const activation = manualActivation(trigger, payload, { deliveryId });
+    const fullDeliveryId = activation.metadata?.deliveryId;
+    if (deliveryId && fullDeliveryId && (await this.store.hasSeenDelivery(trigger.id, fullDeliveryId))) {
+      await this.store.appendLedger({ event: "pollinate.delivery.duplicate", trigger_id: trigger.id, delivery_id: fullDeliveryId, source: activation.source });
+      return { job: null, duplicate: true };
+    }
+    return { job: await this.delivery.handle(trigger, activation), duplicate: false };
+  }
+
+  private hive(): { path: string; version: string | null } | undefined {
+    if (this.config) void this.probeHive(this.config);
+    return this.hiveStatus ?? undefined;
   }
 
   private setTriggers(triggers: Trigger[]): void {

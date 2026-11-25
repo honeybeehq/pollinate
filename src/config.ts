@@ -60,6 +60,10 @@ export function parseTriggerToml(text: string, fallbackId?: string): Trigger {
   return normalizeTrigger(rawTrigger, fallbackId);
 }
 
+export function parseTriggerRecord(raw: Record<string, unknown>, fallbackId?: string): Trigger {
+  return normalizeTrigger(asRecord(raw, "trigger"), fallbackId);
+}
+
 export function triggerToToml(trigger: Trigger): string {
   return stringify({ trigger: stripRuntimeDates(trigger) }) as string;
 }

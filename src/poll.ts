@@ -16,10 +16,12 @@ export function pollDelayMs(intervalMs: number, consecutiveErrors: number): numb
   return intervalMs * 2 ** doublings;
 }
 
+export type PollCheck = { baselined: boolean; itemCount: number; newCount: number };
+
 export class PollEngine {
   private cursors: CursorState = {};
   private timers = new Map<string, NodeJS.Timeout>();
-  private polling = new Map<string, Promise<number>>();
+  private polling = new Map<string, Promise<PollCheck>>();
   private errors = new Map<string, number>();
   private cursorWrite: Promise<void> = Promise.resolve();
   private running = false;
@@ -65,25 +67,61 @@ export class PollEngine {
   async pollNow(trigger: Trigger): Promise<number> {
     if (trigger.source.kind !== "poll") throw new Error(`Trigger ${trigger.id} is not a poll trigger`);
     const inFlight = this.polling.get(trigger.id);
-    if (inFlight) return inFlight;
-    const polling = this.runPollNow(trigger).finally(() => {
-      this.polling.delete(trigger.id);
-    });
-    this.polling.set(trigger.id, polling);
-    return polling;
+    if (inFlight) return (await inFlight).newCount;
+    return (await this.track(trigger.id, this.runPollNow(trigger))).newCount;
   }
 
-  private async runPollNow(trigger: Trigger): Promise<number> {
+  async preflight(trigger: Trigger): Promise<string> {
+    if (trigger.source.kind !== "poll") throw new Error(`Trigger ${trigger.id} is not a poll trigger`);
+    const fetched = await fetchPoll(trigger.source.poll, trigger.cwd, this.execution);
+    detectDelta(trigger.source.poll, trigger.id, fetched, {});
+    return fetched;
+  }
+
+  async adoptChecked(triggers: Trigger[], trigger: Trigger, fetched: string): Promise<PollCheck> {
+    const existing = this.timers.get(trigger.id);
+    if (existing) clearTimeout(existing);
+    this.timers.delete(trigger.id);
+    const previous = this.polling.get(trigger.id);
+    const run = this.track(
+      trigger.id,
+      (previous ?? Promise.resolve()).catch(() => undefined).then(() => this.applyFetched(trigger, fetched)),
+    );
+    this.updateTriggers(triggers);
+    try {
+      const check = await run;
+      this.errors.delete(trigger.id);
+      await this.health?.recordSuccess(trigger.id, "poll");
+      return check;
+    } finally {
+      const latest = this.pollTriggers().find((item) => item.id === trigger.id);
+      if (latest && !this.polling.has(latest.id)) this.schedule(latest, this.nextDelayMs(latest));
+    }
+  }
+
+  private track(triggerId: string, polling: Promise<PollCheck>): Promise<PollCheck> {
+    const tracked = polling.finally(() => {
+      if (this.polling.get(triggerId) === tracked) this.polling.delete(triggerId);
+    });
+    this.polling.set(triggerId, tracked);
+    return tracked;
+  }
+
+  private async runPollNow(trigger: Trigger): Promise<PollCheck> {
+    if (trigger.source.kind !== "poll") throw new Error(`Trigger ${trigger.id} is not a poll trigger`);
+    return this.applyFetched(trigger, await fetchPoll(trigger.source.poll, trigger.cwd, this.execution));
+  }
+
+  private async applyFetched(trigger: Trigger, fetched: string): Promise<PollCheck> {
     if (trigger.source.kind !== "poll") throw new Error(`Trigger ${trigger.id} is not a poll trigger`);
     const spec = trigger.source.poll;
-    const fetched = await fetchPoll(spec, trigger.cwd, this.execution);
     const firstCheck = this.cursors[trigger.id] === undefined;
     const delta = detectDelta(spec, trigger.id, fetched, this.cursors);
     if (spec.baseline && firstCheck) {
       this.cursors[trigger.id] = delta.cursors[trigger.id];
       await this.writeCursors();
       await this.store.appendLedger({ event: "pollinate.poll.baselined", trigger_id: trigger.id, item_count: delta.itemCount, at: nowIso() });
-      return 0;
+      return { baselined: true, itemCount: delta.itemCount, newCount: 0 };
     }
     await this.store.appendLedger({
       event: "pollinate.poll.checked",
@@ -105,7 +143,7 @@ export class PollEngine {
       }
       await this.store.appendLedger({ event: "pollinate.poll.detected", trigger_id: trigger.id, item_count: delta.items.length, at: nowIso() });
     }
-    return delta.items.length;
+    return { baselined: false, itemCount: delta.itemCount, newCount: delta.items.length };
   }
 
   private schedule(trigger: Trigger, delayMs: number): void {

@@ -41,6 +41,7 @@ everything here is otherwise only discoverable by reading the source.
 - `pol --version [--json]` reads the file next to `dist/cli.js` (symlinked bins
   resolve to the real file). When the file is missing, `--json` reports
   `commit`, `dirty` and `builtAt` as `null` and the version from `package.json`.
+- `--json` also carries `api: 1`, the local API version this build serves.
 
 ## Releases
 
@@ -136,6 +137,7 @@ symlinks, then
   state/jobs-store.json           last retention sweep: job file count, bytes, largest triggers, warnings
   state/daemon-runs.json          last 20 daemon starts/clean stops (crash-loop detection)
   state/daemon.lock               one daemon per store: pid, start time, token; mtime is the heartbeat
+  state/store.json                store metadata {schema: 1}; a newer schema refuses the daemon start
   state/trigger-locks/<id>.lock   per-trigger write locks
   state/job-locks/<jobId>.lock    per-job write locks
   state/router-bindings/<trigger>/<subject>.json   binding records
@@ -147,6 +149,7 @@ symlinks, then
   daemon.out.log                  macOS launchd stdout log
   daemon.err.log                  macOS launchd stderr log
   pollinate.toml                  daemon config
+  pollinated.sock                 local API v1 socket (0600, only while the daemon runs)
 ```
 
 ## CLI map
@@ -544,6 +547,39 @@ its mtime every 10 s.
   and exits 1.
 - A clean stop removes the lock.
 
+## Local API (socket)
+
+The daemon serves the v1 API (HTTP/1.1 + JSON, `node:http`) on
+`<store>/pollinated.sock`. Every call, with a request and answer, is in
+[docs/API.md](docs/API.md).
+
+- No TCP listener, no token. The socket is mode `0600` inside the `0700` store,
+  so trust is the store directory's. `POLLINATE_SOCKET` overrides the path; a
+  path over 103 bytes refuses the start with a clear error.
+- Start order: lock, `state/store.json` schema check, socket path check (a
+  stale socket file is unlinked; a regular file there or a socket another
+  process answers on refuses the start), engines, then the socket listens. So
+  `GET /v1/health` answering means the daemon is ready. A daemon refused at
+  the lock never touches the socket.
+- Stop: requests answer `503 stopping` from the first moment of shutdown; the
+  socket is closed and unlinked before the lock is released. After `kill -9`
+  the socket file stays; the next start replaces it.
+- API writes (`PUT`, `PATCH`, `DELETE`) go through the same store functions as
+  the CLI (`putTrigger`, `setTriggerEnabled`, `removeTrigger`), then hand the
+  trigger straight to delivery, schedules, polls and webhooks before
+  answering. A file reload that read the disk before an API write finished is
+  discarded, so it cannot undo the write. CLI writes still arrive through the
+  1 s file reload.
+- `PUT` of an enabled poll runs the first check inside the call: a failure is
+  `422 poll_failed` and nothing is stored; otherwise the fetched result goes
+  through the normal check (baseline or dispatch), and the next check follows
+  one interval later.
+- `POST /v1/triggers/:id/fire` uses the daemon's delivery queue, unlike
+  `pol trigger`, so `maxConcurrent`, delivery modes and dedup hold. A repeated
+  `deliveryId` answers `409 conflict` and ledgers `pollinate.delivery.duplicate`.
+- `state/store.json` is `{"schema": 1}`, written when missing. A higher schema
+  refuses the start: `store schema N in … is newer than this Pollinate supports`.
+
 ## Webhooks
 
 - Local endpoint: `POST /hook/<path>` on `127.0.0.1:3978` (configurable via
@@ -840,7 +876,8 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 - `pollinate.schedule.missed` carries `policy`, `scheduled_at` (first missed
   occurrence), `missed_count`, `detected: "tick" | "startup"` and, past 10,000,
   `missed_count_capped` (see Schedules and missed fires)
-- `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored,crash_loop,refused}`;
+- `pollinate.api.errored` (an API call failed with `500 internal`; carries `method`, `path`, `error`)
+- `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored,crash_loop,refused}`; `started` carries `socket`;
   `refused` carries `reason: "locked" | "lock_lost"` and the lock holder's `pid`
   (see One daemon per store)
 - `pollinate.jobs.{gc,store_warning}` · `pollinate.ledger.rotated` (job/ledger retention, see Job retention)

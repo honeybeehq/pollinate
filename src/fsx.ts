@@ -60,6 +60,45 @@ export function daemonLockPath(root = storeRoot()): string {
   return join(stateDir(root), "daemon.lock");
 }
 
+export const STORE_SCHEMA = 1;
+export const MAX_SOCKET_PATH_BYTES = 103;
+
+export function apiSocketPath(root = storeRoot()): string {
+  return process.env.POLLINATE_SOCKET || join(root, "pollinated.sock");
+}
+
+export function storeMetaPath(root = storeRoot()): string {
+  return join(stateDir(root), "store.json");
+}
+
+export class StoreSchemaError extends Error {
+  constructor(
+    readonly found: number,
+    readonly path: string,
+  ) {
+    super(`store schema ${found} in ${path} is newer than this Pollinate supports (schema ${STORE_SCHEMA}); upgrade Pollinate or use another store`);
+    this.name = "StoreSchemaError";
+  }
+}
+
+export async function ensureStoreSchema(root = storeRoot()): Promise<number> {
+  const path = storeMetaPath(root);
+  const text = await readTextOrNull(path);
+  if (text === null || text.trim() === "") {
+    await writeJson(path, { schema: STORE_SCHEMA });
+    return STORE_SCHEMA;
+  }
+  let schema: unknown;
+  try {
+    schema = (JSON.parse(text) as { schema?: unknown }).schema;
+  } catch {
+    throw new Error(`store metadata ${path} is not valid JSON; fix or remove it`);
+  }
+  if (typeof schema !== "number" || !Number.isInteger(schema) || schema < 1) throw new Error(`store metadata ${path} has no valid "schema"; fix or remove it`);
+  if (schema > STORE_SCHEMA) throw new StoreSchemaError(schema, path);
+  return schema;
+}
+
 export function daemonConfigPath(root = storeRoot()): string {
   return join(root, "pollinate.toml");
 }
