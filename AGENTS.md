@@ -126,7 +126,7 @@ symlinks, then
   triggers/<id>.toml              one trigger per file (0600)
   router-plugins/<name>.mjs       user-space router plugins
   state/schedule-state.json       next/last fire times
-  state/delivery-state.json       throttle/batch/debounce queues
+  state/delivery-state.json       throttle/batch/debounce queues, in-flight jobs, admissions (see Retry)
   state/deliveries-seen.json      stable delivery ids already fired (dedup; see Delivery identity)
   state/cursors.json              poll cursors
   state/job-id-index.json         UUIDs used for visible job ID suffixes
@@ -223,6 +223,14 @@ interval = "1m"              # throttled (+ collect = true to batch suppressed e
 window = "30s"               # batched
 maxBatch = 10                # batched
 quietPeriod = "20s"          # debounced
+maxQueued = 1000             # beyond it the newest activation is dropped (pollinate.delivery.dropped)
+
+[trigger.retry]              # optional; without it every job gets one attempt (see Retry)
+maxAttempts = 8              # total tries; default 1
+backoff = "2s"               # first delay, doubling per attempt, ±20% jitter
+maxBackoff = "5m"
+maxElapsed = "1h"            # no attempt starts later than this after the first
+on = ["transport", "timeout", "status:408", "status:429", "status:5xx"]   # default depends on the action kind
 
 [trigger.context]            # extra template vars resolved before the action
 [[trigger.context.sources]]
@@ -503,8 +511,9 @@ exits 75. A first start on a large store on a loaded Mac can take minutes.
   `lastCommand`, `lastMessage`). Cancelling the job stops the wait.
 - Honeybee context sources apply their `timeout` per attempt; give them more
   than 15 s if they should ride out the CLI hold.
-- Pollinate restarting during the wait still marks the job errored at startup
-  ("daemon restarted mid-execution"), as for any running job.
+- Pollinate restarting during the wait marks the job errored at startup
+  ("daemon restarted mid-execution"), unless the trigger has a
+  `[trigger.retry]` policy, which resumes it (see Retry).
 
 ## Job retention
 
@@ -550,6 +559,58 @@ out of heap; launchd restarted it every 16 s for seven hours.
   [--max-per-trigger <n>] [--max-total <n>] [--dry-run]`. Flags default to the
   `[retention]` config; `--dry-run` reports what would be removed, per trigger.
 
+## Retry
+
+`[trigger.retry]` (keys also `max_attempts`, `max_backoff`, `max_elapsed`)
+retries a failed `[trigger.action]` job inside the same job, with the same
+delivery id, so receivers see one `Idempotency-Key` and an increasing
+`X-Pollinate-Attempt` / `{{attempt}}`. Router triggers (`[trigger.router]`
+without `[trigger.action]`) ignore it.
+
+- Delay before attempt n+1: `backoff × 2^(n-1)`, ±20% jitter, at most
+  `maxBackoff`. An http `Retry-After` (seconds or date) replaces it, capped at
+  `maxBackoff`. No retry is scheduled whose start would be more than
+  `maxElapsed` after the first attempt started.
+- `on` lists the failure classes that retry: `transport` (connection error),
+  `timeout`, `status:<code>`, `status:<n>xx`, `exit` (command exited non-zero)
+  and hive error codes (`error (<code>)` on stderr or `error.code` in JSON).
+  Defaults: `http` → `transport`, `timeout`, `status:408`, `status:429`,
+  `status:5xx` (other 4xx are final); `honeybee` → `hived_handover_stalled`,
+  `socket_unreachable`, `timeout` (the `daemon_starting` wait stays inside one
+  attempt); `command` and `emit` → nothing, because commands need not be
+  idempotent; `sequence` → the union of its steps. A retried sequence runs all
+  its steps again.
+- Between attempts the job is `retrying` (non-terminal) with `nextAttemptAt`.
+  The job records `attempt` and `attempts` (the last 10: `attempt`,
+  `startedAt`, `endedAt`, `error`, `retryable`). A retrying job keeps its
+  `maxConcurrent` slot, so later fires of the trigger wait behind it.
+- Durable: `state/delivery-state.json` keeps every job from queued to terminal
+  (`queue`, then `inFlight` with the job, activation and batch). Before a
+  delivery id is claimed in `deliveries-seen.json` (webhooks included, before
+  the 202), the activation is written to `admitting` with the claim time; it
+  leaves `admitting` in the same write that makes it a queued job or a pending
+  batch member, or when it is filtered, throttled or dropped. At startup an
+  admission whose claim is ours (same time) or missing is dispatched; one
+  claimed by someone else is a duplicate.
+- At startup an in-flight `retrying` job, or a `running` /
+  `resolving-context` job of a trigger with a retry policy, is resumed with
+  the same delivery id; an interrupted attempt counts as failed (and
+  retryable). Ledger `pollinate.job.resumed {job_id, trigger_id, delivery_id,
+  attempt, next_attempt_at, recovered_from}`. Other interrupted jobs are
+  marked errored as before ("daemon restarted mid-execution"). The stale job
+  sweep also hands orphaned `retrying` jobs (e.g. from a killed
+  `pol trigger`) to the daemon.
+- `pol trigger` runs the retries in the foreground and returns the terminal
+  job.
+- Removing or disabling a trigger cancels its queued and retrying jobs
+  (`pollinate.job.cancelled` with `reason: "trigger-removed"`). Triggers that
+  disabled themselves (a fired `once` schedule, `maxDeliveries` reached) keep
+  their jobs. A running attempt finishes; it is not retried.
+- Ledger: each scheduled retry `pollinate.job.retry_scheduled {job_id,
+  trigger_id, delivery_id, attempt, retry_in_ms, error}`; the final
+  `pollinate.job.errored` carries `attempts` and `gave_up` (true when the
+  failure was retryable but attempts or `maxElapsed` ran out).
+
 ## Delivery identity
 
 Every activation, and so every job (`Job.deliveryId`), has a delivery id
@@ -570,8 +631,9 @@ Sequence steps run with `<delivery id>.s<n>`. Deduped ids are recorded in
 every write and when the trigger is removed). A repeat is not fired: webhooks
 answer `{duplicate: true}` and ledger `pollinate.webhook.duplicate`, other
 sources ledger `pollinate.delivery.duplicate {trigger_id, delivery_id, source}`.
-A crash between recording an id and running its job loses that delivery;
-a lost write of the record allows one duplicate. Receivers should key on
+A crash between recording an id and running its job no longer loses the
+delivery (see Retry: admissions); a lost write of the record allows one
+duplicate. Receivers should key on
 `Idempotency-Key` / `{{delivery_id}}`.
 
 ## Ledger events
@@ -582,8 +644,8 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 - `pollinate.trigger.{added,enabled,disabled,removed}`
 - `pollinate.trigger.invalid` (a trigger file that fails to load, e.g. one
   using a removed action kind; once per file change, keyed on path, mtime and size)
-- `pollinate.job.{queued,started,completed,errored,cancelled,hive_starting}`
-- `pollinate.delivery.{filtered,throttled,duplicate}`
+- `pollinate.job.{queued,started,completed,errored,cancelled,hive_starting,retry_scheduled,resumed}`
+- `pollinate.delivery.{filtered,throttled,duplicate,dropped}`
 - `pollinate.schedule.{fired,missed,errored}` · `pollinate.poll.{checked,detected,errored}`
 - `pollinate.webhook.{received,rejected,duplicate}`
 - `pollinate.hook.{created,delivered,expired,gc_removed}`
@@ -603,3 +665,4 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 Jobs use Honeybee-style IDs `<TRIGGER-PREFIX>.<uuid-prefix>` (e.g. `HE.a3f`).
 `pol job <ref>` accepts the visible id, the suffix, or a longer UUID prefix.
 Terminal statuses: `completed`, `errored`, `timed-out`, `cancelled`.
+Non-terminal: `queued`, `resolving-context`, `running`, `retrying`.

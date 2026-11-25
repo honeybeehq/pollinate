@@ -52,6 +52,15 @@ export type DeliveryMode =
 export type Delivery = {
   mode: DeliveryMode;
   maxConcurrent: number;
+  maxQueued?: number;
+};
+
+export type RetryPolicy = {
+  maxAttempts: number;
+  backoff: string;
+  maxBackoff: string;
+  maxElapsed: string;
+  on?: string[];
 };
 
 export type HoneybeeAction =
@@ -122,6 +131,7 @@ export type Trigger = {
   source: Source;
   filter?: Filter;
   delivery: Delivery;
+  retry?: RetryPolicy;
   context?: ContextResolver;
   lifecycle?: TriggerLifecycle;
   router?: RouterConfig;
@@ -134,6 +144,7 @@ export type JobStatus =
   | "queued"
   | "resolving-context"
   | "running"
+  | "retrying"
   | "completed"
   | "errored"
   | "timed-out"
@@ -156,6 +167,9 @@ export type Job = {
   startedAt?: string;
   completedAt?: string;
   batch?: JsonValue[];
+  attempt?: number;
+  nextAttemptAt?: string;
+  attempts?: JobAttempt[];
   hiveStarting?: {
     refusals: number;
     firstRefusedAt: string;
@@ -163,6 +177,14 @@ export type Job = {
     lastCommand: string;
     lastMessage: string;
   };
+};
+
+export type JobAttempt = {
+  attempt: number;
+  startedAt: string;
+  endedAt: string;
+  error?: string;
+  retryable: boolean;
 };
 
 export type Activation = {
@@ -231,9 +253,15 @@ export type DeliveryState = Record<
     pendingBatch?: Activation[];
     timerDueAt?: string;
     timerKind?: "throttled" | "batched" | "debounced";
-    queue?: Array<{ job: Job; activation: Activation; batch: JsonValue[] }>;
+    queue?: Array<DeliveryEntry>;
+    inFlight?: Array<DeliveryEntry>;
+    admitting?: Record<string, AdmittingEntry>;
   }
 >;
+
+export type DeliveryEntry = { job: Job; activation: Activation; batch: JsonValue[] };
+
+export type AdmittingEntry = { activation: Activation; claimedAt?: number; preclaimed?: boolean };
 
 export type DeliveriesSeen = Record<string, Record<string, number>>;
 

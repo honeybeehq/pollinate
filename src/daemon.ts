@@ -24,7 +24,7 @@ import { jobStoreWarnings, recordDaemonStart, recordDaemonStop, topTriggersByFil
 import type { DaemonConfig, JobStatus, Trigger } from "./types.js";
 
 const STALE_JOB_RECOVERY_MS = 60_000;
-const NON_TERMINAL_JOB_STATUSES: JobStatus[] = ["queued", "resolving-context", "running"];
+const NON_TERMINAL_JOB_STATUSES: JobStatus[] = ["queued", "resolving-context", "running", "retrying"];
 const MS_PER_DAY = 86_400_000;
 const MIN_PRESSURE_GC_SPACING_MS = 60_000;
 let daemonProcessGuardsInstalled = false;
@@ -373,9 +373,13 @@ export class PollinateDaemon {
         if (this.delivery?.ownsJob(listed.id)) continue;
         const job = await this.store.getJob(listed.id);
         if (!job || !NON_TERMINAL_JOB_STATUSES.includes(job.status)) continue;
-        const touchedAt = job.startedAt ?? job.queuedAt;
+        const touchedAt = job.nextAttemptAt ?? job.startedAt ?? job.queuedAt;
         const touchedMs = new Date(touchedAt).getTime();
         if (Number.isFinite(touchedMs) && now - touchedMs < staleMs) continue;
+        if (await this.delivery?.adoptOrphan(job)) {
+          recovered += 1;
+          continue;
+        }
         const previousStatus = job.status;
         const error = `daemon restarted mid-execution; marking stale ${previousStatus} job errored`;
         const updated = await this.store.updateJob(job.id, { status: "errored", error, completedAt: nowIso() }, { onlyFrom: NON_TERMINAL_JOB_STATUSES });

@@ -1,4 +1,5 @@
-import type { Action, Activation, DryRunResult, ExecutionProfile, Job, JsonValue, SourceKind, Trigger } from "./types.js";
+import { setTimeout as sleep } from "node:timers/promises";
+import type { Action, Activation, DryRunResult, ExecutionProfile, Job, JobAttempt, JsonValue, RetryPolicy, SourceKind, Trigger } from "./types.js";
 import type { PollinateStore } from "./store.js";
 import { resolveContext } from "./context.js";
 import { renderAction, renderString } from "./templates.js";
@@ -25,6 +26,50 @@ export type ActionExecutionContext = {
 };
 
 const FIRST_ATTEMPT = 1;
+const MAX_ATTEMPT_RECORDS = 10;
+const RETRY_JITTER = 0.2;
+const HTTP_RETRY_ON = ["transport", "timeout", "status:408", "status:429", "status:5xx"];
+const HIVE_RETRY_ON = ["hived_handover_stalled", "socket_unreachable", "timeout"];
+
+export class ActionFailure extends Error {
+  constructor(
+    message: string,
+    readonly codes: string[],
+    readonly retryAfterMs?: number,
+  ) {
+    super(message);
+    this.name = "ActionFailure";
+  }
+}
+
+export function retryPolicyFor(trigger: Trigger): RetryPolicy | undefined {
+  if (!trigger.action || !trigger.retry || trigger.retry.maxAttempts <= 1) return undefined;
+  return trigger.retry;
+}
+
+export function defaultRetryOn(action: Action | undefined): string[] {
+  if (!action) return [];
+  if (action.kind === "http") return HTTP_RETRY_ON;
+  if (action.kind === "honeybee") return HIVE_RETRY_ON;
+  if (action.kind === "sequence") return [...new Set(action.actions.flatMap((step) => defaultRetryOn(step.action)))];
+  return [];
+}
+
+export function retryDelayMs(policy: RetryPolicy, attempt: number, retryAfterMs?: number, random = Math.random): number {
+  const maxBackoff = parseDuration(policy.maxBackoff);
+  if (retryAfterMs !== undefined) return Math.min(Math.max(0, retryAfterMs), maxBackoff);
+  const base = Math.min(parseDuration(policy.backoff) * 2 ** (attempt - 1), maxBackoff);
+  const jittered = base * (1 - RETRY_JITTER + 2 * RETRY_JITTER * random());
+  return Math.round(Math.min(jittered, maxBackoff));
+}
+
+type AttemptFailure = {
+  attempt: number;
+  startedAt: string;
+  error: unknown;
+  forceRetryable?: boolean;
+  timedOut?: { result: ActionResult; warnings: string[]; durationMs?: number };
+};
 
 export class ActionExecutor {
   constructor(
@@ -84,11 +129,25 @@ export class ActionExecutor {
     const activation = job.deliveryId && !incoming.metadata?.deliveryId
       ? { ...incoming, metadata: { ...incoming.metadata, deliveryId: job.deliveryId } }
       : withDeliveryId(incoming);
-    const cancellation = await this.store.getJob(job.id);
-    if (cancellation?.status === "cancelled") return cancellation;
+    const fresh = await this.store.getJob(job.id);
+    if (fresh?.status === "cancelled") return fresh;
+    const attempt = (fresh?.attempt ?? 0) + 1;
     return withHiveStartingObserver(this.hiveStartingObserver(job), () =>
-      trigger.router && !job.action ? this.executeRouterJob(job, trigger, activation, batch) : this.executePlainJob(job, trigger, activation, batch),
+      trigger.router && !job.action
+        ? this.executeRouterJob(job, trigger, activation, batch, attempt)
+        : this.executePlainJob(job, trigger, activation, batch, attempt),
     );
+  }
+
+  async interruptAttempt(job: Job, trigger: Trigger): Promise<Job> {
+    const attempt = job.attempt ?? FIRST_ATTEMPT;
+    const startedAt = job.attempts?.length ? job.attempts[job.attempts.length - 1]!.endedAt : (job.startedAt ?? job.queuedAt);
+    return this.failAttempt(job, trigger, {
+      attempt,
+      startedAt,
+      error: new ActionFailure(`daemon restarted mid-execution during attempt ${attempt}`, ["interrupted"]),
+      forceRetryable: true,
+    });
   }
 
   private hiveStartingObserver(job: Job): HiveStartingObserver {
@@ -121,11 +180,13 @@ export class ActionExecutor {
     };
   }
 
-  private async executePlainJob(job: Job, trigger: Trigger, activation: Activation, batch: JsonValue[]): Promise<Job> {
-    await this.store.updateJob(job.id, { status: "resolving-context" });
+  private async executePlainJob(job: Job, trigger: Trigger, activation: Activation, batch: JsonValue[], attempt: number): Promise<Job> {
+    const attemptStartedAt = nowIso();
+    const resolving = await this.store.updateJob(job.id, { status: "resolving-context", attempt, nextAttemptAt: undefined });
+    if (resolving.status === "cancelled") return resolving;
     try {
       const jobCwd = job.cwd ?? trigger.cwd;
-      const execution = this.executionContextFor(job, trigger, activation);
+      const execution = this.executionContextFor(job, trigger, activation, attempt);
       const resolved = await this.buildContext(trigger, activation, batch, jobCwd, execution);
       if (!job.action) throw new Error(`Job ${job.id} has no action`);
       const rendered = this.renderJobInputs(job.action, jobCwd, resolved.context);
@@ -135,50 +196,113 @@ export class ActionExecutor {
         cwd: rendered.cwd,
         context: resolved.context,
         action: rendered.action,
-        startedAt: nowIso(),
+        startedAt: resolving.startedAt ?? attemptStartedAt,
       });
-      await this.store.appendLedger({ event: "pollinate.job.started", job_id: job.id, trigger_id: trigger.id, action_kind: rendered.action.kind, cwd: rendered.cwd });
+      await this.store.appendLedger({
+        event: "pollinate.job.started",
+        job_id: job.id,
+        trigger_id: trigger.id,
+        action_kind: rendered.action.kind,
+        cwd: rendered.cwd,
+        ...(attempt > FIRST_ATTEMPT ? { attempt } : {}),
+      });
       const result = await this.executeAction(rendered.action, rendered.cwd, execution);
+      const durationMs = running.startedAt ? Date.now() - new Date(running.startedAt).getTime() : undefined;
+      if (result.timedOut) {
+        return this.failAttempt(job, trigger, {
+          attempt,
+          startedAt: attemptStartedAt,
+          error: new ActionFailure("action timed out", ["timeout"]),
+          timedOut: { result, warnings, durationMs },
+        });
+      }
       const completed = await this.store.updateJob(job.id, {
-        status: result.timedOut ? "timed-out" : "completed",
+        status: "completed",
         result,
         completedAt: nowIso(),
         error: warnings.join("\n") || undefined,
+        attempts: appendAttempt(running.attempts, { attempt, startedAt: attemptStartedAt, endedAt: nowIso(), retryable: false }),
       });
       await this.store.appendLedger({
-        event: result.timedOut ? "pollinate.job.errored" : "pollinate.job.completed",
+        event: "pollinate.job.completed",
         job_id: job.id,
         trigger_id: trigger.id,
-        duration_ms: running.startedAt ? Date.now() - new Date(running.startedAt).getTime() : undefined,
+        duration_ms: durationMs,
         warnings,
+        ...(attempt > FIRST_ATTEMPT ? { attempt } : {}),
       });
       return completed;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const errored = await this.store.updateJob(job.id, {
-        status: "errored",
-        error: message,
-        completedAt: nowIso(),
-      });
-      await this.store.appendLedger({
-        event: "pollinate.job.errored",
-        job_id: job.id,
-        trigger_id: trigger.id,
-        error: message,
-      });
-      return errored;
+      return this.failAttempt(job, trigger, { attempt, startedAt: attemptStartedAt, error });
     }
   }
 
-  private async executeRouterJob(job: Job, trigger: Trigger, activation: Activation, batch: JsonValue[]): Promise<Job> {
+  private async failAttempt(job: Job, trigger: Trigger, failure: AttemptFailure): Promise<Job> {
+    const { attempt, startedAt, error, timedOut } = failure;
+    const message = error instanceof Error ? error.message : String(error);
+    const policy = retryPolicyFor(trigger);
+    const codes = error instanceof ActionFailure ? error.codes : [];
+    const retryOn = policy ? (policy.on ?? defaultRetryOn(job.action ?? trigger.action)) : [];
+    const retryable = Boolean(policy) && (failure.forceRetryable === true || retryOn.some((code) => codes.includes(code)));
+    const current = await this.store.getJob(job.id);
+    if (current?.status === "cancelled") return current;
+    const attempts = appendAttempt(current?.attempts, { attempt, startedAt, endedAt: nowIso(), error: message, retryable });
+    if (policy && retryable && attempt < policy.maxAttempts) {
+      const delayMs = retryDelayMs(policy, attempt, error instanceof ActionFailure ? error.retryAfterMs : undefined);
+      const firstStartedAt = new Date(attempts[0]?.startedAt ?? startedAt).getTime();
+      const elapsedAtNextAttempt = Date.now() + delayMs - (Number.isNaN(firstStartedAt) ? Date.now() : firstStartedAt);
+      if (elapsedAtNextAttempt <= parseDuration(policy.maxElapsed)) {
+        const retrying = await this.store.updateJob(job.id, {
+          status: "retrying",
+          attempt,
+          error: message,
+          nextAttemptAt: new Date(Date.now() + delayMs).toISOString(),
+          attempts,
+        });
+        if (retrying.status !== "retrying") return retrying;
+        await this.store.appendLedger({
+          event: "pollinate.job.retry_scheduled",
+          job_id: job.id,
+          trigger_id: trigger.id,
+          delivery_id: job.deliveryId,
+          attempt,
+          retry_in_ms: delayMs,
+          error: message,
+        });
+        return retrying;
+      }
+    }
+    const gaveUp = retryable;
+    const errored = await this.store.updateJob(job.id, {
+      status: timedOut ? "timed-out" : "errored",
+      attempt,
+      nextAttemptAt: undefined,
+      completedAt: nowIso(),
+      attempts,
+      ...(timedOut ? { result: timedOut.result, error: timedOut.warnings.join("\n") || undefined } : { error: message }),
+    });
+    await this.store.appendLedger({
+      event: "pollinate.job.errored",
+      job_id: job.id,
+      trigger_id: trigger.id,
+      ...(timedOut ? { duration_ms: timedOut.durationMs, warnings: timedOut.warnings } : { error: message }),
+      attempts: attempt,
+      gave_up: gaveUp,
+    });
+    return errored;
+  }
+
+  private async executeRouterJob(job: Job, trigger: Trigger, activation: Activation, batch: JsonValue[], attempt: number): Promise<Job> {
+    const execution = this.executionContextFor(job, trigger, activation, attempt);
     const running = await this.store.updateJob(job.id, {
       status: "running",
+      attempt,
       cwd: job.cwd ?? trigger.cwd,
       context: {
         event: JSON.stringify(activation.payload),
         batch: JSON.stringify(batch),
         batch_count: String(batch.length),
-        delivery_id: this.executionContextFor(job, trigger, activation).deliveryId,
+        delivery_id: execution.deliveryId,
       },
       startedAt: nowIso(),
     });
@@ -190,7 +314,7 @@ export class ActionExecutor {
         trigger,
         activation,
         cwd: running.cwd,
-        execution: this.executionContextFor(job, trigger, activation),
+        execution,
       });
       const completed = await this.store.updateJob(job.id, { status: "completed", result, completedAt: nowIso() });
       await this.store.appendLedger({
@@ -204,17 +328,17 @@ export class ActionExecutor {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const errored = await this.store.updateJob(job.id, { status: "errored", error: message, completedAt: nowIso() });
-      await this.store.appendLedger({ event: "pollinate.job.errored", job_id: job.id, trigger_id: trigger.id, error: message });
+      await this.store.appendLedger({ event: "pollinate.job.errored", job_id: job.id, trigger_id: trigger.id, error: message, attempts: attempt, gave_up: false });
       return errored;
     }
   }
 
-  private executionContextFor(job: Job, trigger: Trigger, activation: Activation): ActionExecutionContext {
+  private executionContextFor(job: Job, trigger: Trigger, activation: Activation, attempt: number): ActionExecutionContext {
     return {
       triggerId: trigger.id,
       deliveryId: job.deliveryId ?? activation.metadata?.deliveryId ?? deliveryIdFor(trigger.id, `job:${job.uuid ?? job.id}`),
       jobId: job.id,
-      attempt: FIRST_ATTEMPT,
+      attempt,
     };
   }
 
@@ -256,7 +380,7 @@ export class ActionExecutor {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
       const result = await execShell(action.command, { cwd: action.cwd ?? cwd, timeoutMs, execution: this.options.execution });
       if (result.timedOut) return { ...result, timedOut: true };
-      if (result.exitCode !== 0) throw new Error(`command exited ${result.exitCode}: ${result.stderr.trim()}`);
+      if (result.exitCode !== 0) throw new ActionFailure(`command exited ${result.exitCode}: ${result.stderr.trim()}`, ["exit", `exit:${result.exitCode}`]);
       return { ...result };
     }
     if (action.kind === "http") {
@@ -264,14 +388,26 @@ export class ActionExecutor {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const response = await fetch(action.url, {
-          method: action.method,
-          headers: withDeliveryHeaders(action.headers, executionContext),
-          body: action.body,
-          signal: controller.signal,
-        });
-        const body = await response.text();
-        if (!response.ok) throw new Error(`HTTP ${response.status}: ${body.slice(0, 500)}`);
+        let response: Response;
+        let body: string;
+        try {
+          response = await fetch(action.url, {
+            method: action.method,
+            headers: withDeliveryHeaders(action.headers, executionContext),
+            body: action.body,
+            signal: controller.signal,
+          });
+          body = await response.text();
+        } catch (error) {
+          throw new ActionFailure(error instanceof Error ? error.message : String(error), [controller.signal.aborted ? "timeout" : "transport"]);
+        }
+        if (!response.ok) {
+          throw new ActionFailure(
+            `HTTP ${response.status}: ${body.slice(0, 500)}`,
+            [`status:${response.status}`, `status:${Math.floor(response.status / 100)}xx`],
+            parseRetryAfterMs(response.headers.get("retry-after")),
+          );
+        }
         return { status: response.status, body };
       } finally {
         clearTimeout(timer);
@@ -402,7 +538,7 @@ export class ActionExecutor {
       execution: this.options.execution,
       startingWaitMs: this.hiveStartingWaitMs,
     });
-    if (result.exitCode !== 0) throw new Error(`${label} exited ${result.exitCode}: ${result.stderr.trim()}`);
+    if (result.exitCode !== 0) throw new ActionFailure(`${label} exited ${result.exitCode}: ${result.stderr.trim()}`, hiveFailureCodes(result));
     return { ...result };
   }
 
@@ -436,7 +572,13 @@ export async function fireTriggerNow(
   const job = await executor.createQueuedJob(trigger, activation, [payload]);
   await store.saveJob(job);
   await store.appendLedger({ event: "pollinate.job.queued", job_id: job.id, trigger_id: trigger.id, queue_position: 0, at: nowIso() });
-  return executor.executeJob(job, trigger, activation, [payload]);
+  let current = await executor.executeJob(job, trigger, activation, [payload]);
+  while (current.status === "retrying") {
+    const dueAt = current.nextAttemptAt ? new Date(current.nextAttemptAt).getTime() : Date.now();
+    await sleep(Math.max(0, (Number.isNaN(dueAt) ? Date.now() : dueAt) - Date.now()));
+    current = await executor.executeJob(job, trigger, activation, [payload]);
+  }
+  return current;
 }
 
 export class DuplicateDeliveryError extends Error {
@@ -505,4 +647,33 @@ export function withDeliveryHeaders(headers: Record<string, string> | undefined,
   };
   for (const [key, value] of Object.entries(defaults)) if (!present.has(key.toLowerCase())) merged[key] = value;
   return merged;
+}
+
+function appendAttempt(previous: JobAttempt[] | undefined, record: JobAttempt): JobAttempt[] {
+  return [...(previous ?? []), record].slice(-MAX_ATTEMPT_RECORDS);
+}
+
+export function parseRetryAfterMs(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const at = Date.parse(trimmed);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
+}
+
+export function hiveFailureCodes(result: ExecResult): string[] {
+  const codes = new Set<string>();
+  if (result.timedOut) codes.add("timeout");
+  for (const match of result.stderr.matchAll(/\berror \(([a-z][a-z0-9_]*)\)/g)) codes.add(match[1]!);
+  for (const line of result.stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const code = (JSON.parse(trimmed) as { error?: { code?: unknown } }).error?.code;
+      if (typeof code === "string") codes.add(code);
+    } catch {
+      continue;
+    }
+  }
+  return [...codes];
 }

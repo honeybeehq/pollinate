@@ -156,12 +156,16 @@ export class WebhookServer {
         return;
       }
       if (!(await this.admitRouterDelivery(trigger, path, request, response))) return;
-      if (providerId && !(await this.store.claimDelivery(trigger.id, deliveryId))) {
+      const dispatchTrigger = trigger;
+      const transformed = trigger.router ? payload : applyWebhookTransform(trigger.source.webhook, payload);
+      const admitted = await this.delivery.admit(
+        trigger,
+        webhookActivation(trigger, transformed, { path, headers: normalizedHeaders(request.headers), deliveryId, stableDeliveryId: Boolean(providerId) }),
+      );
+      if (!admitted) {
         await duplicate();
         return;
       }
-      const dispatchTrigger = trigger;
-      const transformed = trigger.router ? payload : applyWebhookTransform(trigger.source.webhook, payload);
       const updated = await recordWebhookDelivery(this.store, trigger);
       this.replaceTrigger(updated);
       send(response, 202, { accepted: true, trigger_id: trigger.id, delivery_id: deliveryId });
@@ -174,12 +178,7 @@ export class WebhookServer {
         at: nowIso(),
         response_ms: Date.now() - started,
       });
-      void this.dispatch(dispatchTrigger, transformed, request.socket.remoteAddress ?? "unknown", {
-        path,
-        headers: normalizedHeaders(request.headers),
-        deliveryId,
-        stableDeliveryId: Boolean(providerId),
-      }).catch((error) =>
+      void this.delivery.handle(dispatchTrigger, admitted, { admitted: true }).catch((error) =>
         this.store.appendLedger({
           event: "pollinate.webhook.rejected",
           trigger_id: dispatchTrigger.id,
@@ -200,19 +199,7 @@ export class WebhookServer {
     _sourceIp: string,
     webhook?: { path?: string; headers?: Record<string, string>; deliveryId?: string; stableDeliveryId?: boolean },
   ): Promise<void> {
-    const activation: Activation = {
-      triggerId: trigger.id,
-      source: "webhook",
-      payload,
-      receivedAt: nowIso(),
-      metadata: webhook
-        ? {
-            ...(webhook.deliveryId ? { deliveryId: webhook.deliveryId, stableDeliveryId: webhook.stableDeliveryId } : {}),
-            webhook: { path: webhook.path, headers: webhook.headers },
-          }
-        : undefined,
-    };
-    await this.delivery.handle(trigger, activation, { claimed: true });
+    await this.delivery.handle(trigger, webhookActivation(trigger, payload, webhook), { claimed: true });
   }
 
   private replaceTrigger(updated: Trigger): void {
@@ -394,4 +381,21 @@ function requiresSecret(trigger: Trigger, route: WebhookRoute, request: Incoming
 
 function isLoopbackAddress(address: string | undefined): boolean {
   return Boolean(address && (address === "::1" || address === "::ffff:127.0.0.1" || address.startsWith("127.")));
+}
+
+type WebhookActivationMetadata = { path?: string; headers?: Record<string, string>; deliveryId?: string; stableDeliveryId?: boolean };
+
+function webhookActivation(trigger: Trigger, payload: JsonValue, webhook?: WebhookActivationMetadata): Activation {
+  return {
+    triggerId: trigger.id,
+    source: "webhook",
+    payload,
+    receivedAt: nowIso(),
+    metadata: webhook
+      ? {
+          ...(webhook.deliveryId ? { deliveryId: webhook.deliveryId, stableDeliveryId: webhook.stableDeliveryId } : {}),
+          webhook: { path: webhook.path, headers: webhook.headers },
+        }
+      : undefined,
+  };
 }

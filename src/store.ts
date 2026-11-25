@@ -416,7 +416,7 @@ export class PollinateStore {
     return census;
   }
 
-  async cancelJob(id: string): Promise<Job> {
+  async cancelJob(id: string, options: { reason?: string } = {}): Promise<Job> {
     const job = await this.getJob(id);
     if (!job) throw new Error(`No job found with id "${id}"`);
     return withFileLock(this.jobLockPath(job.id), async () => {
@@ -427,10 +427,11 @@ export class PollinateStore {
         ...fresh,
         status: "cancelled" as const,
         completedAt: nowIso(),
-        error: fresh.status === "running" ? "Cancellation requested after process start" : "Cancelled before start",
+        nextAttemptAt: undefined,
+        error: cancellationMessage(fresh.status, options.reason),
       };
       await this.saveJob(updated);
-      await this.appendLedger({ event: "pollinate.job.cancelled", job_id: fresh.id, trigger_id: fresh.triggerId });
+      await this.appendLedger({ event: "pollinate.job.cancelled", job_id: fresh.id, trigger_id: fresh.triggerId, ...(options.reason ? { reason: options.reason } : {}) });
       return updated;
     });
   }
@@ -653,6 +654,11 @@ function stripDeliveryCounterFields(trigger: Trigger): Trigger {
 
 function isEnabledOnlySave(current: Trigger, incoming: Trigger): boolean {
   return JSON.stringify({ ...current, enabled: undefined as unknown as boolean, updatedAt: "" }) === JSON.stringify({ ...incoming, enabled: undefined as unknown as boolean, updatedAt: "" });
+}
+
+function cancellationMessage(status: JobStatus, reason?: string): string {
+  const base = status === "running" ? "Cancellation requested after process start" : status === "retrying" ? "Cancelled while waiting to retry" : "Cancelled before start";
+  return reason ? `${base} (${reason})` : base;
 }
 
 function isTerminalJobStatus(status: JobStatus): boolean {

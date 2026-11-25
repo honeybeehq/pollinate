@@ -14,6 +14,7 @@ import type {
   PollFetch,
   PollSpec,
   RetentionConfig,
+  RetryPolicy,
   RouterConfig,
   ScheduleTiming,
   Source,
@@ -152,6 +153,7 @@ function normalizeTrigger(raw: AnyRecord, fallbackId?: string): Trigger {
     source,
     filter: normalizeFilter(asOptionalRecord(raw.filter)),
     delivery,
+    retry: normalizeRetry(asOptionalRecord(raw.retry)),
     context: normalizeContext(asOptionalRecord(raw.context)),
     lifecycle: normalizeLifecycle(asOptionalRecord(raw.lifecycle)),
     router,
@@ -275,10 +277,34 @@ function normalizeWebhook(raw: AnyRecord): WebhookSpec {
 function normalizeDelivery(raw: AnyRecord | undefined): Delivery {
   const value = raw ?? {};
   const maxConcurrent = Math.max(1, numberOr(value.maxConcurrent ?? value.max_concurrent, 1));
+  const maxQueued = optionalNumber(value.maxQueued ?? value.max_queued);
   return {
     mode: normalizeDeliveryMode(value),
     maxConcurrent,
+    ...(maxQueued === undefined ? {} : { maxQueued: Math.max(1, Math.floor(maxQueued)) }),
   };
+}
+
+const RETRY_ON_PATTERN = /^(transport|timeout|exit|status:[1-5](\d\d|xx)|[a-z][a-z0-9_]*)$/;
+
+function normalizeRetry(raw: AnyRecord | undefined): RetryPolicy | undefined {
+  if (!raw) return undefined;
+  const maxAttempts = Math.max(1, Math.floor(numberOr(raw.maxAttempts ?? raw.max_attempts, 1)));
+  const backoff = stringOr(raw.backoff, "2s");
+  const maxBackoff = stringOr(raw.maxBackoff ?? raw.max_backoff, "5m");
+  const maxElapsed = stringOr(raw.maxElapsed ?? raw.max_elapsed, "1h");
+  for (const [label, value] of [["backoff", backoff], ["maxBackoff", maxBackoff], ["maxElapsed", maxElapsed]] as const) {
+    if (parseDuration(value) <= 0) throw new Error(`trigger.retry.${label} must be a positive duration`);
+  }
+  const policy: RetryPolicy = { maxAttempts, backoff, maxBackoff, maxElapsed };
+  if (raw.on !== undefined) {
+    if (!Array.isArray(raw.on)) throw new Error("trigger.retry.on must be an array of strings");
+    const on = stringArray(raw.on).map((item) => item.trim().toLowerCase());
+    const invalid = on.find((item) => !RETRY_ON_PATTERN.test(item));
+    if (invalid !== undefined) throw new Error(`trigger.retry.on: unsupported entry "${invalid}"; use transport, timeout, exit, status:<code>, status:<n>xx or a hive error code`);
+    policy.on = on;
+  }
+  return policy;
 }
 
 function normalizeDeliveryMode(raw: AnyRecord): DeliveryMode {
@@ -575,6 +601,7 @@ function stripRuntimeDates(trigger: Trigger): AnyRecord {
     source: trigger.source,
     filter: trigger.filter,
     delivery: deliveryToToml(trigger.delivery),
+    retry: trigger.retry,
     context: trigger.context,
     lifecycle: trigger.lifecycle,
     router: trigger.router,
@@ -589,6 +616,7 @@ function deliveryToToml(delivery: Delivery): AnyRecord {
   return {
     mode: strategy,
     maxConcurrent: delivery.maxConcurrent,
+    ...(delivery.maxQueued === undefined ? {} : { maxQueued: delivery.maxQueued }),
     ...Object.fromEntries(Object.entries(delivery.mode).filter(([key]) => key !== "strategy")),
   };
 }
