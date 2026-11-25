@@ -49,6 +49,7 @@ export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
     jobsGcMs: 3_600_000,
     ledgerMaxMb: 64,
   },
+  router: { bindingRetention: "7d" },
 };
 
 export function parseTriggerToml(text: string, fallbackId?: string): Trigger {
@@ -69,6 +70,7 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
   const defaults = asOptionalRecord(doc.defaults) ?? {};
   const execution = asOptionalRecord(doc.execution) ?? {};
   const retention = asOptionalRecord(doc.retention) ?? {};
+  const router = asOptionalRecord(doc.router) ?? {};
   const onFailure = normalizeOnFailure(asOptionalRecord(defaults.onFailure ?? defaults.on_failure), "defaults.onFailure");
   return {
     webhook: {
@@ -88,7 +90,14 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
     },
     execution: normalizeExecution(execution),
     retention: normalizeRetention(retention),
+    router: normalizeDaemonRouter(router),
   };
+}
+
+function normalizeDaemonRouter(raw: AnyRecord): DaemonConfig["router"] {
+  const bindingRetention = stringOr(raw.bindingRetention ?? raw.binding_retention, DEFAULT_DAEMON_CONFIG.router.bindingRetention);
+  parseDuration(bindingRetention);
+  return { bindingRetention };
 }
 
 function positiveOr(value: unknown, fallback: number): number {

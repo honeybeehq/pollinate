@@ -268,4 +268,88 @@ describe("router binding gc", () => {
       }
     });
   });
+
+  test("retries a stuck closing binding three times, then closes it with the error", async () => {
+    await withTempStore(async (store, root) => {
+      const hive = await installHiveStub(root, { script: `#!/bin/sh\necho "$@" >> "${join(root, "hive.log")}"\necho "stop refused" >&2\nexit 1\n` });
+      try {
+        const trig = routerTrigger();
+        await store.saveTrigger(trig);
+        const subject = "github:pull_request:trmd/demo#5";
+        await store.saveRouterBinding(binding(trig.id, { status: "closing", updatedAt: isoAgo(11 * 60_000), closeAttempts: 1 }));
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
+
+        for (let sweep = 1; sweep <= 3; sweep++) {
+          const current = await store.getRouterBinding(trig.id, subject);
+          if (current) await store.saveRouterBinding({ ...current, updatedAt: isoAgo(11 * 60_000) });
+          await gcRouterBindings({ store, executor, triggers: [trig] });
+        }
+
+        const updated = await store.getRouterBinding(trig.id, subject);
+        expect(updated?.status).toBe("closed");
+        expect(updated?.error).toContain("stop refused");
+        expect((await hive.log()).match(/stop pr-5/g)).toHaveLength(3);
+        expect((await store.readLedger()).join("\n")).toContain("close-retries-exhausted");
+      } finally {
+        hive.restore();
+      }
+    });
+  });
+
+  test("leaves a recently closing binding alone", async () => {
+    await withTempStore(async (store) => {
+      const hive = await installHiveStub(store.root);
+      try {
+        const trig = routerTrigger();
+        await store.saveTrigger(trig);
+        await store.saveRouterBinding(binding(trig.id, { status: "closing", updatedAt: isoAgo(60_000), closeAttempts: 1 }));
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
+
+        const result = await gcRouterBindings({ store, executor, triggers: [trig] });
+
+        expect(routerGcSummary(result)).toBeUndefined();
+        expect(await hive.log()).toBe("");
+      } finally {
+        hive.restore();
+      }
+    });
+  });
+
+  test("expires active bindings after the default 7d idleTtl", async () => {
+    await withTempStore(async (store) => {
+      const hive = await installHiveStub(store.root);
+      try {
+        const trig = routerTrigger();
+        await store.saveTrigger(trig);
+        await store.saveRouterBinding(binding(trig.id, { updatedAt: isoAgo(8 * 86_400_000), lastActivityAt: isoAgo(8 * 86_400_000) }));
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
+
+        const result = await gcRouterBindings({ store, executor, triggers: [trig] });
+
+        expect(result.expired).toHaveLength(1);
+        expect((await store.readLedger()).join("\n")).toContain('"idle_ttl":"7d"');
+      } finally {
+        hive.restore();
+      }
+    });
+  });
+
+  test("prunes closed binding files older than the retention", async () => {
+    await withTempStore(async (store) => {
+      const trig = routerTrigger();
+      await store.saveTrigger(trig);
+      await store.saveRouterBinding(binding(trig.id, { status: "closed", updatedAt: isoAgo(8 * 86_400_000) }));
+      await store.saveRouterBinding(
+        binding(trig.id, { id: "fresh", subjectKey: "github:pull_request:trmd/demo#6", status: "closed", updatedAt: isoAgo(86_400_000) }),
+      );
+      const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
+
+      const result = await gcRouterBindings({ store, executor, triggers: [trig] });
+
+      expect(result.pruned).toHaveLength(1);
+      expect(await store.getRouterBinding(trig.id, "github:pull_request:trmd/demo#5")).toBeNull();
+      expect(await store.getRouterBinding(trig.id, "github:pull_request:trmd/demo#6")).not.toBeNull();
+      expect((await store.readLedger()).join("\n")).toContain("pollinate.router.binding_pruned");
+    });
+  });
 });

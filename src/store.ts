@@ -424,6 +424,12 @@ export class PollinateStore {
     await writeJson(this.routerBindingPath(binding.triggerId, binding.subjectKey), binding, { sync: true });
   }
 
+  async deleteRouterBinding(triggerId: string, subjectKey: string): Promise<void> {
+    await unlink(this.routerBindingPath(triggerId, subjectKey)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
+
   async withRouterBindingLock<T>(triggerId: string, subjectKey: string, fn: () => Promise<T>): Promise<T> {
     await this.ensure();
     return withFileLock(this.routerBindingLockPath(triggerId, subjectKey), fn);

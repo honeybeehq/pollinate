@@ -308,7 +308,7 @@ ledgered `pollinate.trigger.invalid`. The messages from `src/config.ts`:
 plugin = "github-pr"         # built-in, or a name in ~/.pollinate/router-plugins/
 openOn  = ["github.pull_request.opened", "github.pull_request.reopened"]
 closeOn = ["github.pull_request.closed", "github.pull_request.merged"]
-idleTtl = "48h"              # GC closes bindings idle longer than this
+idleTtl = "48h"              # GC closes bindings idle longer than this (default "7d")
 [trigger.router.openWhen]    # same filter semantics, applied to the open event payload
 pr_author = "trmdy"
 [trigger.router.onOpen]      # action; its handle becomes binding.target
@@ -322,9 +322,27 @@ onOpen failure. Open events on an existing active binding ledger
 to a dead session) record `error` on the binding and ledger
 `router.activity_errored` — the binding stays active and later activity retries.
 
+Open limit: per trigger, at most 30 binding creations a minute and 100 bindings
+that are not `closed`. Only new bindings count (an open event on a subject with
+no binding, or a closed or errored one); the check runs inside the router after
+`normalize`, so activity and close events on a bound subject are never refused.
+A refused open is dropped (no binding file, no onOpen) and ledgers
+`router.open_rate_limited` with `reason` `open rate limit` or `open binding cap`.
+The webhook answers 202 either way.
+
 The daemon GC sweeps bindings every `defaults.bindingGcMs` (default 60s):
 
-- **idleTtl** — active bindings idle past `idleTtl` are closed via onClose.
+- **idleTtl** — active bindings idle past `idleTtl` (default `7d` when unset)
+  are closed via onClose.
+- **stuck closing** — a failed onClose leaves the binding `closing` with
+  `error` and `closeAttempts`. A `closing` binding last updated 10+ min ago is
+  retried via onClose (ledger `binding_retry`, `phase = "close"`) up to 3
+  times; when the last retry fails it is closed with the error (ledger
+  `binding_expired`, reason `close-retries-exhausted`). This runs for every
+  router, with or without `idleTtl` or `subjectState`.
+- **pruning** — closed binding files whose `updatedAt` is older than
+  `[router].bindingRetention` (default `7d`) are deleted (ledger
+  `binding_pruned`).
 - **errored retry** — errored bindings are re-opened from the stored open
   context, up to 3 attempts, then abandoned (ledger `binding_expired`,
   reason `open-retries-exhausted`).
@@ -386,7 +404,7 @@ plus:
 | var | value |
 |---|---|
 | `event_kind`, `subject_key`, `binding_id` | routing metadata |
-| `delivery_id`, `attempt`, `job_id` | execution id: `<job delivery id>:<subject_key>:<open\|activity\|close>`; GC-driven runs use `gc:<binding id>:<open\|close>:<attempt>` (no `job_id`) |
+| `delivery_id`, `attempt`, `job_id` | execution id: `<job delivery id>:<subject_key>:<open\|activity\|close>`; GC-driven runs use `gc:<binding id>:<open\|close>:<attempt>` (no `job_id`; for close, attempt is `closeAttempts + 1`) |
 | `binding.target` (and `target`) | bound hive handle |
 | `binding.targets.<stepId>` | per-step handles for sequence/swarm onOpen |
 
@@ -547,6 +565,9 @@ jobsWarnFiles = 25000        # warn (daemon.log, ledger, pol status) when the jo
 jobsWarnMb = 1024            # ... or this many MB
 jobsGcMs = 3600000           # jobs + ledger retention sweep interval (default: hourly)
 ledgerMaxMb = 64             # ledger.jsonl is rotated to ledger.jsonl.1 past this size
+
+[router]
+bindingRetention = "7d"      # closed binding files older than this are deleted by the binding GC
 ```
 
 ## Honeybee starting window
@@ -769,7 +790,7 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
   `poll.errored` carries `consecutive_errors` and `next_check_in_ms`
 - `pollinate.webhook.{received,rejected,duplicate}`
 - `pollinate.hook.{created,delivered,expired,gc_removed}`
-- `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,already_bound,unbound,open_filtered,activity_errored,gc}`
+- `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,binding_pruned,already_bound,unbound,open_filtered,open_rate_limited,activity_errored,gc}`
 - `pollinate.router.plugin.created` · `pollinate.github.webhook.installed`
 - `pollinate.schedule.missed` carries `policy`, `scheduled_at` (first missed
   occurrence), `missed_count`, `detected: "tick" | "startup"` and, past 10,000,

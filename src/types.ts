@@ -256,6 +256,7 @@ export type RouterBinding = {
   context?: JsonObject;
   /** Failed onOpen attempts since the binding last went active; bounds GC retries. */
   openAttempts?: number;
+  closeAttempts?: number;
   /** Last time the GC reconciled this binding against the live subject state. */
   checkedAt?: string;
 };
@@ -335,6 +336,7 @@ export type DaemonConfig = {
   };
   execution: ExecutionProfile;
   retention: RetentionConfig;
+  router: { bindingRetention: string };
 };
 
 export type LedgerEvent = {

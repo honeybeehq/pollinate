@@ -5,6 +5,8 @@ import { ActionExecutor } from "../src/actions.js";
 import { DeliveryManager } from "../src/delivery.js";
 import { routerPluginsDir } from "../src/fsx.js";
 import { githubPrRouterPlugin } from "../src/router-plugins/github-pr.js";
+import { executeRouter } from "../src/router.js";
+import type { Action, JsonValue } from "../src/types.js";
 import { WebhookServer } from "../src/webhook.js";
 import { installHiveStub, trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
 
@@ -729,6 +731,61 @@ cat >/dev/null
       } finally {
         hive.restore();
       }
+    });
+  });
+
+  test("the open limit refuses new bindings only, never activity on a bound subject", async () => {
+    await withTempStore(async (store) => {
+      const actions: Action[] = [];
+      const executor = {
+        async executeAction(action: Action) {
+          actions.push(action);
+          return { handle: action.kind === "honeybee" && action.run === "spawn" ? action.name : undefined };
+        },
+      };
+      const trig = trigger({
+        id: "github-pr-limit",
+        source: { kind: "webhook", webhook: { path: "github/pr-limit" } },
+        action: undefined,
+        router: {
+          plugin: "github-pr",
+          openOn: ["github.pull_request.opened"],
+          closeOn: ["github.pull_request.merged"],
+          onOpen: { kind: "honeybee", run: "spawn", bee: "codex", name: "pr-{{pr_number}}" },
+          onActivity: { kind: "honeybee", run: "send", target: "{{binding.target}}", message: "{{activity_markdown}}" },
+        },
+      });
+      const run = (event: string, body: JsonValue) =>
+        executeRouter({
+          store,
+          executor,
+          trigger: trig,
+          activation: { triggerId: trig.id, source: "webhook", payload: body, receivedAt: new Date().toISOString(), metadata: { webhook: { headers: { "x-github-event": event } } } },
+        });
+      const opened = (number: number) => ({
+        action: "opened",
+        repository: { full_name: "trmd/pollinate" },
+        sender: { login: "alice" },
+        pull_request: { number, html_url: `https://github.com/trmd/pollinate/pull/${number}`, title: "PR", state: "open" },
+      });
+      const outcomes: string[] = [];
+      for (let number = 1; number <= 31; number++) outcomes.push((await run("pull_request", opened(number))).events[0]?.outcome ?? "none");
+      for (let index = 0; index < 40; index++) {
+        const result = await run("check_run", {
+          action: "completed",
+          repository: { full_name: "trmd/pollinate" },
+          sender: { login: "ci-bot" },
+          check_run: { name: `check-${index}`, status: "completed", conclusion: "success", html_url: "https://github.com/trmd/pollinate/runs/1", pull_requests: [{ number: 1 }] },
+        });
+        outcomes.push(result.events[0]?.outcome ?? "none");
+      }
+
+      expect(outcomes.slice(0, 30).every((outcome) => outcome === "created")).toBe(true);
+      expect(outcomes[30]).toBe("dropped");
+      expect(outcomes.slice(31).every((outcome) => outcome === "routed")).toBe(true);
+      expect(actions.filter((action) => action.kind === "honeybee" && action.run === "send")).toHaveLength(40);
+      expect(await store.getRouterBinding(trig.id, "github:pull_request:trmd/pollinate#31")).toBeNull();
+      expect((await store.readLedger()).filter((line) => line.includes("pollinate.router.open_rate_limited"))).toHaveLength(1);
     });
   });
 });

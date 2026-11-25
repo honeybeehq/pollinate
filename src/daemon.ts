@@ -19,7 +19,7 @@ import {
   type DaemonLockHolder,
 } from "./fsx.js";
 import { gcTemporaryHooks } from "./hooks.js";
-import { gcRouterBindings, routerGcSummary } from "./router-gc.js";
+import { DEFAULT_BINDING_RETENTION, gcRouterBindings, routerGcSummary } from "./router-gc.js";
 import { TriggerHealthMonitor } from "./health.js";
 import { jobStoreWarnings, recordDaemonStart, recordDaemonStop, topTriggersByFiles, writeJobStoreHealth } from "./daemon-health.js";
 import type { DaemonConfig, JobStatus, Trigger } from "./types.js";
@@ -287,6 +287,7 @@ export class PollinateDaemon {
         triggers: this.triggers,
         execution: this.config?.execution,
         health: this.health,
+        bindingRetentionMs: parseDuration(this.config?.router.bindingRetention ?? DEFAULT_BINDING_RETENTION),
       });
       const summary = routerGcSummary(result);
       if (summary) {
@@ -298,6 +299,10 @@ export class PollinateDaemon {
           retry_failed: result.retryFailed,
           abandoned: result.abandoned,
           staled: result.staled,
+          close_retried: result.closeRetried,
+          close_retry_failed: result.closeRetryFailed,
+          close_abandoned: result.closeAbandoned,
+          pruned: result.pruned,
           errors: result.errors,
         });
         await this.log(`binding gc: ${summary}`);

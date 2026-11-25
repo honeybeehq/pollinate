@@ -86,6 +86,18 @@ async function handleRouterEvent(
         });
         return { subjectKey: event.subjectKey, kind: event.kind, outcome: "already-bound", target: current.target.handle };
       }
+      const refusal = await openLimitRefusal(options, current);
+      if (refusal) {
+        await options.store.appendLedger({
+          event: "pollinate.router.open_rate_limited",
+          trigger_id: options.trigger.id,
+          router: router.plugin,
+          subject_key: event.subjectKey,
+          event_kind: event.kind,
+          reason: refusal,
+        });
+        return { subjectKey: event.subjectKey, kind: event.kind, outcome: "dropped", reason: refusal };
+      }
       return createBinding(options, router, event, current);
     }
 
@@ -103,6 +115,25 @@ async function handleRouterEvent(
     if (router.closeOn.includes(event.kind)) return closeBinding(options, router, event, current);
     return routeToBinding(options, router, event, current);
   });
+}
+
+export const ROUTER_OPEN_BINDING_CAP = 100;
+export const ROUTER_OPEN_WINDOW_MS = 60_000;
+export const ROUTER_OPEN_LIMIT = 30;
+
+const recentOpens = new Map<string, number[]>();
+
+async function openLimitRefusal(options: ExecuteRouterOptions, existing: RouterBinding | null): Promise<string | undefined> {
+  const triggerId = options.trigger.id;
+  const now = Date.now();
+  const recent = (recentOpens.get(triggerId) ?? []).filter((at) => now - at < ROUTER_OPEN_WINDOW_MS);
+  recentOpens.set(triggerId, recent);
+  if (recent.length >= ROUTER_OPEN_LIMIT) return "open rate limit";
+  const bindings = await options.store.listRouterBindings({ triggerId });
+  const open = bindings.filter((binding) => binding.status !== "closed" && binding.subjectKey !== existing?.subjectKey);
+  if (open.length >= ROUTER_OPEN_BINDING_CAP) return "open binding cap";
+  recent.push(now);
+  return undefined;
 }
 
 export async function createBinding(
@@ -233,7 +264,7 @@ export async function closeBinding(
   event: CanonicalRouterEvent,
   binding: RouterBinding,
 ): Promise<RouterEventResult> {
-  const closing = { ...binding, status: "closing" as const, updatedAt: nowIso(), lastEventKind: event.kind };
+  const closing: RouterBinding = { ...binding, status: "closing", updatedAt: nowIso(), lastEventKind: event.kind };
   await deps.store.saveRouterBinding(closing);
   const execution = deps.executionFor?.(event.subjectKey, "close");
   const action = renderRouterAction(router.onClose ?? defaultCloseAction(), event, closing, execution);
@@ -241,10 +272,11 @@ export async function closeBinding(
     await deps.executor.executeAction(action, deps.cwd, execution);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    await deps.store.saveRouterBinding({ ...closing, error: message, closeAttempts: (binding.status === "closing" ? binding.closeAttempts ?? 1 : 0) + 1 });
     await deps.health?.recordFailure(deps.trigger.id, { kind: "router_close", error: message, deliveryId: execution?.deliveryId });
     throw error;
   }
-  const closed = { ...closing, status: "closed" as const, updatedAt: nowIso(), lastActivityAt: nowIso() };
+  const closed: RouterBinding = { ...closing, status: "closed", updatedAt: nowIso(), lastActivityAt: nowIso(), error: undefined, closeAttempts: undefined };
   await deps.store.saveRouterBinding(closed);
   await deps.store.appendLedger({
     event: "pollinate.router.binding_closed",

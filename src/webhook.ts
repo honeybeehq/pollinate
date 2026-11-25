@@ -14,13 +14,9 @@ const MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
 const HEADERS_TIMEOUT_MS = 10_000;
 const MAX_HEADERS_COUNT = 64;
-const ROUTER_BINDING_CAP = 100;
-const ROUTER_CREATION_WINDOW_MS = 60_000;
-const ROUTER_CREATION_LIMIT = 30;
 
 export class WebhookServer {
   private server?: http.Server;
-  private readonly routerAdmission = new Map<string, number[]>();
 
   constructor(
     private readonly store: PollinateStore,
@@ -155,7 +151,6 @@ export class WebhookServer {
         await duplicate();
         return;
       }
-      if (!(await this.admitRouterDelivery(trigger, path, request, response))) return;
       const dispatchTrigger = trigger;
       const transformed = trigger.router ? payload : applyWebhookTransform(trigger.source.webhook, payload);
       const admitted = await this.delivery.admit(
@@ -216,27 +211,6 @@ export class WebhookServer {
     });
   }
 
-  private async admitRouterDelivery(trigger: Trigger, path: string, request: IncomingMessage, response: ServerResponse): Promise<boolean> {
-    if (!trigger.router) return true;
-    const bindings = await this.store.listRouterBindings({ triggerId: trigger.id });
-    const openBindings = bindings.filter((binding) => binding.status !== "closed");
-    if (openBindings.length >= ROUTER_BINDING_CAP) {
-      await this.ledgerRejection(trigger.id, path, "router-binding-cap", request);
-      send(response, 429, { error: "router binding cap reached" });
-      return false;
-    }
-    const now = Date.now();
-    const recent = (this.routerAdmission.get(trigger.id) ?? []).filter((at) => now - at < ROUTER_CREATION_WINDOW_MS);
-    if (recent.length >= ROUTER_CREATION_LIMIT) {
-      this.routerAdmission.set(trigger.id, recent);
-      await this.ledgerRejection(trigger.id, path, "router-rate-limited", request);
-      send(response, 429, { error: "router rate limit exceeded" });
-      return false;
-    }
-    recent.push(now);
-    this.routerAdmission.set(trigger.id, recent);
-    return true;
-  }
 }
 
 type WebhookRoute = { kind: "hook" | "relay"; path: string };
