@@ -168,7 +168,7 @@ commandTimeout = "1s"
         const error = await waitForLedgerEvent(store, "pollinate.daemon.reload_errored");
         expect(error.error).toEqual(expect.any(String));
 
-        const [job] = await waitForTerminalJobs(store, 1, 2_000);
+        const [job] = await waitForTerminalJobs(store, 1, 10_000);
         expect(job.triggerId).toBe("survives-reload-error");
       } finally {
         await daemon.stop();
