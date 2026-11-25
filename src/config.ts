@@ -1,4 +1,4 @@
-import { basename, extname } from "node:path";
+import { basename, extname, isAbsolute } from "node:path";
 import { parse, stringify } from "smol-toml";
 import type {
   Action,
@@ -10,6 +10,7 @@ import type {
   DeliveryMode,
   Filter,
   ExecutionProfile,
+  HiveUrgency,
   OnFailurePolicy,
   PollCursor,
   PollFetch,
@@ -50,6 +51,7 @@ export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
     ledgerMaxMb: 64,
   },
   router: { bindingRetention: "7d" },
+  honeybee: {},
 };
 
 export function parseTriggerToml(text: string, fallbackId?: string): Trigger {
@@ -71,6 +73,7 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
   const execution = asOptionalRecord(doc.execution) ?? {};
   const retention = asOptionalRecord(doc.retention) ?? {};
   const router = asOptionalRecord(doc.router) ?? {};
+  const honeybee = asOptionalRecord(doc.honeybee) ?? {};
   const onFailure = normalizeOnFailure(asOptionalRecord(defaults.onFailure ?? defaults.on_failure), "defaults.onFailure");
   return {
     webhook: {
@@ -91,7 +94,14 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
     execution: normalizeExecution(execution),
     retention: normalizeRetention(retention),
     router: normalizeDaemonRouter(router),
+    honeybee: normalizeHoneybeeConfig(honeybee),
   };
+}
+
+function normalizeHoneybeeConfig(raw: AnyRecord): DaemonConfig["honeybee"] {
+  const bin = optionalString(raw.bin);
+  if (bin !== undefined && !isAbsolute(bin)) throw new Error(`honeybee.bin must be an absolute path (got "${bin}")`);
+  return bin ? { bin } : {};
 }
 
 function normalizeDaemonRouter(raw: AnyRecord): DaemonConfig["router"] {
@@ -491,13 +501,16 @@ function normalizeAction(raw: AnyRecord): Action {
   if (kind === "honeybee") {
     const run = stringOr(raw.run, "");
     if (run === "spawn") {
+      const colony = optionalString(raw.colony);
+      const tags = [...stringArray(raw.tags), ...(colony ? [`colony=${colony}`] : [])];
       return {
         kind,
         run,
-        bee: requiredString(raw.bee, "trigger.action.bee"),
+        agent: requiredString(raw.agent ?? raw.bee, "trigger.action.agent"),
         name: optionalString(raw.name),
-        colony: optionalString(raw.colony),
-        home: optionalString(raw.home),
+        account: optionalString(raw.account ?? raw.home),
+        ...(tags.length ? { tags } : {}),
+        title: optionalString(raw.title),
         cwd: optionalString(raw.cwd),
         yolo: optionalBoolean(raw.yolo),
         args: stringArray(raw.args ?? raw.beeArgs ?? raw.bee_args),
@@ -511,11 +524,12 @@ function normalizeAction(raw: AnyRecord): Action {
         run,
         target: requiredString(raw.target, "trigger.action.target"),
         message: requiredString(raw.message ?? raw.prompt, "trigger.action.message"),
+        urgency: optionalUrgency(raw.urgency),
         timeout: optionalString(raw.timeout),
       };
     }
-    if (run === "kill") {
-      return { kind, run, target: requiredString(raw.target, "trigger.action.target"), timeout: optionalString(raw.timeout) };
+    if (run === "stop" || run === "kill") {
+      return { kind, run: "stop", target: requiredString(raw.target, "trigger.action.target"), timeout: optionalString(raw.timeout) };
     }
     throw new Error(`Unsupported honeybee run mode: ${run || "(missing)"}`);
   }
@@ -523,6 +537,15 @@ function normalizeAction(raw: AnyRecord): Action {
     return { kind, subject: requiredString(raw.subject, "trigger.action.subject"), payload: optionalString(raw.payload) };
   }
   throw new Error(`Unsupported action kind: ${kind || "(missing)"}`);
+}
+
+const HIVE_URGENCIES = ["now", "next", "idle"] as const;
+
+function optionalUrgency(value: unknown): HiveUrgency | undefined {
+  const urgency = optionalString(value);
+  if (urgency === undefined) return undefined;
+  if (!(HIVE_URGENCIES as readonly string[]).includes(urgency)) throw new Error(`trigger.action.urgency must be one of ${HIVE_URGENCIES.join(", ")} (got "${urgency}")`);
+  return urgency as HiveUrgency;
 }
 
 function normalizeActionStep(raw: AnyRecord): ActionStep {

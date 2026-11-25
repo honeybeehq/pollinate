@@ -111,7 +111,7 @@ describe("router binding gc", () => {
         expect(result.retried).toHaveLength(1);
         const updated = await store.getRouterBinding(trig.id, "github:pull_request:trmd/demo#5");
         expect(updated).toMatchObject({ status: "active", target: { handle: "pr-5" } });
-        expect(await hive.log()).toContain("spawn pr-5 --agent codex --json");
+        expect(await hive.log()).toContain("spawn pr-5 --agent codex --no-parent");
         expect((await store.readLedger()).join("\n")).toContain("pollinate.router.binding_retry");
       } finally {
         hive.restore();

@@ -25,6 +25,7 @@ export async function resolveContext(
     cwd?: string;
     execution?: ExecutionProfile;
     hiveStartingWaitMs?: number;
+    hiveBin?: string;
     jobId?: string;
     attempt?: number;
     deliveryIds?: string[];
@@ -66,7 +67,7 @@ async function resolveSource(
   defaultTimeoutMs: number,
   defaultCwd: string | undefined,
   context: Record<string, string>,
-  options: { execution?: ExecutionProfile; hiveStartingWaitMs?: number },
+  options: { execution?: ExecutionProfile; hiveStartingWaitMs?: number; hiveBin?: string },
 ): Promise<{ ok: true; variable: string; value: string; warnings: string[] } | { ok: false; warning: string; warnings: string[] }> {
   const timeoutMs = parseDuration(source.timeout, defaultTimeoutMs);
   const cwd =
@@ -93,7 +94,7 @@ async function resolveSource(
 function startSourceValue(
   source: RenderedContextSource,
   cwd: string | undefined,
-  { execution, hiveStartingWaitMs }: { execution?: ExecutionProfile; hiveStartingWaitMs?: number },
+  { execution, hiveStartingWaitMs, hiveBin }: { execution?: ExecutionProfile; hiveStartingWaitMs?: number; hiveBin?: string },
   timeoutMs: number,
 ): { promise: Promise<string>; cancel?: () => void; boundsItsOwnTime?: boolean } {
   if (source.kind === "command") {
@@ -125,7 +126,7 @@ function startSourceValue(
   if (source.kind === "honeybee") {
     return {
       boundsItsOwnTime: true,
-      promise: execHive(source.args, { label: `hive ${source.args[0] ?? ""}`.trim(), cwd, execution, timeoutMs, startingWaitMs: hiveStartingWaitMs }).then((result) => {
+      promise: execHive(source.args, { label: `hive ${source.args[0] ?? ""}`.trim(), bin: hiveBin, cwd, execution, timeoutMs, startingWaitMs: hiveStartingWaitMs }).then((result) => {
         if (result.timedOut) throw new Error(`hive timed out after ${timeoutMs}ms`);
         if (result.exitCode !== 0) throw new Error(`hive exited ${result.exitCode}: ${result.stderr.trim()}`);
         return result.stdout.trimEnd();

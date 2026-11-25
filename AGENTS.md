@@ -270,24 +270,50 @@ kind = "command" | "http" | "emit" | "honeybee" | "sequence"
 | `command` | `command`, `cwd?`, `timeout?` — runs through the configured shell |
 | `http` | `method`, `url`, `headers?`, `body?`, `timeout?` — also sends `Idempotency-Key` and `X-Pollinate-Delivery` (the delivery id), `X-Pollinate-Trigger` and `X-Pollinate-Attempt` unless `headers` sets them (case-insensitive) |
 | `emit` | `subject`, `payload?` — appends a ledger event only |
-| `honeybee` | `run = "spawn"\|"send"\|"kill"` (below) |
+| `honeybee` | `run = "spawn"\|"send"\|"stop"` (`"kill"` is an alias of `"stop"`; below) |
 | `sequence` | `mode = "serial"\|"parallel"`, `primary?`, `continueOnError?`, `actions = [{id, action}]` |
 
 Honeybee runs (executed argv-style, never through a shell — payload text cannot
-inject commands) use the hive v2 grammar:
+inject commands) use the hive v2 grammar. Every call passes `--json` and an
+`--idempotency-key` derived from the job's delivery id, so a retried or
+resumed job (same delivery id) cannot create a second bee or a second
+message. Sequence steps get their own key (`<delivery id>.s<n>:…`).
 
-- `spawn`: `bee` (required), `name?`, `colony?`, `home?`, `cwd?`, `yolo?`,
-  `args?`, `message?` (alias `prompt`), `timeout?`. Runs
-  `hive spawn <name> --agent <bee> --json`, adding `--cwd <cwd>`,
-  `--tag colony=<colony>`, `--account <home>` and one `--arg <value>` per
-  entry of `args` (`yolo = true` prepends the harness's own bypass flag).
-  `name` defaults to `pol-<delivery id>`. When `message` is set it is then sent
-  with `hive send <handle> <message>`. The spawn result handle must match
+- `spawn`: `agent` (required; alias `bee`), `name?`, `account?` (alias
+  `home`), `tags?` (array), `title?`, `colony?` (adds the tag
+  `colony=<colony>`), `cwd?`, `yolo?`, `args?`, `message?` (alias `prompt`),
+  `timeout?`. Runs `hive spawn <name> --agent <agent> --no-parent
+  --idempotency-key <delivery id>:spawn --json`, adding `--cwd`, `--account`,
+  `--title`, one `--tag` per tag and one `--arg <value>` per entry of `args`
+  (`yolo = true` prepends the harness's own bypass flag). `name` defaults to
+  `pol-<delivery id>`. When `message` is set it is then sent with
+  `hive send <handle> <message> --sender-kind automation --idempotency-key
+  <delivery id>:seed --json`. The spawn result handle must match
   `^[A-Za-z0-9._:-]+$`; garbage hive output fails the action loudly instead of
   binding silently.
-- `send`: `target`, `message`, `timeout?` — `hive send <target> <message>`
-- `kill`: `target`, `timeout?` — `hive stop <target>`; the bee stays revivable,
-  Pollinate never runs `hive delete`
+- `send`: `target`, `message`, `urgency?` (`"now"`, `"next"` or `"idle"`,
+  passed as `--urgency`), `timeout?` — `hive send <target> <message>
+  --sender-kind automation --idempotency-key <delivery id>:send --json`.
+- `stop` (alias `kill`): `target`, `timeout?` — `hive stop <target>
+  --idempotency-key <delivery id>:stop --json`; the bee stays revivable,
+  Pollinate never runs `hive delete`. `bee_not_found` (or a message saying the
+  bee is already stopped) counts as success with result
+  `{stopped: false, alreadyStopped: true}`, so router `onClose` closes the
+  binding.
+- A message whose first character is `-` is sent with one leading space:
+  `hive` reads any `--…` token as a flag and `send` ignores a body after `--`.
+- Failures: hive prints `{"error":{"code","message"}}` on stdout under
+  `--json`. The job error reads `hive <verb>: <code>: <message>` and the job's
+  `result.hiveError` holds `{code, message}`; the code feeds `[trigger.retry]`
+  (see Retry). A `protocol_mismatch` error names the resolved binary
+  (`binary` in `hiveError`) and points at `[honeybee] bin`.
+- Binary: `[honeybee] bin` in `pollinate.toml` (absolute path); default `hive`
+  looked up on the execution PATH (`[execution.env].PATH`, else the daemon's
+  own when `inheritEnv`). Honeybee context sources use the same binary. When
+  any enabled trigger uses hive (a honeybee action, a router, or a honeybee
+  context source) the daemon resolves the path at start, runs
+  `hive --version --json` bounded to 2 s and ledgers
+  `pollinate.hive.probed {path, version, ok, error?}`.
 
 Removed kinds are refused. `pol add` and `pol create` exit 1 with the
 replacement; an existing trigger file that uses one is skipped at load and
@@ -313,7 +339,7 @@ idleTtl = "48h"              # GC closes bindings idle longer than this (default
 pr_author = "trmdy"
 [trigger.router.onOpen]      # action; its handle becomes binding.target
 [trigger.router.onActivity]  # action; runs for every non-open/non-close event
-[trigger.router.onClose]     # optional; defaults to honeybee kill {{binding.target}} (hive stop)
+[trigger.router.onClose]     # optional; defaults to honeybee stop {{binding.target}} (hive stop)
 ```
 
 Binding lifecycle: `pending → active → closing → closed`, with `errored` on
@@ -567,6 +593,9 @@ inheritEnv = true
 [execution.env]
 PATH = "…"
 
+[honeybee]
+bin = "/abs/path/hive"       # optional; default `hive` on the execution PATH (see Action kinds)
+
 [retention]
 jobsMaxAge = "14d"           # terminal jobs older than this are GC-eligible
 jobsKeepLastPerTrigger = 50  # floor: newest N terminal jobs of each *existing* trigger survive the age rule
@@ -674,8 +703,9 @@ without `[trigger.action]`) ignore it.
   and hive error codes (`error (<code>)` on stderr or `error.code` in JSON).
   Defaults: `http` → `transport`, `timeout`, `status:408`, `status:429`,
   `status:5xx` (other 4xx are final); `honeybee` → `hived_handover_stalled`,
-  `socket_unreachable`, `timeout` (the `daemon_starting` wait stays inside one
-  attempt); `command` and `emit` → nothing, because commands need not be
+  `socket_unreachable`, `move_in_progress`, `handoff_in_progress`, `timeout`
+  (the `daemon_starting` wait stays inside one attempt). Codes such as `protocol_mismatch`, `invalid_request`, `bee_not_found`,
+  `idempotency_conflict` and `cli_error` are final; `command` and `emit` → nothing, because commands need not be
   idempotent; `sequence` → the union of its steps. A retried sequence runs all
   its steps again.
 - Between attempts the job is `retrying` (non-terminal) with `nextAttemptAt`.
@@ -815,6 +845,7 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
   (see One daemon per store)
 - `pollinate.jobs.{gc,store_warning}` · `pollinate.ledger.rotated` (job/ledger retention, see Job retention)
 - `pollinate.emit` (from `emit` actions)
+- `pollinate.hive.probed {path, version, ok, error?}` (daemon start, when a trigger uses hive; see Action kinds)
 
 ## Job IDs
 

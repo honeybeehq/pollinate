@@ -1251,11 +1251,11 @@ function routerActionSummary(action: Action): string {
   if (action.kind === "honeybee") {
     const parts: string[] = [`${c.bold("honeybee")} ${action.run}`];
     if (action.run === "spawn") {
-      parts.push(`bee=${action.bee}`);
+      parts.push(`agent=${action.agent ?? action.bee}`);
       if (action.name) parts.push(`name=${action.name}`);
       if (action.args?.length) parts.push(c.dim(`args=${truncate(action.args.join(" "), max)}`));
     }
-    if (action.run === "send" || action.run === "kill") parts.push(`target=${action.target}`);
+    if (action.run === "send" || action.run === "stop" || action.run === "kill") parts.push(`target=${action.target}`);
     const lines = [parts.join(c.dim(` ${sym.mid} `))];
     const message = "message" in action ? action.message : undefined;
     if (message) lines.push(c.dim(`message: ${truncate(message.replace(/\s+/g, " "), max)}`));
@@ -1517,11 +1517,11 @@ function actionFromFlags(args: ParsedArgs): Action {
       timeout: stringFlag(args, "timeout"),
     };
   }
-  if (action === "honeybee-kill" || (action === "honeybee" && stringFlag(args, "run") === "kill")) {
+  if (action === "honeybee-kill" || action === "honeybee-stop" || (action === "honeybee" && ["kill", "stop"].includes(stringFlag(args, "run") ?? ""))) {
     return {
       kind: "honeybee",
-      run: "kill",
-      target: requiredFlag(args, "target", "Honeybee kill actions require --target <bee>"),
+      run: "stop",
+      target: requiredFlag(args, "target", "Honeybee stop actions require --target <bee>"),
       timeout: stringFlag(args, "timeout"),
     };
   }

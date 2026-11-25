@@ -1,10 +1,18 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import type { Action, Activation, DryRunResult, ExecutionProfile, Job, JobAttempt, JsonValue, RetryPolicy, SourceKind, Trigger } from "./types.js";
+import type { Action, Activation, DaemonConfig, DryRunResult, ExecutionProfile, HiveUrgency, Job, JobAttempt, JsonValue, RetryPolicy, SourceKind, Trigger } from "./types.js";
 import type { PollinateStore } from "./store.js";
 import { resolveContext } from "./context.js";
 import { renderAction, renderString } from "./templates.js";
 import { execShell, type ExecResult } from "./process.js";
-import { DEFAULT_HIVE_STARTING_WAIT_MS, execHive, withHiveStartingObserver, type HiveStartingObserver } from "./hive-exec.js";
+import {
+  DEFAULT_HIVE_BIN,
+  DEFAULT_HIVE_STARTING_WAIT_MS,
+  execHive,
+  parseHiveJsonError,
+  resolveHiveBin,
+  withHiveStartingObserver,
+  type HiveStartingObserver,
+} from "./hive-exec.js";
 import { nowIso, parseDuration } from "./time.js";
 import { executeRouter } from "./router.js";
 import { activationDeliveryIds, admitDelivery, deliveryIdFor, withDeliveryId } from "./delivery.js";
@@ -14,6 +22,7 @@ export type ActionExecutorOptions = {
   contextTimeoutMs: number;
   commandTimeoutMs: number;
   hiveStartingWaitMs?: number;
+  hiveBin?: string;
   execution?: ExecutionProfile;
 };
 
@@ -30,13 +39,16 @@ const FIRST_ATTEMPT = 1;
 const MAX_ATTEMPT_RECORDS = 10;
 const RETRY_JITTER = 0.2;
 const HTTP_RETRY_ON = ["transport", "timeout", "status:408", "status:429", "status:5xx"];
-const HIVE_RETRY_ON = ["hived_handover_stalled", "socket_unreachable", "timeout"];
+const HIVE_RETRY_ON = ["hived_handover_stalled", "socket_unreachable", "move_in_progress", "handoff_in_progress", "timeout"];
+
+export type HiveErrorDetail = { code: string; message: string; binary?: string };
 
 export class ActionFailure extends Error {
   constructor(
     message: string,
     readonly codes: string[],
     readonly retryAfterMs?: number,
+    readonly hiveError?: HiveErrorDetail,
   ) {
     super(message);
     this.name = "ActionFailure";
@@ -245,6 +257,7 @@ export class ActionExecutor {
     const message = error instanceof Error ? error.message : String(error);
     const policy = retryPolicyFor(trigger);
     const codes = error instanceof ActionFailure ? error.codes : [];
+    const failureResult = error instanceof ActionFailure && error.hiveError ? { hiveError: error.hiveError } : undefined;
     const retryOn = policy ? (policy.on ?? defaultRetryOn(job.action ?? trigger.action)) : [];
     const retryable = Boolean(policy) && (failure.forceRetryable === true || retryOn.some((code) => codes.includes(code)));
     const current = await this.store.getJob(job.id);
@@ -261,6 +274,7 @@ export class ActionExecutor {
           error: message,
           nextAttemptAt: new Date(Date.now() + delayMs).toISOString(),
           attempts,
+          result: failureResult,
         });
         if (retrying.status !== "retrying") return retrying;
         await this.store.appendLedger({
@@ -282,7 +296,7 @@ export class ActionExecutor {
       nextAttemptAt: undefined,
       completedAt: nowIso(),
       attempts,
-      ...(timedOut ? { result: timedOut.result, error: timedOut.warnings.join("\n") || undefined } : { error: message }),
+      ...(timedOut ? { result: timedOut.result, error: timedOut.warnings.join("\n") || undefined } : { error: message, result: failureResult }),
     });
     await this.store.appendLedger({
       event: "pollinate.job.errored",
@@ -355,6 +369,7 @@ export class ActionExecutor {
       deliveryIds: activationDeliveryIds(activation),
       execution: this.options.execution,
       hiveStartingWaitMs: this.hiveStartingWaitMs,
+      hiveBin: this.options.hiveBin,
     });
     return {
       context: {
@@ -489,45 +504,43 @@ export class ActionExecutor {
     cwd?: string,
     executionContext?: ActionExecutionContext,
   ): Promise<ActionResult> {
+    const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
+    const deliveryId = executionContext?.deliveryId;
     if (action.run === "spawn") {
       const spawnCwd = action.cwd ?? cwd;
-      // v2 grammar (cutover 2026-08-19): name is positional, harness is
-      // --agent, colonies become tags, a home IS an account id, and --yolo
-      // maps to the harness's own bypass flag as a per-bee arg (kept across
-      // revives).
-      const name = action.name ?? `pol-${(executionContext?.deliveryId ?? Date.now().toString(36)).replace(/[^A-Za-z0-9._:-]+/g, "-")}`;
-      const v2Args = ["spawn", name, "--agent", action.bee, "--json"];
-      if (spawnCwd) v2Args.push("--cwd", spawnCwd);
-      if (action.colony) v2Args.push("--tag", `colony=${action.colony}`);
-      if (action.home) v2Args.push("--account", action.home);
-      const bypass = action.yolo === true ? HARNESS_BYPASS_ARGS[action.bee] : undefined;
-      for (const beeArg of [...(bypass ?? []), ...(action.args ?? [])]) v2Args.push("--arg", beeArg);
-      const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      return this.execHive(v2Args, "hive spawn", { cwd: spawnCwd, timeoutMs }).then(async (result) => {
-        const handle = parseV2SpawnBeeId(result.stdout) ?? (isValidHiveHandle(action.name) ? action.name : undefined);
-        if (!handle) {
-          throw new Error(`hive spawn did not return a parsable target handle; stdout: ${JSON.stringify(String(result.stdout).slice(0, 200))}`);
-        }
-        if (action.message) {
-          const sent = await this.execHive(["send", handle, action.message], "hive send", { cwd: spawnCwd, timeoutMs });
-          return { ...result, handle, sent };
-        }
-        return { ...result, handle };
-      });
+      const agent = action.agent ?? action.bee;
+      if (!agent) throw new Error("honeybee spawn requires agent");
+      const name = action.name ?? `pol-${(deliveryId ?? Date.now().toString(36)).replace(/[^A-Za-z0-9._:-]+/g, "-")}`;
+      const spawnArgs = ["spawn", name, "--agent", agent, "--no-parent", ...idempotencyArgs(deliveryId, "spawn"), "--json"];
+      if (spawnCwd) spawnArgs.push("--cwd", spawnCwd);
+      const account = action.account ?? action.home;
+      if (account) spawnArgs.push("--account", account);
+      if (action.title) spawnArgs.push("--title", action.title);
+      const tags = [...(action.tags ?? []), ...(action.colony ? [`colony=${action.colony}`] : [])];
+      for (const tag of new Set(tags)) spawnArgs.push("--tag", tag);
+      const bypass = action.yolo === true ? HARNESS_BYPASS_ARGS[agent] : undefined;
+      for (const beeArg of [...(bypass ?? []), ...(action.args ?? [])]) spawnArgs.push("--arg", beeArg);
+      const result = await this.execHive(spawnArgs, "hive spawn", { cwd: spawnCwd, timeoutMs });
+      const handle = parseV2SpawnBeeId(result.stdout) ?? (isValidHiveHandle(action.name) ? action.name : undefined);
+      if (!handle) {
+        throw new Error(`hive spawn did not return a parsable target handle; stdout: ${JSON.stringify(String(result.stdout).slice(0, 200))}`);
+      }
+      if (action.message) {
+        const sent = await this.execHive(sendArgs(handle, action.message, deliveryId, "seed"), "hive send", { cwd: spawnCwd, timeoutMs });
+        return { ...result, handle, sent };
+      }
+      return { ...result, handle };
     }
     if (action.run === "send") {
-      const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      return this.execHive(["send", action.target, action.message], "hive send", { cwd, timeoutMs });
+      return this.execHive(sendArgs(action.target, action.message, deliveryId, "send", action.urgency), "hive send", { cwd, timeoutMs });
     }
-    if (action.run === "kill") {
-      // v2 split kill into stop (end the process; the bee stays revivable)
-      // and delete (irreversible purge). Automation must never purge records:
-      // kill maps to stop.
-      const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      return this.execHive(["stop", action.target], "hive stop", { cwd, timeoutMs });
+    try {
+      return await this.execHive(["stop", action.target, ...idempotencyArgs(deliveryId, "stop"), "--json"], "hive stop", { cwd, timeoutMs });
+    } catch (error) {
+      const hiveError = error instanceof ActionFailure ? error.hiveError : undefined;
+      if (hiveError && isAlreadyStopped(hiveError)) return { stopped: false, alreadyStopped: true, hiveError };
+      throw error;
     }
-    const neverAction: never = action;
-    throw new Error(`Unsupported honeybee action: ${JSON.stringify(neverAction)}`);
   }
 
   private get hiveStartingWaitMs(): number {
@@ -537,26 +550,36 @@ export class ActionExecutor {
   private async execHive(args: string[], label: string, options: { cwd?: string; timeoutMs?: number }): Promise<ActionResult & ExecResult> {
     const result = await execHive(args, {
       label,
+      bin: this.options.hiveBin,
       cwd: options.cwd,
       timeoutMs: options.timeoutMs ?? this.options.commandTimeoutMs,
       execution: this.options.execution,
       startingWaitMs: this.hiveStartingWaitMs,
     });
-    if (result.exitCode !== 0) throw new ActionFailure(`${label} exited ${result.exitCode}: ${result.stderr.trim()}`, hiveFailureCodes(result));
-    return { ...result };
+    if (result.exitCode === 0) return { ...result };
+    const codes = hiveFailureCodes(result);
+    const parsed = parseHiveJsonError(result.stdout);
+    if (!parsed) throw new ActionFailure(`${label} exited ${result.exitCode}: ${result.stderr.trim()}`, codes);
+    const binary = parsed.code === "protocol_mismatch" ? (resolveHiveBin(this.options.hiveBin, this.options.execution) ?? this.options.hiveBin ?? DEFAULT_HIVE_BIN) : undefined;
+    const hiveError: HiveErrorDetail = { ...parsed, ...(binary ? { binary } : {}) };
+    const suffix = binary ? ` (hive binary: ${binary}; set [honeybee] bin in pollinate.toml to choose another)` : "";
+    throw new ActionFailure(`${label}: ${parsed.code}: ${parsed.message}${suffix}`, codes, undefined, hiveError);
   }
-
 }
 
 /** Build an ActionExecutor from the store's daemon config (timeouts + shell). */
 export async function createExecutor(store: PollinateStore): Promise<ActionExecutor> {
-  const config = await store.daemonConfig();
-  return new ActionExecutor(store, {
+  return new ActionExecutor(store, executorOptionsFor(await store.daemonConfig()));
+}
+
+export function executorOptionsFor(config: DaemonConfig): ActionExecutorOptions {
+  return {
     contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
     commandTimeoutMs: parseDuration(config.defaults.commandTimeout, 600_000),
     hiveStartingWaitMs: parseDuration(config.defaults.hiveStartingWait, DEFAULT_HIVE_STARTING_WAIT_MS),
+    hiveBin: config.honeybee.bin,
     execution: config.execution,
-  });
+  };
 }
 
 /**
@@ -601,6 +624,31 @@ async function runSequence<T, R>(items: T[], fn: (item: T, index: number) => Pro
   const out: R[] = [];
   for (let index = 0; index < items.length; index += 1) out.push(await fn(items[index]!, index));
   return out;
+}
+
+function idempotencyArgs(deliveryId: string | undefined, step: string): string[] {
+  return deliveryId ? ["--idempotency-key", `${deliveryId}:${step}`] : [];
+}
+
+function sendArgs(target: string, message: string, deliveryId: string | undefined, step: string, urgency?: HiveUrgency): string[] {
+  return [
+    "send",
+    target,
+    hiveSafeMessage(message),
+    "--sender-kind",
+    "automation",
+    ...(urgency ? ["--urgency", urgency] : []),
+    ...idempotencyArgs(deliveryId, step),
+    "--json",
+  ];
+}
+
+export function hiveSafeMessage(message: string): string {
+  return message.startsWith("-") ? ` ${message}` : message;
+}
+
+function isAlreadyStopped(error: HiveErrorDetail): boolean {
+  return error.code === "bee_not_found" || /already stopped|not running|no such bee/i.test(error.message);
 }
 
 /** Old --yolo, per harness: the bypass flag rides as a per-bee arg in v2. */

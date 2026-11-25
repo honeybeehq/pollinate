@@ -93,7 +93,7 @@ message = "{{activity_markdown}}"
       closeOn: ["github.pull_request.merged"],
       openWhen: { pr_author: "trmdy" },
       idleTtl: "48h",
-      onOpen: { kind: "honeybee", run: "spawn", bee: "codex", name: "pr-{{pr_number}}" },
+      onOpen: { kind: "honeybee", run: "spawn", agent: "codex", name: "pr-{{pr_number}}" },
       onActivity: { kind: "honeybee", run: "send", target: "{{binding.target}}" },
     });
     expect(parsed.router?.onClose).toBeUndefined();
@@ -112,9 +112,9 @@ message = "{{activity_markdown}}"
         closeOn: ["github.pull_request.merged"],
         openWhen: { pr_author: "trmdy" },
         idleTtl: "2d",
-        onOpen: { kind: "honeybee", run: "spawn", bee: "codex", name: "pr-{{pr_number}}" },
+        onOpen: { kind: "honeybee", run: "spawn", agent: "codex", name: "pr-{{pr_number}}" },
         onActivity: { kind: "honeybee", run: "send", target: "{{binding.target}}", message: "{{activity_markdown}}" },
-        onClose: { kind: "honeybee", run: "kill", target: "{{binding.target}}" },
+        onClose: { kind: "honeybee", run: "stop", target: "{{binding.target}}" },
       },
     });
 
@@ -158,6 +158,20 @@ ${action}
     expect(() => parseTriggerToml(base('kind = "carrier-pigeon"', ok.delivery, ok.action))).toThrow(/Unsupported source kind/);
     expect(() => parseTriggerToml(base(ok.source, 'mode = "psychic"', ok.action))).toThrow(/Unsupported delivery mode/);
     expect(() => parseTriggerToml(base(ok.source, ok.delivery, 'kind = "honeybee"\nrun = "dance"'))).toThrow(/Unsupported honeybee run mode/);
+  });
+
+  test("normalizes honeybee aliases: bee/home/colony on spawn, kill to stop, and validates urgency", () => {
+    const action = (body: string) => parseTriggerToml(`[trigger]\nid = "h"\n[trigger.source]\nkind = "manual"\n[trigger.action]\nkind = "honeybee"\n${body}`).action;
+    expect(action(`run = "spawn"\nbee = "codex"\nhome = "work"\ncolony = "ops"\ntags = ["a"]\ntitle = "T"`)).toMatchObject({
+      run: "spawn",
+      agent: "codex",
+      account: "work",
+      tags: ["a", "colony=ops"],
+      title: "T",
+    });
+    expect(action(`run = "kill"\ntarget = "b"`)).toMatchObject({ run: "stop", target: "b" });
+    expect(action(`run = "send"\ntarget = "b"\nmessage = "m"\nurgency = "idle"`)).toMatchObject({ urgency: "idle" });
+    expect(() => action(`run = "send"\ntarget = "b"\nmessage = "m"\nurgency = "later"`)).toThrow(/urgency/);
   });
 
   test("refuses removed action kinds with the replacement named", () => {
@@ -384,6 +398,11 @@ jobsKeepLastPerTrigger = -5.7
     const config = parseDaemonConfigToml(`[retention]\njobsWarnFiles = 0\njobsWarnMb = -1\n`);
     expect(config.retention.jobsWarnFiles).toBe(DEFAULT_DAEMON_CONFIG.retention.jobsWarnFiles);
     expect(config.retention.jobsWarnMb).toBe(DEFAULT_DAEMON_CONFIG.retention.jobsWarnMb);
+  });
+
+  test("parses [honeybee] bin and requires an absolute path", () => {
+    expect(parseDaemonConfigToml(`[honeybee]\nbin = "/opt/hive/bin/hive"\n`).honeybee).toEqual({ bin: "/opt/hive/bin/hive" });
+    expect(() => parseDaemonConfigToml(`[honeybee]\nbin = "hive"\n`)).toThrow(/absolute path/);
   });
 
   test("rejects an invalid retention.jobsMaxAge duration", () => {

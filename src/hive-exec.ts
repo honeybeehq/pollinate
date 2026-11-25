@@ -1,6 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { accessSync, constants } from "node:fs";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { execArgv, type ExecOptions, type ExecResult } from "./process.js";
+import type { Action, ExecutionProfile, Trigger } from "./types.js";
 
 export const DEFAULT_HIVE_STARTING_WAIT_MS = 15 * 60_000;
 const FIRST_RETRY_DELAY_MS = 1_000;
@@ -23,8 +26,14 @@ export type HiveStartingObserver = {
 
 export type HiveExecOptions = ExecOptions & {
   label: string;
+  bin?: string;
   startingWaitMs?: number;
 };
+
+export const DEFAULT_HIVE_BIN = "hive";
+const HIVE_PROBE_TIMEOUT_MS = 2_000;
+
+export type HiveJsonError = { code: string; message: string };
 
 export class HiveStillStartingError extends Error {
   constructor(
@@ -45,11 +54,11 @@ export function withHiveStartingObserver<T>(observer: HiveStartingObserver, fn: 
 }
 
 export async function execHive(args: string[], options: HiveExecOptions): Promise<ExecResult> {
-  const { label, startingWaitMs = DEFAULT_HIVE_STARTING_WAIT_MS, ...execOptions } = options;
+  const { label, bin = DEFAULT_HIVE_BIN, startingWaitMs = DEFAULT_HIVE_STARTING_WAIT_MS, ...execOptions } = options;
   const observer = observerScope.getStore();
   let firstRefusedAt = 0;
   for (let attempt = 1; ; attempt += 1) {
-    const result = await execArgv("hive", args, execOptions);
+    const result = await execArgv(bin, args, execOptions);
     const refusal = daemonStartingRefusal(args, result);
     if (!refusal) return result;
     const now = Date.now();
@@ -102,4 +111,87 @@ function firstLine(text: string): string {
 function formatWait(ms: number): string {
   const seconds = Math.round(ms / 1000);
   return seconds >= 120 ? `${Math.round(seconds / 60)} min` : `${seconds}s`;
+}
+
+export function parseHiveJsonError(stdout: string): HiveJsonError | undefined {
+  for (const line of stdout.split(/\r?\n/)) {
+    const error = jsonLineError(line.trim());
+    if (typeof error?.code === "string") return { code: error.code, message: typeof error.message === "string" ? error.message : "" };
+  }
+  return undefined;
+}
+
+function jsonLineError(line: string): { code?: unknown; message?: unknown } | undefined {
+  if (!line.startsWith("{")) return undefined;
+  try {
+    return (JSON.parse(line) as { error?: { code?: unknown; message?: unknown } }).error;
+  } catch {
+    return undefined;
+  }
+}
+
+export function resolveHiveBin(bin: string | undefined, execution?: ExecutionProfile): string | undefined {
+  const command = bin ?? DEFAULT_HIVE_BIN;
+  if (command.includes("/")) return isAbsolute(command) ? command : resolve(command);
+  for (const dir of executionPath(execution).split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, command);
+    if (isExecutable(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function isExecutable(path: string): boolean {
+  try {
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function executionPath(execution?: ExecutionProfile): string {
+  if (!execution) return process.env.PATH ?? "";
+  return execution.env.PATH ?? (execution.inheritEnv ? (process.env.PATH ?? "") : "");
+}
+
+export function actionUsesHive(action: Action | undefined): boolean {
+  if (!action) return false;
+  if (action.kind === "honeybee") return true;
+  if (action.kind === "sequence") return action.actions.some((step) => actionUsesHive(step.action));
+  return false;
+}
+
+export function triggerUsesHive(trigger: Trigger): boolean {
+  if (trigger.enabled === false) return false;
+  if (actionUsesHive(trigger.action)) return true;
+  if (trigger.router) return true;
+  return (trigger.context?.sources ?? []).some((source) => source.kind === "honeybee");
+}
+
+export type HiveProbe = { path: string | null; version: string | null; ok: boolean; error?: string };
+
+export async function probeHive(bin: string | undefined, execution?: ExecutionProfile): Promise<HiveProbe> {
+  const path = resolveHiveBin(bin, execution) ?? null;
+  if (!path) return { path, version: null, ok: false, error: `${bin ?? DEFAULT_HIVE_BIN} not found on the execution PATH` };
+  try {
+    const result = await execArgv(path, ["--version", "--json"], { timeoutMs: HIVE_PROBE_TIMEOUT_MS, execution });
+    if (result.timedOut) return { path, version: null, ok: false, error: `timed out after ${HIVE_PROBE_TIMEOUT_MS}ms` };
+    const version = parseVersion(result.stdout);
+    if (result.exitCode !== 0 || !version) {
+      return { path, version, ok: false, error: firstLine(result.stderr) || firstLine(result.stdout) || `exited ${result.exitCode}` };
+    }
+    return { path, version, ok: true };
+  } catch (error) {
+    return { path, version: null, ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function parseVersion(stdout: string): string | null {
+  try {
+    const version = (JSON.parse(stdout.trim()) as { version?: unknown }).version;
+    return typeof version === "string" ? version : null;
+  } catch {
+    return null;
+  }
 }

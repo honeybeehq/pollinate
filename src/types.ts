@@ -85,22 +85,28 @@ export type TriggerHealthEntry = {
 
 export type TriggerHealth = Record<string, TriggerHealthEntry>;
 
+export type HiveUrgency = "now" | "next" | "idle";
+
 export type HoneybeeAction =
   | {
       kind: "honeybee";
       run: "spawn";
-      bee: string;
+      agent?: string;
+      bee?: string;
       name?: string;
-      colony?: string;
+      account?: string;
       home?: string;
+      tags?: string[];
+      colony?: string;
+      title?: string;
       cwd?: string;
       yolo?: boolean;
       args?: string[];
       message?: string;
       timeout?: string;
     }
-  | { kind: "honeybee"; run: "send"; target: string; message: string; timeout?: string }
-  | { kind: "honeybee"; run: "kill"; target: string; timeout?: string };
+  | { kind: "honeybee"; run: "send"; target: string; message: string; urgency?: HiveUrgency; timeout?: string }
+  | { kind: "honeybee"; run: "stop" | "kill"; target: string; timeout?: string };
 
 export type ActionStep = {
   id?: string;
@@ -337,6 +343,11 @@ export type DaemonConfig = {
   execution: ExecutionProfile;
   retention: RetentionConfig;
   router: { bindingRetention: string };
+  honeybee: HoneybeeConfig;
+};
+
+export type HoneybeeConfig = {
+  bin?: string;
 };
 
 export type LedgerEvent = {

@@ -1,5 +1,5 @@
-import { ActionExecutor } from "./actions.js";
-import { DEFAULT_HIVE_STARTING_WAIT_MS } from "./hive-exec.js";
+import { ActionExecutor, executorOptionsFor } from "./actions.js";
+import { probeHive, triggerUsesHive } from "./hive-exec.js";
 import { DeliveryManager } from "./delivery.js";
 import { PollEngine } from "./poll.js";
 import { ScheduleEngine } from "./schedule.js";
@@ -146,12 +146,7 @@ export class PollinateDaemon {
     await gcTemporaryHooks(this.store);
     await this.pruneOrphanedTriggerState();
     const { triggers, invalid } = await this.store.loadTriggerFiles();
-    const executor = new ActionExecutor(this.store, {
-      contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
-      commandTimeoutMs: parseDuration(config.defaults.commandTimeout, 600_000),
-      hiveStartingWaitMs: parseDuration(config.defaults.hiveStartingWait, DEFAULT_HIVE_STARTING_WAIT_MS),
-      execution: config.execution,
-    });
+    const executor = new ActionExecutor(this.store, executorOptionsFor(config));
     this.config = config;
     this.store.onJobAllocated = (triggerId) => this.noteJobAllocated(triggerId);
     this.daemonConfigSignature = signatureForConfig(config);
@@ -195,6 +190,13 @@ export class PollinateDaemon {
     );
     void this.runBindingGc();
     void this.runJobsGc("startup");
+    if (triggers.some(triggerUsesHive)) void this.probeHive(config);
+  }
+
+  private async probeHive(config: DaemonConfig): Promise<void> {
+    const probe = await probeHive(config.honeybee.bin, config.execution);
+    await this.store.appendLedger({ event: "pollinate.hive.probed", ...probe });
+    if (!probe.ok) await this.log(`hive probe failed for ${probe.path ?? config.honeybee.bin ?? "hive"}: ${probe.error ?? "unknown error"}`);
   }
 
   private async pruneOrphanedTriggerState(): Promise<void> {

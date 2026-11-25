@@ -436,7 +436,7 @@ export default {
           expect(binding?.status).toBe("closed");
 
           const log = await hive.log();
-          expect(log).toContain("spawn pr-trmd-pollinate-123 --agent codex --json");
+          expect(log).toContain("spawn pr-trmd-pollinate-123 --agent codex --no-parent");
           expect(log).toContain("--arg --allowedTools --arg Read"); // v2: per-bee args; --no-yolo = the v2 default (approvals on)
           expect(log.match(/--agent codex/g)).toHaveLength(2);
           expect(log.match(/stop pr-trmd-pollinate-123/g)).toHaveLength(2);
@@ -638,8 +638,8 @@ export default {
           binding = await store.getRouterBinding("github-pr-swarm", "github:pull_request:trmd/pollinate#456");
           expect(binding?.status).toBe("closed");
           const log = await hive.log();
-          expect(log).toContain("spawn claude-456 --agent claude --json");
-          expect(log).toContain("spawn grok-456 --agent grok --json");
+          expect(log).toContain("spawn claude-456 --agent claude --no-parent");
+          expect(log).toContain("spawn grok-456 --agent grok --no-parent");
           expect(log).toContain("send claude-456");
           expect(log).toContain("send grok-456");
           expect(log).toContain("stop claude-456");
