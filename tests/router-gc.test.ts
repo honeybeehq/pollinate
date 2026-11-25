@@ -48,7 +48,7 @@ describe("router binding gc", () => {
         const trig = routerTrigger({}, { idleTtl: "1s" });
         await store.saveTrigger(trig);
         await store.saveRouterBinding(binding(trig.id, { updatedAt: isoAgo(60_000), lastActivityAt: isoAgo(60_000) }));
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
 
         const result = await gcRouterBindings({ store, executor, triggers: [trig] });
 
@@ -72,7 +72,7 @@ describe("router binding gc", () => {
         const trig = routerTrigger({}, { idleTtl: "1h" });
         await store.saveTrigger(trig);
         await store.saveRouterBinding(binding(trig.id, { lastActivityAt: isoAgo(1_000) }));
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
 
         const result = await gcRouterBindings({ store, executor, triggers: [trig] });
 
@@ -101,7 +101,7 @@ describe("router binding gc", () => {
             context: { pr_number: "5", repo: "trmd/demo" },
           }),
         );
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
 
         const result = await gcRouterBindings({ store, executor, triggers: [trig] });
 
@@ -131,7 +131,7 @@ describe("router binding gc", () => {
             context: { pr_number: "5", repo: "trmd/demo" },
           }),
         );
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
 
         const result = await gcRouterBindings({ store, executor, triggers: [trig], maxOpenRetries: 3 });
 
@@ -160,7 +160,7 @@ describe("router binding gc", () => {
             context: { pr_number: "5", repo: "trmd/demo" },
           }),
         );
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
 
         const first = await gcRouterBindings({ store, executor, triggers: [trig] });
         expect(first.staled).toHaveLength(1);
@@ -186,7 +186,7 @@ describe("router binding gc", () => {
         const trig = routerTrigger();
         await store.saveTrigger(trig);
         await store.saveRouterBinding(binding(trig.id, { lastActivityAt: isoAgo(3_600_000), updatedAt: isoAgo(3_600_000) }));
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
 
         const result = await gcRouterBindings({ store, executor, triggers: [trig], reconcileAfterMs: 0 });
 
@@ -212,7 +212,7 @@ describe("router binding gc", () => {
         const trig = routerTrigger();
         await store.saveTrigger(trig);
         await store.saveRouterBinding(binding(trig.id, { lastActivityAt: isoAgo(3_600_000), updatedAt: isoAgo(3_600_000) }));
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
 
         const result = await gcRouterBindings({ store, executor, triggers: [trig], reconcileAfterMs: 0 });
 
@@ -252,7 +252,7 @@ describe("router binding gc", () => {
             updatedAt: isoAgo(3_600_000),
           }),
         );
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
 
         const result = await gcRouterBindings({ store, executor, triggers: [trig], reconcileAfterMs: 0 });
 

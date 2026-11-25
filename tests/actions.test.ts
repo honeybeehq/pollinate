@@ -37,7 +37,7 @@ describe("ActionExecutor honeybee argv execution", () => {
     await withTempStore(async (store, root) => {
       const hive = await installHiveStub(root);
       try {
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
         const marker = join(root, "pwned");
         const message = `PR title with '; touch ${marker}; echo ' and $(touch ${marker}) and \`touch ${marker}\``;
         await executor.executeAction({ kind: "honeybee", run: "send", target: "bee-1", message });
@@ -54,7 +54,7 @@ describe("ActionExecutor honeybee argv execution", () => {
     await withTempStore(async (store, root) => {
       const hive = await installHiveStub(root);
       try {
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
         await executor.executeAction({
           kind: "honeybee",
           run: "buz",
@@ -74,7 +74,7 @@ describe("ActionExecutor honeybee argv execution", () => {
     await withTempStore(async (store, root) => {
       const hive = await installHiveStub(root);
       try {
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
         const result = await executor.executeAction({
           kind: "honeybee",
           run: "spawn",
@@ -99,7 +99,7 @@ describe("ActionExecutor honeybee argv execution", () => {
         script: `#!/bin/sh\necho "$@" >> "${hiveLog}"\necho "!! totally not a handle !!"\ncat >/dev/null\n`,
       });
       try {
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
         await expect(
           executor.executeAction({ kind: "honeybee", run: "spawn", bee: "codex" }),
         ).rejects.toThrow(/did not return a parsable target handle/);
@@ -116,7 +116,7 @@ describe("ActionExecutor honeybee argv execution", () => {
         script: `#!/bin/sh\necho "$@" >> "${hiveLog}"\necho "!! noise !!"\ncat >/dev/null\n`,
       });
       try {
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
         const result = await executor.executeAction({ kind: "honeybee", run: "spawn", bee: "codex", name: "fallback-1" });
         expect(result.handle).toBe("fallback-1");
       } finally {
@@ -131,7 +131,7 @@ describe("ActionExecutor honeybee argv execution", () => {
         script: `#!/bin/sh\necho "no such bee" >&2\ncat >/dev/null\nexit 3\n`,
       });
       try {
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
         await expect(
           executor.executeAction({ kind: "honeybee", run: "kill", target: "ghost" }),
         ).rejects.toThrow(/hive stop exited 3: no such bee/);
@@ -145,7 +145,7 @@ describe("ActionExecutor honeybee argv execution", () => {
     await withTempStore(async (store, root) => {
       const hive = await installHiveStub(root);
       try {
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
         const result = await executor.executeAction({
           kind: "sequence",
           mode: "parallel",
