@@ -29,7 +29,7 @@ Every error answers `{"error": {"code", "message", "details"?}}`.
 | `not_found` | 404 | no such trigger, job or route |
 | `conflict` | 409 | `ifAbsent=1` on an existing id; a duplicate `deliveryId`; firing a disabled trigger; an ambiguous job reference |
 | `poll_failed` | 422 | a poll trigger's first check failed inside `PUT`; nothing was stored |
-| `unsupported` | 501 | a call this build does not serve (`/v1/events`, `/v1/doctor`); 405 for a wrong method on a known path |
+| `unsupported` | 501 | a call this build does not serve (`/v1/doctor`); 405 for a wrong method on a known path |
 | `stopping` | 503 | the daemon is shutting down |
 | `internal` | 500 | anything else; also ledgered as `pollinate.api.errored` |
 
@@ -39,7 +39,7 @@ Every error answers `{"error": {"code", "message", "details"?}}`.
 
 ```json
 {"name":"pollinate","version":"1.0.0","commit":"e8676a50a1415f7c6ea34e229910bef6dd8e240f","api":1,
- "features":["retry","baseline","onFailure"],"pid":45937,
+ "features":["retry","baseline","onFailure","events"],"pid":45937,
  "startedAt":"2026-11-25T11:54:48.261Z","reloadedAt":"2026-11-25T11:54:48.261Z",
  "store":"/tmp/pol-HLr6","triggers":{"total":0,"enabled":0},
  "webhook":{"bind":"127.0.0.1","port":39871,"publicUrl":null},
@@ -184,13 +184,47 @@ POST /v1/jobs/MA.b67/cancel
 200 {"job":{"id":"MA.b67","status":"cancelled","error":"Cancelled before start (cancelled via API)",...}}
 ```
 
-### `GET /v1/events`
+### `GET /v1/events?after=<cursor>&follow=1&tag=&trigger=&types=`
 
-Not served by this build:
+The ledger as `application/x-ndjson`: each ledger line as is, plus `cursor`.
+A cursor is `<generation>-<byte offset>`, the offset just past that line. Store
+the last cursor you handled and pass it as `after` to get exactly the lines
+after it, across daemon restarts and ledger rotations.
+
+- No `after`: starts at the current end and sends a heartbeat with the current
+  cursor at once, so a client can store a starting point.
+- `follow=1`: stays open; `{"heartbeat":true,"cursor"}` every 15 s
+  (`POLLINATE_EVENTS_HEARTBEAT_MS` overrides it). A heartbeat's cursor also
+  moves past lines the filters dropped. Without `follow` the call sends what
+  exists, then (with `after`) one heartbeat with the end cursor, and closes.
+- `{"gap":true,"cursor"}` comes first when `after` names a generation that has
+  rotated away; the stream continues from the oldest line still kept, which
+  that cursor names.
+- Filters, combined with AND: `trigger=<id>`, `types=<event>,<event>`,
+  `tag=<tag>` (the trigger's tags, including triggers removed recently).
+  Events without `trigger_id` never match `trigger` or `tag`.
+- A cursor that does not parse or does not sit at a line end: 400
+  `invalid_request`.
 
 ```json
-501 {"error":{"code":"unsupported","message":"GET /v1/events is not available in this build"}}
+GET /v1/events?follow=1&tag=apiary
+200 (application/x-ndjson)
+{"heartbeat":true,"cursor":"3-18244"}
+{"ts":"2026-11-25T12:20:01.114Z","event":"pollinate.job.queued","job_id":"WA.1c2","trigger_id":"wake","queue_position":0,"cursor":"3-18371"}
+{"heartbeat":true,"cursor":"3-18902"}
+
+GET /v1/events?after=1-5120
+200 (application/x-ndjson)
+{"gap":true,"cursor":"2-0"}
+{"ts":"2026-11-25T11:02:09.882Z","event":"pollinate.daemon.started","trigger_count":4,"cursor":"2-163"}
+...
+{"heartbeat":true,"cursor":"3-18902"}
+
+GET /v1/events?after=2-17
+400 {"error":{"code":"invalid_request","message":"Cursor 2-17 does not point at the end of a ledger line"}}
 ```
+
+See AGENTS.md, Events stream, for generations and rotation.
 
 ### `GET /v1/doctor`
 

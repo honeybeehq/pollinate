@@ -1,4 +1,5 @@
 import { appendFile, rename, stat, writeFile } from "node:fs/promises";
+import { request as httpRequest, type ClientRequest } from "node:http";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { PollinateDaemon } from "../src/daemon.js";
@@ -47,6 +48,40 @@ async function appendNumbered(store: PollinateStore, from: number, count: number
   for (let n = from; n < from + count; n += 1) await store.appendLedger({ event: "pollinate.test.n", n, ...extra });
 }
 
+function followSocket(socketPath: string, path: string) {
+  const lines: Line[] = [];
+  let status = 0;
+  let contentType = "";
+  let buffered = "";
+  const req: ClientRequest = httpRequest({ socketPath, path }, (res) => {
+    status = res.statusCode ?? 0;
+    contentType = String(res.headers["content-type"]);
+    res.setEncoding("utf8");
+    res.on("data", (chunk: string) => {
+      buffered += chunk;
+      for (let newline = buffered.indexOf("\n"); newline >= 0; newline = buffered.indexOf("\n")) {
+        lines.push(JSON.parse(buffered.slice(0, newline)) as Line);
+        buffered = buffered.slice(newline + 1);
+      }
+    });
+    res.on("error", () => undefined);
+  });
+  req.on("error", () => undefined);
+  req.end();
+  return {
+    lines,
+    response: () => ({ status, contentType }),
+    async waitFor(predicate: (lines: Line[]) => boolean, timeoutMs = 3_000) {
+      const start = Date.now();
+      while (!predicate(lines)) {
+        if (Date.now() - start > timeoutMs) throw new Error(`timed out; got ${JSON.stringify(lines)}`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    },
+    close: () => req.destroy(),
+  };
+}
+
 function numbers(lines: Line[]): number[] {
   return lines.filter((line) => line.event === "pollinate.test.n").map((line) => line.n as number);
 }
@@ -90,10 +125,10 @@ describe("events cursor", () => {
       await appendNumbered(store, 0, 5);
       const all = await collect(root, "after=1-0");
       expect(numbers(all)).toEqual(range(0, 5));
-      const resumed = await collect(root, `after=${all[1]!.cursor}`);
+      const resumed = await collect(root, `after=${all[1]?.cursor}`);
       expect(numbers(resumed)).toEqual([2, 3, 4]);
-      expect(resumed.at(-1)).toEqual({ heartbeat: true, cursor: all[4]!.cursor });
-      expect(all[4]!.cursor).toBe(`1-${(await stat(ledgerPath(root))).size}`);
+      expect(resumed.at(-1)).toEqual({ heartbeat: true, cursor: all[4]?.cursor });
+      expect(all[4]?.cursor).toBe(`1-${(await stat(ledgerPath(root))).size}`);
     });
   });
 
@@ -104,7 +139,7 @@ describe("events cursor", () => {
       const first = await collect(root, "after=1-0");
       expect(numbers(first)).toEqual([0]);
       await appendFile(ledgerPath(root), "}\n");
-      const second = await collect(root, `after=${first[0]!.cursor}`);
+      const second = await collect(root, `after=${first[0]?.cursor}`);
       expect(numbers(second)).toEqual([1]);
     });
   });
@@ -119,9 +154,9 @@ describe("ledger generations", () => {
       expect(await rotateLedgerIfLarge(root, 0.00001)).toBe(2);
       expect(await readLedgerGeneration(root)).toBe(2);
       await appendNumbered(store, 3, 2);
-      const resumed = await collect(root, `after=${before[0]!.cursor}`);
+      const resumed = await collect(root, `after=${before[0]?.cursor}`);
       expect(numbers(resumed)).toEqual([1, 2, 3, 4]);
-      expect(resumed.find((line) => line.n === 3)!.cursor.startsWith("2-")).toBe(true);
+      expect(resumed.find((line) => line.n === 3)?.cursor.startsWith("2-")).toBe(true);
     });
   });
 
@@ -143,7 +178,7 @@ describe("ledger generations", () => {
   test("a cursor whose generation rotated away gets a gap, then the oldest available lines", async () => {
     await withTempStore(async (store, root) => {
       await appendNumbered(store, 0, 2);
-      const stale = (await collect(root, "after=1-0"))[0]!.cursor;
+      const stale = (await collect(root, "after=1-0"))[0]?.cursor;
       await rotateLedgerIfLarge(root, 0.00001);
       await appendNumbered(store, 2, 2);
       await rotateLedgerIfLarge(root, 0.00001);
@@ -232,17 +267,19 @@ describe("events follow", () => {
     });
   });
 
-  test("a follower that disconnects gets exactly the 50 events written across a daemon restart", async () => {
+  test("a socket follower that disconnects gets exactly the 50 events written across a daemon restart", async () => {
     await withTempStore(async (store, root) => {
       await writeFile(join(root, "pollinate.toml"), QUIET_DAEMON_CONFIG);
+      const socket = join(root, "pollinated.sock");
       let daemon = new PollinateDaemon(store);
       await daemon.start();
-      const follower = follow(root, "follow=1", { pollMs: 20 });
-      await follower.waitFor((lines) => lines.length >= 1);
+      const first = followSocket(socket, "/v1/events?follow=1");
+      await first.waitFor((lines) => lines.length >= 1);
+      expect(first.response()).toEqual({ status: 200, contentType: "application/x-ndjson" });
       await appendNumbered(store, -3, 3);
-      await follower.waitFor((lines) => numbers(lines).length >= 3);
-      await follower.stop();
-      const last = follower.lines.at(-1)!.cursor;
+      await first.waitFor((lines) => numbers(lines).length >= 3);
+      first.close();
+      const last = first.lines.at(-1)?.cursor;
 
       await daemon.stop();
       await appendNumbered(store, 0, 20);
@@ -250,10 +287,13 @@ describe("events follow", () => {
       await daemon.start();
       try {
         await appendNumbered(store, 20, 30);
-        const lines = await collect(root, `after=${last}&types=pollinate.test.n`);
-        expect(numbers(lines)).toEqual(range(0, 50));
-        const events = lines.filter((line) => line.event);
-        expect(new Set(events.map((line) => line.cursor)).size).toBe(50);
+        const second = followSocket(socket, `/v1/events?follow=1&after=${last}`);
+        await second.waitFor((lines) => numbers(lines).length >= 50);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        second.close();
+        expect(numbers(second.lines)).toEqual(range(0, 50));
+        const cursors = second.lines.filter((line) => line.event === "pollinate.test.n").map((line) => line.cursor);
+        expect(new Set(cursors).size).toBe(50);
       } finally {
         await daemon.stop();
       }

@@ -119,7 +119,7 @@ describe("local API v1", () => {
       expect(health.body).toMatchObject({
         name: "pollinate",
         api: 1,
-        features: ["retry", "baseline", "onFailure"],
+        features: ["retry", "baseline", "onFailure", "events"],
         pid: process.pid,
         store: root,
         triggers: { total: 0, enabled: 0 },
@@ -128,7 +128,8 @@ describe("local API v1", () => {
       expect(health.body.webhook.port).toBeGreaterThan(0);
       expect(JSON.parse(await readFile(join(root, "state", "store.json"), "utf8"))).toEqual({ schema: 1 });
       expect((await call(socket, "GET", "/v1/nope")).body.error.code).toBe("not_found");
-      expect(await call(socket, "GET", "/v1/events")).toMatchObject({ status: 501, body: { error: { code: "unsupported" } } });
+      expect(await call(socket, "GET", "/v1/events")).toMatchObject({ status: 200, body: { heartbeat: true } });
+      expect(await call(socket, "GET", "/v1/events?after=nope")).toMatchObject({ status: 400, body: { error: { code: "invalid_request" } } });
       expect(await call(socket, "POST", "/v1/health")).toMatchObject({ status: 405, body: { error: { code: "unsupported" } } });
     });
   });

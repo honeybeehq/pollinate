@@ -359,6 +359,7 @@ export class PollinateDaemon {
       scheduleState: (id) => this.schedule?.stateFor(id) ?? {},
       fire: (trigger, payload, deliveryId) => this.fireTrigger(trigger, payload, deliveryId),
       hive: () => this.hive(),
+      eventTags: this.eventTags,
     };
   }
 

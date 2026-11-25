@@ -2,6 +2,7 @@ import { connect } from "node:net";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { chmod, lstat, unlink } from "node:fs/promises";
 import { parseTriggerRecord, parseTriggerToml } from "./config.js";
+import { EventsRequestError, serveEvents, type TriggerTagIndex } from "./events.js";
 import { MAX_SOCKET_PATH_BYTES, isEnoent } from "./fsx.js";
 import { isValidStoreId, TriggerExistsError, type PollinateStore } from "./store.js";
 import {
@@ -40,6 +41,7 @@ export type ApiHost = {
   scheduleState(id: string): { nextFireAt?: string; lastFireAt?: string };
   fire(trigger: Trigger, payload: JsonValue, deliveryId?: string): Promise<{ job: Job | null; duplicate: boolean }>;
   hive(): { path: string; version: string | null } | undefined;
+  readonly eventTags: TriggerTagIndex;
 };
 
 export class ApiError extends Error {
@@ -64,7 +66,8 @@ export class SocketPathError extends Error {
 type Route = {
   method: string;
   pattern: RegExp;
-  handle: (request: ApiRequest) => Promise<unknown>;
+  handle?: (request: ApiRequest) => Promise<unknown>;
+  stream?: (request: IncomingMessage, response: ServerResponse, url: URL) => Promise<void>;
   status?: number;
 };
 
@@ -96,7 +99,7 @@ export class ApiServer {
       { method: "GET", pattern: /^\/v1\/jobs$/, handle: (request) => this.listJobs(request.query) },
       { method: "GET", pattern: /^\/v1\/jobs\/([^/]+)$/, handle: (request) => this.getJob(request.id) },
       { method: "POST", pattern: /^\/v1\/jobs\/([^/]+)\/cancel$/, handle: (request) => this.cancelJob(request.id) },
-      { method: "GET", pattern: /^\/v1\/events$/, handle: () => this.unsupported("GET /v1/events is not available in this build") },
+      { method: "GET", pattern: /^\/v1\/events$/, stream: (request, response, url) => this.events(request, response, url) },
       { method: "GET", pattern: /^\/v1\/doctor$/, handle: () => this.unsupported("GET /v1/doctor is not available in this build") },
     ];
   }
@@ -172,6 +175,11 @@ export class ApiServer {
         if (!match) continue;
         pathMatched = true;
         if (route.method !== method) continue;
+        if (route.stream) {
+          await route.stream(request, response, url);
+          return;
+        }
+        if (!route.handle) continue;
         const id = match[1] === undefined ? "" : safeDecode(match[1]);
         const result = await route.handle({ id, query: url.searchParams, body: () => readJsonBody(request) });
         sendJson(response, route.status ?? 200, result);
@@ -189,6 +197,15 @@ export class ApiServer {
       sendJson(response, apiError.status, {
         error: { code: apiError.code, message: apiError.message, ...(apiError.details === undefined ? {} : { details: apiError.details }) },
       });
+    }
+  }
+
+  private async events(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    try {
+      await serveEvents(request, response, url, { root: this.host.store.root, tags: this.host.eventTags });
+    } catch (error) {
+      if (error instanceof EventsRequestError) throw new ApiError("invalid_request", error.message);
+      throw error;
     }
   }
 
