@@ -17,6 +17,7 @@ const MAX_HEADERS_COUNT = 64;
 
 export class WebhookServer {
   private server?: http.Server;
+  private readonly dispatches = new Set<Promise<unknown>>();
 
   constructor(
     private readonly store: PollinateStore,
@@ -44,10 +45,12 @@ export class WebhookServer {
   }
 
   async stop(): Promise<void> {
-    if (!this.server) return;
-    await new Promise<void>((resolve, reject) => {
-      this.server?.close((error) => (error ? reject(error) : resolve()));
-    });
+    if (this.server) {
+      await new Promise<void>((resolve, reject) => {
+        this.server?.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+    await Promise.allSettled([...this.dispatches]);
   }
 
   updateTriggers(triggers: Trigger[]): void {
@@ -173,7 +176,7 @@ export class WebhookServer {
         at: nowIso(),
         response_ms: Date.now() - started,
       });
-      void this.delivery.handle(dispatchTrigger, admitted, { admitted: true }).catch((error) =>
+      const dispatch = this.delivery.handle(dispatchTrigger, admitted, { admitted: true }).catch((error) =>
         this.store.appendLedger({
           event: "pollinate.webhook.rejected",
           trigger_id: dispatchTrigger.id,
@@ -182,6 +185,9 @@ export class WebhookServer {
           error: error instanceof Error ? error.message : String(error),
         }),
       );
+      this.dispatches.add(dispatch);
+      const settled = () => this.dispatches.delete(dispatch);
+      dispatch.then(settled, settled);
     } catch (error) {
       const status = error instanceof HttpError ? error.status : 500;
       send(response, status, { error: error instanceof Error ? error.message : String(error) });
