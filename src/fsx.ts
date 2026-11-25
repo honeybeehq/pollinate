@@ -1,4 +1,4 @@
-import { chmod, mkdir, open, readFile, rename, rm, stat, unlink, utimes } from "node:fs/promises";
+import { chmod, link, mkdir, open, readFile, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -54,6 +54,10 @@ export async function rotateLedgerIfLarge(root: string, maxMb: number): Promise<
   if (!info || info.size <= maxMb * 1024 * 1024) return false;
   await rename(path, `${path}.1`);
   return true;
+}
+
+export function daemonLockPath(root = storeRoot()): string {
+  return join(stateDir(root), "daemon.lock");
 }
 
 export function daemonConfigPath(root = storeRoot()): string {
@@ -207,6 +211,109 @@ async function readLockToken(path: string): Promise<string | undefined> {
     if (isEnoent(error)) return undefined;
     throw error;
   }
+}
+
+export const DAEMON_LOCK_HEARTBEAT_MS = 10_000;
+export const DAEMON_LOCK_STALE_MS = 30_000;
+const DAEMON_LOCK_ATTEMPTS = 5;
+
+export type DaemonLock = { path: string; pid: number; startedAt: string; token: string };
+export type DaemonLockHolder = { pid: number | null; startedAt: string | null; heartbeatAt: string; token: string | null; raw: string; mtimeMs: number };
+export type DaemonLockAttempt = { acquired: true; lock: DaemonLock } | { acquired: false; holder: DaemonLockHolder | null };
+export type DaemonLockCheck = { held: true } | { held: false; holder: DaemonLockHolder | null };
+
+export async function acquireDaemonLock(root: string, staleMs = DAEMON_LOCK_STALE_MS): Promise<DaemonLockAttempt> {
+  const lock: DaemonLock = { path: daemonLockPath(root), pid: process.pid, startedAt: new Date().toISOString(), token: randomUUID() };
+  await mkdir(dirname(lock.path), { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < DAEMON_LOCK_ATTEMPTS; attempt += 1) {
+    if (await createDaemonLockFile(lock)) return { acquired: true, lock };
+    const holder = await readDaemonLock(lock.path);
+    if (!holder) continue;
+    if (!isDaemonLockStale(holder, staleMs)) return { acquired: false, holder };
+    await removeUnchangedDaemonLock(lock.path, holder);
+  }
+  return { acquired: false, holder: await readDaemonLock(lock.path) };
+}
+
+export async function refreshDaemonLock(lock: DaemonLock): Promise<DaemonLockCheck> {
+  const holder = await readDaemonLock(lock.path);
+  if (!holder) {
+    if (await createDaemonLockFile(lock)) return { held: true };
+    const current = await readDaemonLock(lock.path);
+    return current?.token === lock.token ? { held: true } : { held: false, holder: current };
+  }
+  if (holder.token !== lock.token) return { held: false, holder };
+  const now = new Date();
+  await utimes(lock.path, now, now);
+  return { held: true };
+}
+
+export async function releaseDaemonLock(lock: DaemonLock): Promise<void> {
+  const holder = await readDaemonLock(lock.path);
+  if (holder?.token === lock.token) await unlink(lock.path).catch(() => undefined);
+}
+
+export async function readDaemonLock(path: string): Promise<DaemonLockHolder | null> {
+  try {
+    const [raw, info] = await Promise.all([readFile(path, "utf8"), stat(path)]);
+    const parsed = parseDaemonLock(raw);
+    return {
+      pid: typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0 ? parsed.pid : null,
+      startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : null,
+      token: typeof parsed.token === "string" ? parsed.token : null,
+      heartbeatAt: info.mtime.toISOString(),
+      raw,
+      mtimeMs: info.mtimeMs,
+    };
+  } catch (error) {
+    if (isEnoent(error)) return null;
+    throw error;
+  }
+}
+
+export function isDaemonLockStale(holder: DaemonLockHolder, staleMs = DAEMON_LOCK_STALE_MS, now = Date.now()): boolean {
+  if (now - holder.mtimeMs > staleMs) return true;
+  return holder.pid !== null && !processAlive(holder.pid);
+}
+
+function parseDaemonLock(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function createDaemonLockFile(lock: DaemonLock): Promise<boolean> {
+  const tmp = join(dirname(lock.path), `.daemon.lock.${process.pid}.${randomUUID()}.tmp`);
+  await writeFile(tmp, `${JSON.stringify({ pid: lock.pid, startedAt: lock.startedAt, token: lock.token })}\n`, { mode: 0o600 });
+  try {
+    await link(tmp, lock.path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  } finally {
+    await unlink(tmp).catch(() => undefined);
+  }
+}
+
+async function removeUnchangedDaemonLock(path: string, judged: DaemonLockHolder): Promise<void> {
+  const current = await readDaemonLock(path);
+  if (!current || current.raw !== judged.raw || current.mtimeMs !== judged.mtimeMs) return;
+  await unlink(path).catch((error) => {
+    if (!isEnoent(error)) throw error;
+  });
 }
 
 async function quarantineCorruptJson(path: string, error: unknown): Promise<void> {

@@ -5,8 +5,14 @@ import { nowIso, parseDuration, parseIsoDate } from "./time.js";
 
 type ScheduleEntry = ScheduleState[string] & { timingHash?: string };
 type NextFireOptions = { previousFireAt?: Date };
+type MissedDetection = "tick" | "startup";
+export type DueOccurrences = { count: number; latest: Date; capped: boolean };
 
 const NEVER_FIRE = new Date("9999-12-31T23:59:59.999Z");
+const FIRE_ALL_CAP = 100;
+const MISSED_COUNT_LIMIT = 10_000;
+const LATE_GRACE_MIN_MS = 5_000;
+const LATE_GRACE_MAX_MS = 60_000;
 
 export class ScheduleEngine {
   private state: ScheduleState = {};
@@ -56,8 +62,7 @@ export class ScheduleEngine {
           if (!entry.nextFireAt) continue;
           const next = parseIsoDate(entry.nextFireAt, "nextFireAt");
           if (next.getTime() > now.getTime()) continue;
-          await this.ledgerMissed(trigger, timing, entry.nextFireAt);
-          await this.handleMissedFire(trigger, timing, next, now);
+          await this.catchUp(trigger, timing, next, now, "startup");
           dirty = false;
         } catch (error) {
           await this.ledgerScheduleError("restoreMissedFires", error, trigger.id);
@@ -93,12 +98,12 @@ export class ScheduleEngine {
             await this.store.writeScheduleState(this.state);
             continue;
           }
-          if (isMissedInTick(timing, nextAt, now)) {
-            await this.ledgerMissed(trigger, timing, entry.nextFireAt);
-            await this.handleMissedFire(trigger, timing, nextAt, now);
+          const following = this.nextAfterScheduled(timing, nextAt);
+          if (following.getTime() <= now.getTime()) {
+            await this.catchUp(trigger, timing, nextAt, now, "tick");
             continue;
           }
-          await this.reserveAndFire(trigger, timing, nextAt, this.nextAfterScheduled(timing, nextAt));
+          await this.reserveAndFire(trigger, timing, nextAt, nextAfterOnTimeFire(timing, nextAt, following, now), 0);
         } catch (error) {
           await this.ledgerScheduleError("tick", error, trigger.id);
         }
@@ -153,14 +158,20 @@ export class ScheduleEngine {
     return dirty;
   }
 
-  private async handleMissedFire(trigger: Trigger, timing: ScheduleTiming, scheduledAt: Date, now: Date): Promise<void> {
+  private async catchUp(trigger: Trigger, timing: ScheduleTiming, firstDue: Date, now: Date, detected: MissedDetection): Promise<void> {
+    const due = dueOccurrences(timing, firstDue, now);
+    await this.ledgerMissed(trigger, timing, firstDue, due, detected);
+    await this.handleMissedFire(trigger, timing, firstDue, due, now);
+  }
+
+  private async handleMissedFire(trigger: Trigger, timing: ScheduleTiming, scheduledAt: Date, due: DueOccurrences, now: Date): Promise<void> {
     const policy = missedFirePolicy(timing);
     if (timing.type === "once") {
       if (policy === "skip") {
         await this.completeOnce(trigger, scheduledAt);
         return;
       }
-      await this.reserveAndFire(trigger, timing, scheduledAt, undefined);
+      await this.reserveAndFire(trigger, timing, scheduledAt, undefined, 1);
       return;
     }
     if (policy === "skip") {
@@ -173,14 +184,14 @@ export class ScheduleEngine {
       return;
     }
     if (policy === "fire-once") {
-      await this.reserveAndFire(trigger, timing, scheduledAt, nextFireAfter(timing, now, { previousFireAt: scheduledAt }));
+      await this.reserveAndFire(trigger, timing, due.latest, nextFireAfter(timing, now, { previousFireAt: due.latest }), due.count);
       return;
     }
     let cursor = scheduledAt;
     let count = 0;
-    while (cursor.getTime() <= now.getTime() && count < 100) {
+    while (cursor.getTime() <= now.getTime() && count < FIRE_ALL_CAP) {
       const next = this.nextAfterScheduled(timing, cursor);
-      await this.reserveAndFire(trigger, timing, cursor, next);
+      await this.reserveAndFire(trigger, timing, cursor, next, 1);
       cursor = next;
       count += 1;
     }
@@ -198,10 +209,10 @@ export class ScheduleEngine {
     return nextFireAfter(timing, scheduledAt, { previousFireAt: scheduledAt });
   }
 
-  private async reserveAndFire(trigger: Trigger, timing: ScheduleTiming, scheduledAt: Date, nextFireAt: Date | undefined): Promise<void> {
+  private async reserveAndFire(trigger: Trigger, timing: ScheduleTiming, scheduledAt: Date, nextFireAt: Date | undefined, missed: number): Promise<void> {
     if (timing.type === "once") {
       await this.completeOnce(trigger, scheduledAt, false);
-      await this.fire(trigger, scheduledAt);
+      await this.fire(trigger, scheduledAt, missed);
       trigger.enabled = false;
       return;
     } else {
@@ -213,7 +224,7 @@ export class ScheduleEngine {
       });
       await this.store.writeScheduleState(this.state);
     }
-    await this.fire(trigger, scheduledAt);
+    await this.fire(trigger, scheduledAt, missed);
   }
 
   private async completeOnce(trigger: Trigger, scheduledAt: Date, disableRuntime = true): Promise<void> {
@@ -229,11 +240,11 @@ export class ScheduleEngine {
     if (disableRuntime) trigger.enabled = false;
   }
 
-  private async fire(trigger: Trigger, scheduledAt = new Date()): Promise<void> {
+  private async fire(trigger: Trigger, scheduledAt: Date, missed: number): Promise<void> {
     const activation: Activation = {
       triggerId: trigger.id,
       source: "schedule",
-      payload: { scheduled_at: scheduledAt.toISOString() },
+      payload: { scheduled_at: scheduledAt.toISOString(), missed, late_ms: Math.max(0, Date.now() - scheduledAt.getTime()) },
       receivedAt: nowIso(),
       metadata: { deliveryId: deliveryIdFor(trigger.id, `sched:${scheduledAt.toISOString()}`), stableDeliveryId: true },
     };
@@ -260,8 +271,16 @@ export class ScheduleEngine {
     return localMinuteKey(zonedParts(scheduledAt, timezone)) === localMinuteKey(zonedParts(previous, timezone));
   }
 
-  private async ledgerMissed(trigger: Trigger, timing: ScheduleTiming, scheduledAt: string): Promise<void> {
-    await this.store.appendLedger({ event: "pollinate.schedule.missed", trigger_id: trigger.id, policy: missedFirePolicy(timing), scheduled_at: scheduledAt });
+  private async ledgerMissed(trigger: Trigger, timing: ScheduleTiming, firstDue: Date, due: DueOccurrences, detected: MissedDetection): Promise<void> {
+    await this.store.appendLedger({
+      event: "pollinate.schedule.missed",
+      trigger_id: trigger.id,
+      policy: missedFirePolicy(timing),
+      scheduled_at: firstDue.toISOString(),
+      missed_count: due.count,
+      ...(due.capped ? { missed_count_capped: true } : {}),
+      detected,
+    });
   }
 
   private async ledgerScheduleError(stage: string, error: unknown, triggerId?: string): Promise<void> {
@@ -422,9 +441,44 @@ export function missedFirePolicy(timing: ScheduleTiming): MissedFirePolicy {
   return timing.missedFirePolicy ?? "skip";
 }
 
-function isMissedInTick(timing: ScheduleTiming, scheduledAt: Date, now: Date): boolean {
-  if (timing.type !== "every") return false;
-  return now.getTime() - scheduledAt.getTime() >= parseDuration(timing.interval);
+export function dueOccurrences(timing: ScheduleTiming, firstDue: Date, now: Date): DueOccurrences {
+  if (timing.type === "once") return { count: 1, latest: firstDue, capped: false };
+  if (timing.type === "every") {
+    const intervalMs = parseDuration(timing.interval);
+    const count = intervalMs > 0 ? Math.floor((now.getTime() - firstDue.getTime()) / intervalMs) + 1 : 1;
+    return { count, latest: new Date(firstDue.getTime() + (count - 1) * intervalMs), capped: false };
+  }
+  let latest = firstDue;
+  for (let count = 1; ; count += 1) {
+    const next = nextFireAfter(timing, latest, { previousFireAt: latest });
+    if (next.getTime() > now.getTime()) return { count, latest, capped: false };
+    if (count >= MISSED_COUNT_LIMIT) return { count, latest: latestCronOccurrence(timing, now) ?? next, capped: true };
+    latest = next;
+  }
+}
+
+function latestCronOccurrence(timing: ScheduleTiming, now: Date): Date | undefined {
+  for (let spanMs = 60_000; spanMs <= 5 * 366 * 86_400_000; spanMs *= 2) {
+    let latest = nextFireAfter(timing, new Date(now.getTime() - spanMs));
+    if (latest.getTime() > now.getTime()) continue;
+    for (;;) {
+      const next = nextFireAfter(timing, latest, { previousFireAt: latest });
+      if (next.getTime() > now.getTime()) return latest;
+      latest = next;
+    }
+  }
+  return undefined;
+}
+
+function nextAfterOnTimeFire(timing: ScheduleTiming, scheduledAt: Date, following: Date, now: Date): Date {
+  if (timing.type !== "every" || missedFirePolicy(timing) === "fire-all") return following;
+  const intervalMs = parseDuration(timing.interval);
+  if (now.getTime() - scheduledAt.getTime() <= lateGraceMs(intervalMs)) return following;
+  return new Date(now.getTime() + intervalMs);
+}
+
+function lateGraceMs(intervalMs: number): number {
+  return Math.min(LATE_GRACE_MAX_MS, Math.max(LATE_GRACE_MIN_MS, intervalMs / 10));
 }
 
 function timingHash(timing: ScheduleTiming): string {

@@ -6,7 +6,18 @@ import { ScheduleEngine } from "./schedule.js";
 import { PollinateStore } from "./store.js";
 import { WebhookServer } from "./webhook.js";
 import { nowIso, parseDuration } from "./time.js";
-import { appendTextLine, daemonLogPath, rotateLedgerIfLarge } from "./fsx.js";
+import {
+  acquireDaemonLock,
+  appendTextLine,
+  DAEMON_LOCK_HEARTBEAT_MS,
+  daemonLockPath,
+  daemonLogPath,
+  refreshDaemonLock,
+  releaseDaemonLock,
+  rotateLedgerIfLarge,
+  type DaemonLock,
+  type DaemonLockHolder,
+} from "./fsx.js";
 import { gcTemporaryHooks } from "./hooks.js";
 import { gcRouterBindings, routerGcSummary } from "./router-gc.js";
 import { jobStoreWarnings, recordDaemonStart, recordDaemonStop, topTriggersByFiles, writeJobStoreHealth } from "./daemon-health.js";
@@ -18,7 +29,21 @@ const MS_PER_DAY = 86_400_000;
 const MIN_PRESSURE_GC_SPACING_MS = 60_000;
 let daemonProcessGuardsInstalled = false;
 
+export class DaemonRefusedError extends Error {
+  constructor(
+    readonly reason: "locked" | "lock_lost",
+    readonly holderPid: number | null,
+    message: string,
+  ) {
+    super(message);
+    this.name = "DaemonRefusedError";
+  }
+}
+
 export class PollinateDaemon {
+  onLockLost?: (error: DaemonRefusedError) => void;
+  private lock?: DaemonLock;
+  private lockHeartbeatTimer?: NodeJS.Timeout;
   private delivery?: DeliveryManager;
   private schedule?: ScheduleEngine;
   private poll?: PollEngine;
@@ -43,6 +68,68 @@ export class PollinateDaemon {
 
   async start(): Promise<void> {
     await this.store.ensure();
+    await this.acquireLock();
+    try {
+      await this.startEngines();
+    } catch (error) {
+      await this.log(`daemon start failed: ${error instanceof Error ? error.message : String(error)}`);
+      await this.abandonStart();
+      throw error;
+    }
+  }
+
+  private async acquireLock(): Promise<void> {
+    const attempt = await acquireDaemonLock(this.store.root);
+    if (!attempt.acquired) {
+      const holderPid = attempt.holder?.pid ?? null;
+      await this.store.appendLedger({ event: "pollinate.daemon.refused", reason: "locked", pid: holderPid });
+      const message = `store ${this.store.root} is locked by daemon pid ${holderPid ?? "unknown"}${describeHolder(attempt.holder)} (${daemonLockPath(this.store.root)})`;
+      await this.log(`daemon start refused (pid ${process.pid}): ${message}`);
+      throw new DaemonRefusedError("locked", holderPid, message);
+    }
+    this.lock = attempt.lock;
+    this.lockHeartbeatTimer = setInterval(() => {
+      void this.heartbeatLock();
+    }, DAEMON_LOCK_HEARTBEAT_MS);
+    this.lockHeartbeatTimer.unref?.();
+  }
+
+  private async heartbeatLock(): Promise<void> {
+    const lock = this.lock;
+    if (!lock || this.stopping) return;
+    try {
+      const check = await refreshDaemonLock(lock);
+      if (check.held || this.lock !== lock) return;
+      this.lock = undefined;
+      const holderPid = check.holder?.pid ?? null;
+      await this.store.appendLedger({ event: "pollinate.daemon.refused", reason: "lock_lost", pid: holderPid });
+      const message = `daemon pid ${process.pid} lost the store lock to pid ${holderPid ?? "unknown"}${describeHolder(check.holder)}; stopping`;
+      await this.log(message);
+      await this.stop();
+      this.onLockLost?.(new DaemonRefusedError("lock_lost", holderPid, message));
+    } catch (error) {
+      await this.log(`daemon lock heartbeat failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async abandonStart(): Promise<void> {
+    this.stopping = true;
+    this.clearTimers();
+    await this.webhook?.stop().catch(() => undefined);
+    await this.poll?.stop().catch(() => undefined);
+    await this.schedule?.stop().catch(() => undefined);
+    await this.delivery?.shutdown().catch(() => undefined);
+    await this.releaseLock();
+  }
+
+  private async releaseLock(): Promise<void> {
+    if (this.lockHeartbeatTimer) clearInterval(this.lockHeartbeatTimer);
+    const lock = this.lock;
+    this.lock = undefined;
+    if (lock) await releaseDaemonLock(lock).catch(() => undefined);
+  }
+
+  private async startEngines(): Promise<void> {
     const restarts = await recordDaemonStart(this.store.root).catch(() => ({ uncleanExits: 0, crashLoop: false }));
     if (restarts.crashLoop) {
       await this.store.appendLedger({ event: "pollinate.daemon.crash_loop", unclean_exits: restarts.uncleanExits });
@@ -67,12 +154,12 @@ export class PollinateDaemon {
     this.triggers = triggers;
     this.delivery = new DeliveryManager(this.store, executor);
     await this.delivery.init(triggers);
+    this.webhook = new WebhookServer(this.store, this.delivery, triggers, config.webhook.bind, config.webhook.port, config.webhook.relay);
+    await this.webhook.start();
     this.schedule = new ScheduleEngine(this.store, this.delivery, triggers, config.defaults.tickMs);
     this.poll = new PollEngine(this.store, this.delivery, triggers, config.execution);
-    this.webhook = new WebhookServer(this.store, this.delivery, triggers, config.webhook.bind, config.webhook.port, config.webhook.relay);
     await this.schedule.start();
     await this.poll.start();
-    await this.webhook.start();
     this.triggerSignature = signatureForTriggers(triggers);
     this.reloadTimer = setInterval(() => {
       void this.reloadTriggers();
@@ -109,18 +196,23 @@ export class PollinateDaemon {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
-    if (this.reloadTimer) clearInterval(this.reloadTimer);
-    if (this.bindingGcTimer) clearInterval(this.bindingGcTimer);
-    if (this.jobsGcTimer) clearInterval(this.jobsGcTimer);
-    if (this.jobsGcPressureTimer) clearTimeout(this.jobsGcPressureTimer);
-    this.store.onJobAllocated = undefined;
+    this.clearTimers();
     await this.webhook?.stop();
     await this.poll?.stop();
     await this.schedule?.stop();
     await this.delivery?.shutdown();
     await this.store.appendLedger({ event: "pollinate.daemon.stopped" });
     await recordDaemonStop(this.store.root).catch(() => undefined);
+    await this.releaseLock();
     await this.log("daemon stopped");
+  }
+
+  private clearTimers(): void {
+    if (this.reloadTimer) clearInterval(this.reloadTimer);
+    if (this.bindingGcTimer) clearInterval(this.bindingGcTimer);
+    if (this.jobsGcTimer) clearInterval(this.jobsGcTimer);
+    if (this.jobsGcPressureTimer) clearTimeout(this.jobsGcPressureTimer);
+    this.store.onJobAllocated = undefined;
   }
 
   private async reloadTriggers(): Promise<void> {
@@ -309,6 +401,11 @@ function formatMb(bytes: number): string {
   return `${(bytes / 1_048_576).toFixed(1)} MB`;
 }
 
+function describeHolder(holder: DaemonLockHolder | null): string {
+  if (!holder) return "";
+  return `, started ${holder.startedAt ?? "unknown"}, heartbeat ${holder.heartbeatAt}`;
+}
+
 function signatureForTriggers(triggers: Array<{ id: string; updatedAt: string; enabled: boolean }>): string {
   return triggers
     .map((trigger) => `${trigger.id}:${trigger.updatedAt}:${trigger.enabled}`)
@@ -320,9 +417,10 @@ function signatureForConfig(config: DaemonConfig): string {
   return JSON.stringify(config);
 }
 
-export async function runForeground(): Promise<void> {
+export async function runForeground(onFatal: (error: unknown) => void): Promise<void> {
   const daemon = new PollinateDaemon();
   installDaemonProcessGuards((message) => daemon.logProcessGuard(message));
+  daemon.onLockLost = onFatal;
   await daemon.start();
   const stop = async () => {
     await daemon.stop();

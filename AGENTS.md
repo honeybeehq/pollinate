@@ -133,6 +133,7 @@ symlinks, then
   state/job-id-index.lock         lock for the job ID index
   state/jobs-store.json           last retention sweep: job file count, bytes, largest triggers, warnings
   state/daemon-runs.json          last 20 daemon starts/clean stops (crash-loop detection)
+  state/daemon.lock               one daemon per store: pid, start time, token; mtime is the heartbeat
   state/trigger-locks/<id>.lock   per-trigger write locks
   state/job-locks/<jobId>.lock    per-job write locks
   state/router-bindings/<trigger>/<subject>.json   binding records
@@ -372,6 +373,59 @@ marker, which is the only thing preventing a bee's own comment from re-waking
 it. Keep review bees read-only (`--allowedTools` with `gh pr view/diff/comment`,
 `Read`, `Grep`, …) — comment bodies are untrusted prompt input.
 
+## Schedules and missed fires
+
+A schedule fire's payload (`{{event}}`) is
+`{"scheduled_at": "<occurrence ISO>", "missed": <n>, "late_ms": <ms>}`:
+`missed` is how many missed occurrences this fire stands for (0 on time, 1 for
+a missed `once` and for each `fire-all` catch-up, all of them for a `fire-once`
+catch-up) and `late_ms` is fire time minus `scheduled_at`.
+
+An occurrence is missed when the daemon was down at start (`detected:
+"startup"`: any overdue occurrence) or when a tick finds that the occurrence
+after the due one is also due (`detected: "tick"`, e.g. the process was
+suspended by sleep or `SIGSTOP`). The rule is the same for `every`, `cron` and
+`once`. Each catch-up writes one `pollinate.schedule.missed` with `policy`,
+`scheduled_at` (the first missed occurrence), `missed_count` and `detected`,
+then applies `missedFirePolicy`:
+
+- `skip` (default): no fire; next is the first occurrence after now.
+- `fire-once`: one fire with `scheduled_at` set to the latest due occurrence
+  and `missed` set to `missed_count`; next is the first occurrence after now.
+- `fire-all`: one fire per missed occurrence, oldest first, at most 100 per
+  catch-up; then next is the first occurrence after now.
+
+`missed_count` is counted up to 10,000 occurrences; beyond that the entry
+carries `missed_count_capped: true` and `fire-once` still uses the latest
+occurrence.
+
+A single late occurrence (the next one not yet due) fires as usual with
+`missed: 0`. For `every` under `skip` or `fire-once`, a fire later than its
+grace (10% of the interval, at least 5 s, at most 60 s) sets next to now plus
+the interval, so it is not followed by an on-time fire seconds later.
+`fire-all` keeps the original cadence.
+
+## One daemon per store
+
+`daemon run` takes `state/daemon.lock` before anything else, then restores
+queued deliveries, listens for webhooks, and only then starts schedules and
+polls. The lock file holds `pid`, `startedAt` and a token; the daemon touches
+its mtime every 10 s.
+
+- A lock is stale when its pid is dead or its mtime is older than 30 s (e.g. a
+  daemon killed with `-9`); a new start removes it and takes over.
+- A live lock refuses the start: the process ledgers
+  `pollinate.daemon.refused {reason: "locked", pid: <holder pid>}`, prints the
+  holder and exits 1 within about a second. A refused start is not recorded in
+  `state/daemon-runs.json`.
+- Any failed start (lock refused, `EADDRINUSE`, bad config) releases the lock
+  and exits 1 before schedules and polls start.
+- If the heartbeat finds the lock owned by another daemon (one that took over
+  a lock gone stale, e.g. while this process was suspended), this daemon ledgers
+  `pollinate.daemon.refused {reason: "lock_lost", pid: <new holder>}`, stops,
+  and exits 1.
+- A clean stop removes the lock.
+
 ## Webhooks
 
 - Local endpoint: `POST /hook/<path>` on `127.0.0.1:3978` (configurable via
@@ -535,7 +589,12 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 - `pollinate.hook.{created,delivered,expired,gc_removed}`
 - `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,already_bound,unbound,open_filtered,activity_errored,gc}`
 - `pollinate.router.plugin.created` · `pollinate.github.webhook.installed`
-- `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored,crash_loop}`
+- `pollinate.schedule.missed` carries `policy`, `scheduled_at` (first missed
+  occurrence), `missed_count`, `detected: "tick" | "startup"` and, past 10,000,
+  `missed_count_capped` (see Schedules and missed fires)
+- `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored,crash_loop,refused}`;
+  `refused` carries `reason: "locked" | "lock_lost"` and the lock holder's `pid`
+  (see One daemon per store)
 - `pollinate.jobs.{gc,store_warning}` · `pollinate.ledger.rotated` (job/ledger retention, see Job retention)
 - `pollinate.emit` (from `emit` actions)
 

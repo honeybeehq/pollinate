@@ -1,8 +1,10 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { ActionExecutor } from "../src/actions.js";
 import { parseTriggerToml, triggerToToml } from "../src/config.js";
 import { DeliveryManager } from "../src/delivery.js";
-import { nextCronFireAfter, nextFireAfter, ScheduleEngine } from "../src/schedule.js";
+import { dueOccurrences, nextCronFireAfter, nextFireAfter, ScheduleEngine } from "../src/schedule.js";
+import type { PollinateStore } from "../src/store.js";
+import type { MissedFirePolicy, ScheduleTiming, Trigger } from "../src/types.js";
 import { trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
 
 type CronCase = {
@@ -344,6 +346,171 @@ message = "{{activity_markdown}}"
       } finally {
         await schedule.stop();
         await delivery.shutdown();
+      }
+    });
+  });
+});
+
+async function startSchedule(store: PollinateStore, triggers: Trigger[]): Promise<{ stop(): Promise<void> }> {
+  for (const trig of triggers) await store.saveTrigger(trig);
+  const delivery = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 }));
+  await delivery.init(triggers);
+  const schedule = new ScheduleEngine(store, delivery, triggers, 10);
+  await schedule.start();
+  return {
+    async stop() {
+      await schedule.stop();
+      await delivery.shutdown();
+    },
+  };
+}
+
+async function ledgerEvents(store: PollinateStore, event: string): Promise<Array<Record<string, unknown>>> {
+  return (await store.readLedger()).map((line) => JSON.parse(line) as Record<string, unknown>).filter((entry) => entry.event === event);
+}
+
+async function waitForLedgerCount(store: PollinateStore, event: string, count: number): Promise<Array<Record<string, unknown>>> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const entries = await ledgerEvents(store, event);
+    if (entries.length >= count) return entries;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${count} ${event} ledger entries`);
+}
+
+function cronTrigger(id: string, missedFirePolicy: MissedFirePolicy): Trigger {
+  return trigger({ id, source: { kind: "schedule", timing: { type: "cron", expression: "* * * * *", timezone: "UTC", missedFirePolicy } } });
+}
+
+function scheduledPayloads(jobs: Array<{ batch: unknown[]; queuedAt: string }>): unknown[] {
+  return [...jobs].sort((a, b) => a.queuedAt.localeCompare(b.queuedAt)).map((job) => job.batch[0]);
+}
+
+describe("missed fires", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("counts due occurrences for every, cron and once timings", () => {
+    const now = new Date("2026-11-25T07:43:58.000Z");
+    const cron: ScheduleTiming = { type: "cron", expression: "* * * * *" };
+    expect(dueOccurrences(cron, new Date("2026-11-25T07:41:00.000Z"), now)).toEqual({ count: 3, latest: new Date("2026-11-25T07:43:00.000Z"), capped: false });
+    expect(dueOccurrences({ type: "every", interval: "1h" }, new Date("2026-11-25T04:50:00.000Z"), now)).toEqual({
+      count: 3,
+      latest: new Date("2026-11-25T06:50:00.000Z"),
+      capped: false,
+    });
+    expect(dueOccurrences({ type: "once", at: "2026-11-25T07:00:00.000Z" }, new Date("2026-11-25T07:00:00.000Z"), now).count).toBe(1);
+    const capped = dueOccurrences(cron, new Date("2026-08-01T00:00:00.000Z"), now);
+    expect(capped).toEqual({ count: 10_000, latest: new Date("2026-11-25T07:43:00.000Z"), capped: true });
+  });
+
+  test("a suspended cron under fire-once delivers one catch-up fire, then the on-time fire", async () => {
+    await withTempStore(async (store) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-11-25T07:40:38.000Z"));
+      const engine = await startSchedule(store, [cronTrigger("cron-once", "fire-once")]);
+      try {
+        vi.setSystemTime(new Date("2026-11-25T07:43:58.000Z"));
+        await waitForTerminalJobs(store, 1);
+        expect(await ledgerEvents(store, "pollinate.schedule.missed")).toEqual([
+          expect.objectContaining({ trigger_id: "cron-once", policy: "fire-once", scheduled_at: "2026-11-25T07:41:00.000Z", missed_count: 3, detected: "tick" }),
+        ]);
+        expect((await store.readScheduleState())["cron-once"]?.nextFireAt).toBe("2026-11-25T07:44:00.000Z");
+        vi.setSystemTime(new Date("2026-11-25T07:44:00.250Z"));
+        const jobs = await waitForTerminalJobs(store, 2);
+        expect(scheduledPayloads(jobs)).toEqual([
+          { scheduled_at: "2026-11-25T07:43:00.000Z", missed: 3, late_ms: 58_000 },
+          { scheduled_at: "2026-11-25T07:44:00.000Z", missed: 0, late_ms: 250 },
+        ]);
+        expect(await ledgerEvents(store, "pollinate.schedule.fired")).toHaveLength(2);
+        expect(await ledgerEvents(store, "pollinate.schedule.missed")).toHaveLength(1);
+      } finally {
+        await engine.stop();
+      }
+    });
+  });
+
+  test("a suspended cron under skip fires nothing for the missed minutes", async () => {
+    await withTempStore(async (store) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-11-25T07:40:38.000Z"));
+      const engine = await startSchedule(store, [cronTrigger("cron-skip", "skip")]);
+      try {
+        vi.setSystemTime(new Date("2026-11-25T07:43:58.000Z"));
+        const [missed] = await waitForLedgerCount(store, "pollinate.schedule.missed", 1);
+        expect(missed).toMatchObject({ trigger_id: "cron-skip", policy: "skip", missed_count: 3, detected: "tick" });
+        expect(await store.listJobs()).toHaveLength(0);
+        expect((await store.readScheduleState())["cron-skip"]?.nextFireAt).toBe("2026-11-25T07:44:00.000Z");
+        vi.setSystemTime(new Date("2026-11-25T07:44:00.100Z"));
+        const jobs = await waitForTerminalJobs(store, 1);
+        expect(scheduledPayloads(jobs)).toEqual([{ scheduled_at: "2026-11-25T07:44:00.000Z", missed: 0, late_ms: 100 }]);
+      } finally {
+        await engine.stop();
+      }
+    });
+  });
+
+  test("a suspended cron under fire-all fires every missed minute from the tick", async () => {
+    await withTempStore(async (store) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-11-25T07:40:38.000Z"));
+      const engine = await startSchedule(store, [cronTrigger("cron-all", "fire-all")]);
+      try {
+        vi.setSystemTime(new Date("2026-11-25T07:43:58.000Z"));
+        const jobs = await waitForTerminalJobs(store, 3);
+        expect(scheduledPayloads(jobs).map((payload) => (payload as { scheduled_at: string }).scheduled_at).sort()).toEqual([
+          "2026-11-25T07:41:00.000Z",
+          "2026-11-25T07:42:00.000Z",
+          "2026-11-25T07:43:00.000Z",
+        ]);
+        expect(scheduledPayloads(jobs).every((payload) => (payload as { missed: number }).missed === 1)).toBe(true);
+        expect((await store.readScheduleState())["cron-all"]?.nextFireAt).toBe("2026-11-25T07:44:00.000Z");
+      } finally {
+        await engine.stop();
+      }
+    });
+  });
+
+  test("a restarted daemon catches up an overdue cron once and ledgers it as startup", async () => {
+    await withTempStore(async (store) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-11-25T07:43:58.000Z"));
+      await store.writeScheduleState({ "cron-restart": { nextFireAt: "2026-11-25T07:41:00.000Z", lastFireAt: "2026-11-25T07:40:00.000Z" } });
+      const engine = await startSchedule(store, [cronTrigger("cron-restart", "fire-once")]);
+      try {
+        const jobs = await waitForTerminalJobs(store, 1);
+        expect(scheduledPayloads(jobs)).toEqual([{ scheduled_at: "2026-11-25T07:43:00.000Z", missed: 3, late_ms: 58_000 }]);
+        expect(await ledgerEvents(store, "pollinate.schedule.missed")).toEqual([expect.objectContaining({ missed_count: 3, detected: "startup" })]);
+      } finally {
+        await engine.stop();
+      }
+    });
+  });
+
+  test.each([
+    { name: "fire-once beyond the grace restarts the interval from now", policy: "fire-once" as const, lateMs: 10 * 60_000, nextFromNow: true },
+    { name: "skip beyond the grace restarts the interval from now", policy: "skip" as const, lateMs: 10 * 60_000, nextFromNow: true },
+    { name: "fire-once within the grace keeps the cadence", policy: "fire-once" as const, lateMs: 30_000, nextFromNow: false },
+    { name: "fire-all keeps the cadence", policy: "fire-all" as const, lateMs: 10 * 60_000, nextFromNow: false },
+  ])("a late every fire: $name", async ({ policy, lateMs, nextFromNow }) => {
+    await withTempStore(async (store) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const start = new Date("2026-11-25T07:00:00.000Z");
+      const due = new Date(start.getTime() + 60_000);
+      vi.setSystemTime(start);
+      await store.writeScheduleState({ late: { nextFireAt: due.toISOString() } });
+      const engine = await startSchedule(store, [trigger({ id: "late", source: { kind: "schedule", timing: { type: "every", interval: "1h", missedFirePolicy: policy } } })]);
+      try {
+        const now = new Date(due.getTime() + lateMs);
+        vi.setSystemTime(now);
+        const jobs = await waitForTerminalJobs(store, 1);
+        expect(scheduledPayloads(jobs)).toEqual([{ scheduled_at: due.toISOString(), missed: 0, late_ms: lateMs }]);
+        const expectedNext = new Date((nextFromNow ? now : due).getTime() + 60 * 60_000).toISOString();
+        expect((await store.readScheduleState()).late?.nextFireAt).toBe(expectedNext);
+        expect(await ledgerEvents(store, "pollinate.schedule.missed")).toHaveLength(0);
+      } finally {
+        await engine.stop();
       }
     });
   });

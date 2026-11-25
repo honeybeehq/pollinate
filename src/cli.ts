@@ -676,7 +676,7 @@ async function cmdDaemon(args: ParsedArgs): Promise<void> {
   const sub = requiredArg(args.rest[0], "Usage: pollinate daemon <install|uninstall|start|stop|restart|status|logs|run>");
   if (sub === "run") {
     if (!args.flags.foreground) throw new Error("Usage: pollinate daemon run --foreground");
-    await runForeground();
+    await runForeground(exitWithError).catch(exitWithError);
     return;
   }
   if (sub === "install") {
@@ -1975,7 +1975,7 @@ async function printHelp(): Promise<void> {
   console.log(out.join("\n"));
 }
 
-main().catch((error: unknown) => {
+function reportError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   if (process.argv.includes("--json")) {
     console.error(JSON.stringify({ error: message }));
@@ -1984,5 +1984,15 @@ main().catch((error: unknown) => {
     console.error(usage ? c.dim(message) : say.fail(message));
     if (!usage) console.error(say.hint(`run ${c.bold("pol help")} for available commands`));
   }
+}
+
+function exitWithError(error: unknown): void {
+  reportError(error);
+  process.exitCode = 1;
+  process.stderr.write("", () => process.exit(1));
+}
+
+main().catch((error: unknown) => {
+  reportError(error);
   process.exitCode = 1;
 });

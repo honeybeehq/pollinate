@@ -51,6 +51,7 @@ node scripts/install-runtime.mjs latest && pol daemon restart
   state/cursors.json
   state/job-id-index.json
   state/job-id-index.lock
+  state/daemon.lock
   state/trigger-locks/<id>.lock
   state/job-locks/<jobId>.lock
   state/router-bindings/<trigger>/<subject>.json
@@ -94,6 +95,9 @@ Run the daemon in the foreground:
 ```sh
 pollinate daemon run --foreground
 ```
+
+One store runs one daemon: a second `daemon run` on the same store exits 1 and
+ledgers `pollinate.daemon.refused` (see `AGENTS.md` → "One daemon per store").
 
 The daemon reloads trigger files automatically while running. Adding, editing,
 enabling, disabling, or removing a trigger through the CLI is picked up without a
