@@ -4,7 +4,7 @@ import type { Activation, CursorState, ExecutionProfile, JsonValue, PollSpec, Tr
 import { DeliveryManager, deliveryIdFor } from "./delivery.js";
 import type { HealthRecorder } from "./health.js";
 import { PollinateStore } from "./store.js";
-import { execShell } from "./process.js";
+import { execShell, stderrTail } from "./process.js";
 import { selectJsonPathArray } from "./jsonpath.js";
 import { nowIso, parseDuration, stableStringify } from "./time.js";
 
@@ -230,7 +230,7 @@ export async function fetchPoll(spec: PollSpec, cwd?: string, execution?: Execut
     const timeoutMs = parseDuration(spec.interval);
     const result = await execShell(spec.fetch.command, { cwd: spec.fetch.cwd ?? cwd, execution, timeoutMs });
     if (result.timedOut) throw new Error(`poll command timed out after ${timeoutMs}ms`);
-    if (result.exitCode !== 0) throw new Error(`poll command exited ${result.exitCode}: ${result.stderr.trim()}`);
+    if (result.exitCode !== 0) throw new Error(`poll command exited ${result.exitCode}: ${stderrTail(result)}`);
     return result.stdout;
   }
   const timeoutMs = parseDuration(spec.interval);

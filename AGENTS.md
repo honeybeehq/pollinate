@@ -708,6 +708,12 @@ pass and the daemon reloaded every second.
   written, the result carries `stdoutDroppedBytes` / `stderrDroppedBytes`
   (bytes dropped from the front). A command printing 500 MB completes with the
   daemon under 200 MB RSS.
+- A failing child's error text (`job.error`, `attempts[].error`, the
+  `pollinate.job.errored` / `pollinate.poll.errored` ledger lines, context and
+  hive errors) quotes only the last 2 KB of stderr, prefixed
+  `[<n> earlier bytes cut]` when longer. A failed `command` action's job keeps
+  `result` with `exitCode`, `stdout`, `stderr` (the 1 MB tails) and the
+  dropped counts.
 - `http` actions: the job's `result.body` holds the first 64 KB of the
   response; when the body is longer the rest is not read and the result
   carries `bodyTruncated: true` and `bodyKeptBytes: 65536`. The error of a

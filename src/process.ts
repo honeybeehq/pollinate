@@ -12,6 +12,7 @@ export type ExecResult = {
 };
 
 export const CHILD_OUTPUT_TAIL_BYTES = 1024 * 1024;
+export const ERROR_STDERR_TAIL_BYTES = 2 * 1024;
 
 export type ExecOptions = { cwd?: string; timeoutMs?: number; input?: string; execution?: ExecutionProfile };
 
@@ -105,6 +106,14 @@ class OutputTail {
     const excess = Math.max(0, kept.length - this.limit);
     return { text: kept.subarray(excess).toString("utf8"), droppedBytes: this.droppedBytes + excess };
   }
+}
+
+export function stderrTail(result: ExecResult, limit = ERROR_STDERR_TAIL_BYTES): string {
+  const text = Buffer.from(result.stderr.trim(), "utf8");
+  const start = Math.max(0, text.length - limit);
+  const cut = start + (result.stderrDroppedBytes ?? 0);
+  const tail = text.subarray(start).toString("utf8");
+  return cut > 0 ? `[${cut} earlier bytes cut] ${tail}` : tail;
 }
 
 export function shellQuote(value: string): string {

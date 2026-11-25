@@ -3,7 +3,7 @@ import type { Action, Activation, DaemonConfig, DryRunResult, ExecutionProfile, 
 import type { PollinateStore } from "./store.js";
 import { resolveContext } from "./context.js";
 import { renderAction, renderString } from "./templates.js";
-import { execShell, type ExecResult } from "./process.js";
+import { execShell, stderrTail, type ExecResult } from "./process.js";
 import {
   DEFAULT_HIVE_BIN,
   DEFAULT_HIVE_STARTING_WAIT_MS,
@@ -49,10 +49,16 @@ export class ActionFailure extends Error {
     readonly codes: string[],
     readonly retryAfterMs?: number,
     readonly hiveError?: HiveErrorDetail,
+    readonly output?: ExecResult,
   ) {
     super(message);
     this.name = "ActionFailure";
   }
+}
+
+function failureResultOf(error: ActionFailure): Record<string, unknown> | undefined {
+  if (!error.output && !error.hiveError) return undefined;
+  return { ...error.output, ...(error.hiveError ? { hiveError: error.hiveError } : {}) };
 }
 
 export function retryPolicyFor(trigger: Trigger): RetryPolicy | undefined {
@@ -257,7 +263,7 @@ export class ActionExecutor {
     const message = error instanceof Error ? error.message : String(error);
     const policy = retryPolicyFor(trigger);
     const codes = error instanceof ActionFailure ? error.codes : [];
-    const failureResult = error instanceof ActionFailure && error.hiveError ? { hiveError: error.hiveError } : undefined;
+    const failureResult = error instanceof ActionFailure ? failureResultOf(error) : undefined;
     const retryOn = policy ? (policy.on ?? defaultRetryOn(job.action ?? trigger.action)) : [];
     const retryable = Boolean(policy) && (failure.forceRetryable === true || retryOn.some((code) => codes.includes(code)));
     const current = await this.store.getJob(job.id);
@@ -399,7 +405,7 @@ export class ActionExecutor {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
       const result = await execShell(action.command, { cwd: action.cwd ?? cwd, timeoutMs, execution: this.options.execution });
       if (result.timedOut) return { ...result, timedOut: true };
-      if (result.exitCode !== 0) throw new ActionFailure(`command exited ${result.exitCode}: ${result.stderr.trim()}`, ["exit", `exit:${result.exitCode}`]);
+      if (result.exitCode !== 0) throw new ActionFailure(`command exited ${result.exitCode}: ${stderrTail(result)}`, ["exit", `exit:${result.exitCode}`], undefined, undefined, { ...result });
       return { ...result };
     }
     if (action.kind === "http") {
@@ -559,7 +565,7 @@ export class ActionExecutor {
     if (result.exitCode === 0) return { ...result };
     const codes = hiveFailureCodes(result);
     const parsed = parseHiveJsonError(result.stdout);
-    if (!parsed) throw new ActionFailure(`${label} exited ${result.exitCode}: ${result.stderr.trim()}`, codes);
+    if (!parsed) throw new ActionFailure(`${label} exited ${result.exitCode}: ${stderrTail(result)}`, codes);
     const binary = parsed.code === "protocol_mismatch" ? (resolveHiveBin(this.options.hiveBin, this.options.execution) ?? this.options.hiveBin ?? DEFAULT_HIVE_BIN) : undefined;
     const hiveError: HiveErrorDetail = { ...parsed, ...(binary ? { binary } : {}) };
     const suffix = binary ? ` (hive binary: ${binary}; set [honeybee] bin in pollinate.toml to choose another)` : "";

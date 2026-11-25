@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { execShell } from "./process.js";
+import { execShell, stderrTail } from "./process.js";
 import { execHive } from "./hive-exec.js";
 import { selectJsonPath } from "./jsonpath.js";
 import { renderShellCommand, renderString, type Rendered } from "./templates.js";
@@ -101,7 +101,7 @@ function startSourceValue(
     return {
       promise: execShell(source.command, { cwd, execution, timeoutMs }).then((result) => {
         if (result.timedOut) throw new Error(`command timed out after ${timeoutMs}ms`);
-        if (result.exitCode !== 0) throw new Error(`command exited ${result.exitCode}: ${result.stderr.trim()}`);
+        if (result.exitCode !== 0) throw new Error(`command exited ${result.exitCode}: ${stderrTail(result)}`);
         return result.stdout.trimEnd();
       }),
     };
@@ -128,7 +128,7 @@ function startSourceValue(
       boundsItsOwnTime: true,
       promise: execHive(source.args, { label: `hive ${source.args[0] ?? ""}`.trim(), bin: hiveBin, cwd, execution, timeoutMs, startingWaitMs: hiveStartingWaitMs }).then((result) => {
         if (result.timedOut) throw new Error(`hive timed out after ${timeoutMs}ms`);
-        if (result.exitCode !== 0) throw new Error(`hive exited ${result.exitCode}: ${result.stderr.trim()}`);
+        if (result.exitCode !== 0) throw new Error(`hive exited ${result.exitCode}: ${stderrTail(result)}`);
         return result.stdout.trimEnd();
       }),
     };
