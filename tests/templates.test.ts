@@ -27,6 +27,24 @@ describe("renderString", () => {
   test("renders undefined values as empty strings", () => {
     expect(renderString("[{{maybe}}]", { maybe: undefined }).value).toBe("[]");
   });
+
+  test("{{json var}} renders a JSON literal that keeps a JSON body valid", () => {
+    const error = 'say "hi"\nC:\\path\ttab';
+    const rendered = renderString('{"error": {{json failure_error}}, "id": {{ json delivery_id }}, "n": {{json count}}, "e": {{json event}}}', {
+      failure_error: error,
+      delivery_id: "t:wh:1",
+      count: 3,
+      event: { a: [1] },
+    });
+    expect(JSON.parse(rendered.value)).toEqual({ error, id: "t:wh:1", n: 3, e: { a: [1] } });
+    expect(rendered.warnings).toEqual([]);
+  });
+
+  test("{{json var}} warns when unresolved, renders undefined as null and leaves {{json}} a plain var", () => {
+    expect(renderString("{{json missing}}", {})).toEqual({ value: "{{json missing}}", warnings: ["Unresolved template var: missing"] });
+    expect(renderString("{{json maybe}}", { maybe: undefined }).value).toBe("null");
+    expect(renderString("{{json}}", { json: "plain" }).value).toBe("plain");
+  });
 });
 
 describe("stringifyTemplateValue", () => {

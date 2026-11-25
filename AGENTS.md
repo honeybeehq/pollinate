@@ -372,6 +372,17 @@ export default {
 `{{var}}` placeholders render in action strings, keys, and `cwd`. Unresolved
 vars stay literal and surface as job warnings.
 
+`{{json var}}` renders the value JSON-encoded instead: a string becomes a JSON
+string literal with its quotes (`"say \"hi\"\n"`), a number or object its JSON,
+an undefined value `null`. Use it to put a value inside an http JSON body, e.g.
+`body = '{"error": {{json failure_error}}, "id": {{json delivery_id}}}'`: quotes,
+newlines and backslashes in the value no longer break the body. `{{var}}`
+renders as before (raw text). `{{event}}`, `{{batch}}` and `{{delivery_ids}}` are
+already JSON text, so put them in a body as `{{event}}`; `{{json event}}` gives a
+string holding that JSON. In a `command` action `{{json var}}` is JSON-encoded,
+then shell-quoted like any var. `json` is a prefix only when followed by a
+space and a var name; a var named `json` is still `{{json}}`.
+
 Plain (non-router) actions:
 
 | var | value |
@@ -396,7 +407,7 @@ plus:
 | `failure_error` | the error, cut at 2,000 characters |
 | `failed_job_id`, `delivery_id` | the failed job and its delivery id; empty when the failure has none (e.g. a poll fetch) |
 | `consecutive_failures`, `first_failed_at` | the streak length and when it began |
-| `event` | JSON object of the vars above; use it as an http `body` (templates are not JSON-escaped) |
+| `event` | JSON object of the vars above; use it as an http `body`, or `{{json failure_error}}` etc. in your own body |
 
 Router actions (onOpen / onActivity / onClose) get the canonical event payload
 plus:

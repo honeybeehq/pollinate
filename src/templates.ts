@@ -1,7 +1,7 @@
 import type { Action, JsonValue } from "./types.js";
 import { shellQuote } from "./process.js";
 
-const TEMPLATE_RE = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
+const TEMPLATE_RE = /\{\{\s*(?:(json)\s+)?([A-Za-z0-9_.-]+)\s*\}\}/g;
 
 export type Rendered<T> = {
   value: T;
@@ -14,26 +14,34 @@ export function stringifyTemplateValue(value: unknown): string {
   return JSON.stringify(value);
 }
 
+export function jsonTemplateValue(value: unknown): string {
+  return JSON.stringify(value === undefined ? null : value);
+}
+
+function renderTemplateValue(form: string | undefined, value: unknown): string {
+  return form === "json" ? jsonTemplateValue(value) : stringifyTemplateValue(value);
+}
+
 export function renderString(input: string, vars: Record<string, unknown>): Rendered<string> {
   const warnings: string[] = [];
-  const value = input.replace(TEMPLATE_RE, (literal, key: string) => {
+  const value = input.replace(TEMPLATE_RE, (literal, form: string | undefined, key: string) => {
     if (!Object.hasOwn(vars, key)) {
       warnings.push(`Unresolved template var: ${key}`);
       return literal;
     }
-    return stringifyTemplateValue(vars[key]);
+    return renderTemplateValue(form, vars[key]);
   });
   return { value, warnings };
 }
 
 export function renderShellCommand(input: string, vars: Record<string, unknown>): Rendered<string> {
   const warnings: string[] = [];
-  const value = input.replace(TEMPLATE_RE, (literal, key: string, offset: number) => {
+  const value = input.replace(TEMPLATE_RE, (literal, form: string | undefined, key: string, offset: number) => {
     if (!Object.hasOwn(vars, key)) {
       warnings.push(`Unresolved template var: ${key}`);
       return literal;
     }
-    return shellEscapeTemplateValue(stringifyTemplateValue(vars[key]), shellQuoteContextAt(input, offset));
+    return shellEscapeTemplateValue(renderTemplateValue(form, vars[key]), shellQuoteContextAt(input, offset));
   });
   return { value, warnings };
 }
