@@ -612,6 +612,9 @@ The daemon serves the v1 API (HTTP/1.1 + JSON, `node:http`) on
   it through the file path as before (the same as with no daemon).
 - `state/store.json` is `{"schema": 1}`, written when missing. A higher schema
   refuses the start: `store schema N in … is newer than this Pollinate supports`.
+- `tests/contract-apiary.test.ts` is Apiary's contract: exactly the calls and
+  fields Apiary's kernel uses. Do not loosen or delete it without Apiary's
+  agreement; a change that fails it breaks Apiary.
 
 ## Doctor
 

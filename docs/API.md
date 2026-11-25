@@ -13,6 +13,9 @@ directory) is trusted, the same as whoever can write the store.
 - `pol add`, `remove`, `enable`, `disable`, `trigger` and `job cancel` use this
   API when the daemon answers and fall back to files only when it cannot be
   reached or answers `503`/`501` (see Local API in AGENTS.md).
+- `tests/contract-apiary.test.ts` runs exactly the calls Apiary's kernel makes
+  and checks the fields it reads. It is Apiary's contract: do not loosen it
+  without Apiary's agreement.
 
 ```sh
 curl -s --unix-socket ~/.pollinate/pollinated.sock http://pollinate/v1/health
