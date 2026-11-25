@@ -42,6 +42,40 @@ everything here is otherwise only discoverable by reading the source.
   resolve to the real file). When the file is missing, `--json` reports
   `commit`, `dirty` and `builtAt` as `null` and the version from `package.json`.
 
+## Releases
+
+Every green push to `main` is published as GitHub release `runtime-<sha>`
+(title `Pollinate runtime <sha8>`, target the sha) by
+`.github/workflows/release.yml`. It runs after workflow `CI` succeeds for a
+push to `main`, or by hand: `gh workflow run release.yml -f sha=<40-hex sha>`
+(refused unless the sha is a full lowercase sha on `main`). Assets:
+
+- `pollinate-<sha>.tgz`: `pnpm pack` output; every entry under `package/`,
+  including `package/dist/cli.js` and `package/dist/build-info.json`. Apiary pins
+  this file by sha256 and stages it; keep the layout.
+- `pollinate-<sha>-standalone.tgz`: one directory `pollinate-<sha>/` with the
+  packed package plus production-only `node_modules` installed from
+  `pnpm-lock.yaml` (hoisted, no dev dependencies, no absolute symlinks), so
+  `node pollinate-<sha>/dist/cli.js` runs with only `node`.
+- `SHA256SUMS`: `shasum -a 256` of both tarballs; check with
+  `shasum -a 256 -c SHA256SUMS`.
+
+Releases are immutable by rule: if `runtime-<sha>` exists the job exits green
+without touching it, and nothing deletes, overwrites or re-uploads an asset. A
+draft `runtime-<sha>` (a failed upload) fails the job for a human to inspect.
+The release is marked latest only when the sha is the tip of `main`.
+
+Both paths run `scripts/release-runtime.sh [--out <dir>] [--publish] [<sha>]`
+(default sha: the tip of `origin/main`, default out
+`$TMPDIR/pollinate-runtime-<sha>`). It builds the sha from `git archive` with
+`POLLINATE_BUILD_COMMIT=<sha>`, packs, builds the standalone tree
+(`scripts/check-standalone.mjs` checks it), writes `SHA256SUMS`, and runs
+`scripts/smoke-runtime.mjs <standalone.tgz> <sha>`: unpack into a fresh temp
+dir, `--version --json` must report the sha, start `daemon run --foreground`
+on a temp store with a free webhook port, add a webhook trigger whose `command`
+action writes a marker, POST to it, wait for the job to complete and the
+marker, stop the daemon by pid. Without `--publish` it only builds locally.
+
 ## Store layout
 
 ```text

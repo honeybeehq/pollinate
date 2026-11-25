@@ -23,6 +23,11 @@ pollinate --version --json   # contents of dist/build-info.json
 commit it was built from (`POLLINATE_BUILD_COMMIT` overrides the commit for
 release builds). See `AGENTS.md` → "Build info".
 
+Every green commit on `main` is published as a GitHub release `runtime-<sha>`
+with `pollinate-<sha>.tgz`, a standalone `pollinate-<sha>-standalone.tgz`
+(production `node_modules` included; run `node pollinate-<sha>/dist/cli.js`) and
+`SHA256SUMS`. See `AGENTS.md` → "Releases".
+
 ## Store
 
 `POLLINATE_STORE_ROOT` controls the on-disk store. By default it is `~/.pollinate`:
