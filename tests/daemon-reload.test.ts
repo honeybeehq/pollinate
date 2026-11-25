@@ -10,12 +10,13 @@ async function waitForLedgerEvent(
   store: PollinateStore,
   event: string,
   timeoutMs = 2_000,
+  accept: (entry: Record<string, unknown>) => boolean = () => true,
 ): Promise<Record<string, unknown>> {
   const start = Date.now();
   for (;;) {
     const matches = (await store.readLedger())
       .map((line) => JSON.parse(line) as Record<string, unknown>)
-      .filter((entry: Record<string, unknown>) => entry.event === event);
+      .filter((entry: Record<string, unknown>) => entry.event === event && accept(entry));
     const match = matches[matches.length - 1];
     if (match) return match;
     if (Date.now() - start > timeoutMs) throw new Error(`Timed out waiting for ledger event ${event}`);
@@ -157,7 +158,7 @@ commandTimeout = "1s"
       await store.saveTrigger(
         trigger({
           id: "survives-reload-error",
-          source: { kind: "schedule", timing: { type: "once", at: new Date(Date.now() + 60).toISOString() } },
+          source: { kind: "schedule", timing: { type: "every", interval: "100ms" } },
           action: { kind: "emit", subject: "survives-reload-error", payload: "{{event}}" },
         }),
       );
@@ -170,8 +171,13 @@ commandTimeout = "1s"
         const error = await waitForLedgerEvent(store, "pollinate.daemon.reload_errored");
         expect(error.error).toEqual(expect.any(String));
 
-        const [job] = await waitForTerminalJobs(store, 1, 10_000);
-        expect(job.triggerId).toBe("survives-reload-error");
+        const completed = await waitForLedgerEvent(
+          store,
+          "pollinate.job.completed",
+          2_000,
+          (entry) => entry.trigger_id === "survives-reload-error" && String(entry.ts) > String(error.ts),
+        );
+        expect(completed.trigger_id).toBe("survives-reload-error");
       } finally {
         await daemon.stop();
         await daemon.stop();
