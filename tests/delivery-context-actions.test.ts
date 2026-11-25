@@ -131,11 +131,12 @@ describe("delivery manager", () => {
   });
 
   test("maxConcurrent queues and drains FIFO", async () => {
-    await withTempStore(async (store) => {
+    await withTempStore(async (store, root) => {
+      const gate = join(root, "gate");
       const trig = trigger({
         id: "fifo",
         delivery: { mode: { strategy: "immediate" }, maxConcurrent: 1 },
-        action: { kind: "command", command: "node -e \"setTimeout(()=>{},120)\"", timeout: "1s" },
+        action: { kind: "command", command: `while [ ! -f '${gate}' ]; do sleep 0.02; done`, timeout: "30s" },
       });
       const delivery = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 }));
       await delivery.init([trig]);
@@ -144,6 +145,7 @@ describe("delivery manager", () => {
       }
       await waitForJobs(store, 1, "running");
       await waitForJobs(store, 2, "queued");
+      await writeFile(gate, "");
       const completed = await waitForTerminalJobs(store, 3, 5_000);
       expect(completed.every((job) => job.status === "completed")).toBe(true);
       const startedOrder = (await store.listJobs())

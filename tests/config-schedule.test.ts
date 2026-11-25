@@ -247,6 +247,9 @@ message = "{{activity_markdown}}"
 
   test("every schedules fire repeatedly", async () => {
     await withTempStore(async (store) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const start = new Date("2026-11-25T08:00:00.000Z");
+      vi.setSystemTime(start);
       const trig = trigger({
         id: "every",
         source: { kind: "schedule", timing: { type: "every", interval: "40ms" } },
@@ -257,11 +260,19 @@ message = "{{activity_markdown}}"
       const schedule = new ScheduleEngine(store, delivery, [trig], 10);
       await schedule.start();
       try {
-        const jobs = await waitForTerminalJobs(store, 2, 1_000);
-        expect(jobs.filter((job) => job.triggerId === "every")).toHaveLength(2);
+        vi.setSystemTime(new Date("2026-11-25T08:00:00.040Z"));
+        await waitForTerminalJobs(store, 1);
+        vi.setSystemTime(new Date("2026-11-25T08:00:00.080Z"));
+        const jobs = await waitForTerminalJobs(store, 2);
+        expect(jobs.every((job) => job.triggerId === "every" && job.status === "completed")).toBe(true);
+        expect(scheduledPayloads(jobs)).toEqual([
+          { scheduled_at: "2026-11-25T08:00:00.040Z", missed: 0, late_ms: 0 },
+          { scheduled_at: "2026-11-25T08:00:00.080Z", missed: 0, late_ms: 0 },
+        ]);
       } finally {
         await schedule.stop();
         await delivery.shutdown();
+        vi.useRealTimers();
       }
     });
   });

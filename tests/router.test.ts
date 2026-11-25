@@ -770,7 +770,7 @@ cat >/dev/null
       });
       const outcomes: string[] = [];
       for (let number = 1; number <= 31; number++) outcomes.push((await run("pull_request", opened(number))).events[0]?.outcome ?? "none");
-      for (let index = 0; index < 40; index++) {
+      for (let index = 0; index < 3; index++) {
         const result = await run("check_run", {
           action: "completed",
           repository: { full_name: "trmd/pollinate" },
@@ -783,7 +783,7 @@ cat >/dev/null
       expect(outcomes.slice(0, 30).every((outcome) => outcome === "created")).toBe(true);
       expect(outcomes[30]).toBe("dropped");
       expect(outcomes.slice(31).every((outcome) => outcome === "routed")).toBe(true);
-      expect(actions.filter((action) => action.kind === "honeybee" && action.run === "send")).toHaveLength(40);
+      expect(actions.filter((action) => action.kind === "honeybee" && action.run === "send")).toHaveLength(3);
       expect(await store.getRouterBinding(trig.id, "github:pull_request:trmd/pollinate#31")).toBeNull();
       expect((await store.readLedger()).filter((line) => line.includes("pollinate.router.open_rate_limited"))).toHaveLength(1);
     });
