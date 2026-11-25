@@ -1,4 +1,4 @@
-import { closeBinding, createBinding, type RouterActionExecutor, type RouterDeps } from "./router.js";
+import { closeBinding, createBinding, type RouterActionExecutor, type RouterDeps, type RouterPhase } from "./router.js";
 import { getRouterPlugin } from "./router-plugins/index.js";
 import type { CanonicalRouterEvent, ExecutionProfile, RouterBinding, RouterConfig, Trigger } from "./types.js";
 import type { PollinateStore } from "./store.js";
@@ -102,7 +102,7 @@ async function gcBinding(
     health: options.health,
     executionFor: (_subjectKey, phase) => {
       const attempt = phase === "open" ? binding.openAttempts ?? 1 : phase === "close" ? (binding.closeAttempts ?? 0) + 1 : 1;
-      return { triggerId: trigger.id, deliveryId: `gc:${binding.id}:${phase}:${attempt}`, attempt };
+      return { triggerId: trigger.id, deliveryId: gcDeliveryId(binding, phase), attempt };
     },
   };
 
@@ -332,6 +332,11 @@ async function withFreshBinding(
     await fn(current);
     return true;
   });
+}
+
+function gcDeliveryId(binding: RouterBinding, phase: RouterPhase): string {
+  const inFlight = phase === "open" ? binding.openDeliveryId : phase === "close" && binding.status === "closing" ? binding.closeDeliveryId : undefined;
+  return inFlight ?? `gc:${binding.id}:${phase}:${binding.updatedAt}`;
 }
 
 function syntheticEvent(binding: RouterBinding, kind: string): CanonicalRouterEvent {

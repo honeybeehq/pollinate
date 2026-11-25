@@ -143,8 +143,9 @@ export async function createBinding(
   existing: RouterBinding | null,
 ): Promise<RouterEventResult> {
   const now = nowIso();
+  const execution = deps.executionFor?.(event.subjectKey, "open");
   const pending: RouterBinding = existing
-    ? { ...existing, status: "pending", target: undefined, error: undefined, updatedAt: now }
+    ? { ...existing, status: "pending", target: undefined, error: undefined, updatedAt: now, openDeliveryId: execution?.deliveryId }
     : {
         id: bindingId(deps.trigger.id, event.subjectKey),
         triggerId: deps.trigger.id,
@@ -153,6 +154,7 @@ export async function createBinding(
         status: "pending",
         createdAt: now,
         updatedAt: now,
+        openDeliveryId: execution?.deliveryId,
       };
   await deps.store.saveRouterBinding({ ...pending, status: "pending", updatedAt: now, lastEventKind: event.kind, context: event.payload });
   await deps.store.appendLedger({
@@ -164,7 +166,6 @@ export async function createBinding(
   });
 
   try {
-    const execution = deps.executionFor?.(event.subjectKey, "open");
     const rendered = renderRouterAction(router.onOpen, event, pending, execution);
     const result = await deps.executor.executeAction(rendered, deps.cwd, execution);
     const handles = result.handles && isStringRecord(result.handles) ? result.handles : undefined;
@@ -180,6 +181,7 @@ export async function createBinding(
       error: undefined,
       context: event.payload,
       openAttempts: undefined,
+      openDeliveryId: undefined,
     };
     await deps.store.saveRouterBinding(active);
     await deps.store.appendLedger({
@@ -264,9 +266,9 @@ export async function closeBinding(
   event: CanonicalRouterEvent,
   binding: RouterBinding,
 ): Promise<RouterEventResult> {
-  const closing: RouterBinding = { ...binding, status: "closing", updatedAt: nowIso(), lastEventKind: event.kind };
-  await deps.store.saveRouterBinding(closing);
   const execution = deps.executionFor?.(event.subjectKey, "close");
+  const closing: RouterBinding = { ...binding, status: "closing", updatedAt: nowIso(), lastEventKind: event.kind, closeDeliveryId: execution?.deliveryId };
+  await deps.store.saveRouterBinding(closing);
   const action = renderRouterAction(router.onClose ?? defaultCloseAction(), event, closing, execution);
   try {
     await deps.executor.executeAction(action, deps.cwd, execution);
@@ -276,7 +278,7 @@ export async function closeBinding(
     await deps.health?.recordFailure(deps.trigger.id, { kind: "router_close", error: message, deliveryId: execution?.deliveryId });
     throw error;
   }
-  const closed: RouterBinding = { ...closing, status: "closed", updatedAt: nowIso(), lastActivityAt: nowIso(), error: undefined, closeAttempts: undefined };
+  const closed: RouterBinding = { ...closing, status: "closed", updatedAt: nowIso(), lastActivityAt: nowIso(), error: undefined, closeAttempts: undefined, closeDeliveryId: undefined };
   await deps.store.saveRouterBinding(closed);
   await deps.store.appendLedger({
     event: "pollinate.router.binding_closed",

@@ -449,7 +449,7 @@ plus:
 | var | value |
 |---|---|
 | `event_kind`, `subject_key`, `binding_id` | routing metadata |
-| `delivery_id`, `attempt`, `job_id` | execution id: `<job delivery id>:<subject_key>:<open\|activity\|close>`; GC-driven runs use `gc:<binding id>:<open\|close>:<attempt>` (no `job_id`; for close, attempt is `closeAttempts + 1`) |
+| `delivery_id`, `attempt`, `job_id` | execution id: `<job delivery id>:<subject_key>:<open\|activity\|close>`; a GC retry of a failed or interrupted open or close reuses that attempt's delivery id (kept on the binding as `openDeliveryId` / `closeDeliveryId`), so hive's idempotency key dedupes a spawn or stop that succeeded but was reported failed; a close the GC starts (idleTtl, reconcile) uses `gc:<binding id>:close:<binding updatedAt>`. GC runs have no `job_id`; `attempt` is `openAttempts`, or `closeAttempts + 1` for close |
 | `binding.target` (and `target`) | bound hive handle |
 | `binding.targets.<stepId>` | per-step handles for sequence/swarm onOpen |
 

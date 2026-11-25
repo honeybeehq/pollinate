@@ -262,7 +262,9 @@ export type RouterBinding = {
   context?: JsonObject;
   /** Failed onOpen attempts since the binding last went active; bounds GC retries. */
   openAttempts?: number;
+  openDeliveryId?: string;
   closeAttempts?: number;
+  closeDeliveryId?: string;
   /** Last time the GC reconciled this binding against the live subject state. */
   checkedAt?: string;
 };
