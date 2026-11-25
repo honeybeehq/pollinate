@@ -64,6 +64,10 @@ export class PollinateClient {
     return this.call("POST", `/v1/triggers/${encodeURIComponent(id)}/fire`, request);
   }
 
+  getJob(id: string): Promise<JobResponse> {
+    return this.call("GET", `/v1/jobs/${encodeURIComponent(id)}`);
+  }
+
   cancelJob(id: string): Promise<JobResponse> {
     return this.call("POST", `/v1/jobs/${encodeURIComponent(id)}/cancel`, {});
   }

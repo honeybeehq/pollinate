@@ -599,13 +599,15 @@ The daemon serves the v1 API (HTTP/1.1 + JSON, `node:http`) on
   as they are: exit 1, and with `--json` stderr is
   `{"error": message, "code", "details"?}` (`code`/`details` are added to the
   usual `{"error"}`).
-- `pol trigger` through the daemon answers as soon as the job is queued (it no
-  longer waits for the job to finish; follow with `pol job <id>`). `{job: null}`
-  (a debounced, throttled or batched mode holding the activation, a filter
-  miss or a full queue) prints `held: true` with `delivery_mode`; a repeated
-  `--delivery-id` prints the usual `duplicate: true` answer with exit 0. Firing
-  a disabled trigger is `409 conflict` (reason `disabled`); the file path still
-  fires it in the CLI process.
+- `pol trigger` through the daemon fires with `POST …/fire`, then follows
+  `GET /v1/jobs/:id` until the job is terminal (or gone) and prints it with
+  today's output and exit code. If the daemon goes away while following, it
+  keeps reading the job file. `{job: null}` (a debounced, throttled or batched
+  mode holding the activation, a filter miss or a full queue) prints
+  `held: true` with `delivery_mode`, exit 0; a repeated `--delivery-id` prints
+  the usual `duplicate: true` answer, exit 0. Firing a disabled trigger answers
+  `409 conflict` with `reason: "disabled"` and acts on nothing, so the CLI fires
+  it through the file path as before (the same as with no daemon).
 - `state/store.json` is `{"schema": 1}`, written when missing. A higher schema
   refuses the start: `store schema N in … is newer than this Pollinate supports`.
 

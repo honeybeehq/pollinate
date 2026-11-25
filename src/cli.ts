@@ -60,6 +60,7 @@ type ParsedArgs = {
 
 const TERMINAL = new Set<JobStatus>(["completed", "errored", "timed-out", "cancelled"]);
 const DEFAULT_JOBS_LIST_LIMIT = 100;
+const FOLLOW_INTERVAL_MS = 200;
 
 async function main(argv = process.argv.slice(2)): Promise<void> {
   if (isVersionRequest(argv)) {
@@ -318,7 +319,7 @@ async function cmdTrigger(store: PollinateStore, args: ParsedArgs): Promise<void
     print(args, dryRun, renderDryRun(trigger, dryRun));
     return;
   }
-  const fired = await fireThroughDaemon(store, trigger, payload, deliveryId);
+  const fired = await runWithSpinner(args, `firing ${c.bold(trigger.id)}…`, () => fireAndFollow(store, trigger, payload, deliveryId));
   if (fired) {
     printFired(args, trigger, fired);
     return;
@@ -336,19 +337,48 @@ async function cmdTrigger(store: PollinateStore, args: ParsedArgs): Promise<void
 
 type DaemonFire = { job: Job | null } | { duplicate: string };
 
+async function fireAndFollow(store: PollinateStore, trigger: Trigger, payload: JsonValue, deliveryId: string | undefined): Promise<DaemonFire | undefined> {
+  const fired = await fireThroughDaemon(store, trigger, payload, deliveryId);
+  if (!fired || !("job" in fired) || !fired.job) return fired;
+  return { job: await followJob(store, fired.job) };
+}
+
 async function fireThroughDaemon(store: PollinateStore, trigger: Trigger, payload: JsonValue, deliveryId: string | undefined): Promise<DaemonFire | undefined> {
   try {
     return await throughDaemon(store, (client) => client.fireTrigger(trigger.id, { payload, ...(deliveryId ? { deliveryId } : {}) }));
   } catch (error) {
-    if (error instanceof ApiClientError && error.code === "conflict" && deliveryId && isDuplicateDetails(error.details)) {
-      return { duplicate: `${trigger.id}:${deliveryId}` };
-    }
+    if (!(error instanceof ApiClientError) || error.code !== "conflict") throw error;
+    const reason = conflictReason(error.details);
+    if (reason === "duplicate" && deliveryId) return { duplicate: `${trigger.id}:${deliveryId}` };
+    if (reason === "disabled") return undefined;
     throw error;
   }
 }
 
-function isDuplicateDetails(details: unknown): boolean {
-  return typeof details === "object" && details !== null && (details as { reason?: unknown }).reason === "duplicate";
+async function followJob(store: PollinateStore, queued: Job): Promise<Job> {
+  let current = queued;
+  for (;;) {
+    if (TERMINAL.has(current.status)) return current;
+    await sleep(FOLLOW_INTERVAL_MS);
+    const next = await readJobThroughDaemon(store, current.id);
+    if (!next) return current;
+    current = next;
+  }
+}
+
+async function readJobThroughDaemon(store: PollinateStore, id: string): Promise<Job | undefined> {
+  try {
+    const answer = await throughDaemon(store, (client) => client.getJob(id));
+    if (answer) return answer.job;
+  } catch (error) {
+    if (error instanceof ApiClientError && error.code === "not_found") return undefined;
+    if (!(error instanceof ApiClientError && error.code === "interrupted")) throw error;
+  }
+  return (await store.getJob(id)) ?? undefined;
+}
+
+function conflictReason(details: unknown): unknown {
+  return typeof details === "object" && details !== null ? (details as { reason?: unknown }).reason : undefined;
 }
 
 function printFired(args: ParsedArgs, trigger: Trigger, fired: DaemonFire): void {
@@ -357,7 +387,7 @@ function printFired(args: ParsedArgs, trigger: Trigger, fired: DaemonFire): void
     return;
   }
   if (fired.job) {
-    print(args, { ...fired.job, via: "daemon" }, `${renderJobOutcome(fired.job)}  ${c.dim(`${sym.mid} handed to the daemon; follow with pol job ${shortId(fired.job.id)}`)}`);
+    print(args, { ...fired.job, via: "daemon" }, renderJobOutcome(fired.job));
     return;
   }
   const mode = trigger.delivery.mode.strategy;

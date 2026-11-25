@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { PollinateDaemon } from "../src/daemon.js";
 import type { PollinateStore } from "../src/store.js";
-import type { Trigger } from "../src/types.js";
+import type { Job, Trigger } from "../src/types.js";
 import { trigger, withTempStore } from "./helpers.js";
 
 const execFileAsync = promisify(execFile);
@@ -141,13 +141,18 @@ describe("pol through the daemon socket", () => {
       expect(posted.status).toBe(202);
 
       expect((await pol(root, "add", await writeToml(root, "slow", SLOW_TOML))).json).toMatchObject({ id: "slow", via: "daemon" });
-      const first = await pol(root, "trigger", "slow");
-      const second = await pol(root, "trigger", "slow");
-      expect(first.json).toMatchObject({ triggerId: "slow", via: "daemon" });
-      expect(second.json).toMatchObject({ triggerId: "slow", status: "queued", via: "daemon" });
+      const first = pol(root, "trigger", "slow");
+      const second = pol(root, "trigger", "slow");
+      await waitForJob(store, "slow", "running");
+      const queued = await waitForJob(store, "slow", "queued");
 
-      const cancelled = await pol(root, "job", "cancel", second.json.id);
-      expect(cancelled.json).toMatchObject({ id: second.json.id, status: "cancelled", via: "daemon" });
+      const cancelled = await pol(root, "job", "cancel", queued.id);
+      expect(cancelled.json).toMatchObject({ id: queued.id, status: "cancelled", via: "daemon" });
+      const outcomes = [(await first).json, (await second).json].sort((a, b) => a.status.localeCompare(b.status));
+      expect(outcomes).toMatchObject([
+        { id: queued.id, status: "cancelled", via: "daemon" },
+        { triggerId: "slow", status: "completed", via: "daemon" },
+      ]);
 
       expect((await pol(root, "disable", "inbox")).json).toMatchObject({ id: "inbox", enabled: false, via: "daemon" });
       expect((await fetch(added.json.webhook.localUrl, { method: "POST", body: "{}" })).status).toBe(404);
@@ -177,7 +182,7 @@ describe("pol through the daemon socket", () => {
     );
   });
 
-  test("API errors are reported with exit 1 and the CLI error shape, and nothing falls back to files", async () => {
+  test("API errors are reported with exit 1 and the CLI error shape; a disabled trigger fires through files as today", async () => {
     await withDaemon(async ({ store, root }) => {
       const refused = await pol(root, "add", await writeToml(root, "broken", BROKEN_POLL_TOML));
       expect(refused.code).toBe(1);
@@ -191,9 +196,8 @@ describe("pol through the daemon socket", () => {
       await pol(root, "add", await writeToml(root, "slow", SLOW_TOML));
       await pol(root, "disable", "slow");
       const disabled = await pol(root, "trigger", "slow");
-      expect(disabled.code).toBe(1);
-      expect(disabled.json).toMatchObject({ code: "conflict", details: { reason: "disabled" } });
-      expect(await store.listJobs({ triggerId: "slow" })).toHaveLength(0);
+      expect(disabled.json).toMatchObject({ triggerId: "slow", status: "completed", via: "files" });
+      expect(await store.listJobs({ triggerId: "slow" })).toHaveLength(1);
     });
   });
 });
@@ -276,3 +280,13 @@ describe("pol with no daemon", () => {
     });
   });
 });
+
+async function waitForJob(store: PollinateStore, triggerId: string, status: Job["status"]): Promise<Job> {
+  const start = Date.now();
+  for (;;) {
+    const [job] = await store.listJobs({ triggerId, status });
+    if (job) return job;
+    if (Date.now() - start > 5_000) throw new Error(`no ${status} job for ${triggerId}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
