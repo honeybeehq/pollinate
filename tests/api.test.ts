@@ -42,9 +42,12 @@ function call(socketPath: string, method: string, path: string, body?: unknown):
   });
 }
 
-async function withDaemon<T>(fn: (ctx: { store: PollinateStore; root: string; socket: string; daemon: PollinateDaemon }) => Promise<T>): Promise<T> {
+async function withDaemon<T>(
+  fn: (ctx: { store: PollinateStore; root: string; socket: string; daemon: PollinateDaemon }) => Promise<T>,
+  config = DAEMON_CONFIG,
+): Promise<T> {
   return withTempStore(async (store, root) => {
-    await writeFile(join(root, "pollinate.toml"), DAEMON_CONFIG);
+    await writeFile(join(root, "pollinate.toml"), config);
     const daemon = new PollinateDaemon(store);
     await daemon.start();
     try {
@@ -83,6 +86,20 @@ async function leaveStaleSocket(path: string): Promise<void> {
   await new Promise<void>((resolve) => child.stdout.once("data", () => resolve()));
   child.kill("SIGKILL");
   await new Promise((resolve) => child.once("exit", resolve));
+}
+
+function slowDeliveryInit(daemon: PollinateDaemon, delayMs: () => number): { nextInit(): Promise<void> } {
+  const delivery = (daemon as unknown as { delivery: { init(triggers: unknown[]): Promise<void> } }).delivery;
+  const init = delivery.init.bind(delivery);
+  let waiters: Array<() => void> = [];
+  delivery.init = async (triggers) => {
+    const entered = waiters;
+    waiters = [];
+    for (const wake of entered) wake();
+    await new Promise((resolve) => setTimeout(resolve, delayMs()));
+    await init(triggers);
+  };
+  return { nextInit: () => new Promise<void>((resolve) => waiters.push(resolve)) };
 }
 
 async function ledger(root: string): Promise<Array<Record<string, unknown>>> {
@@ -256,6 +273,67 @@ describe("local API v1", () => {
         await rm(dir, { recursive: true, force: true });
       }
     });
+  });
+
+  test("concurrent PUTs all reach every engine and stay there after reload ticks", async () => {
+    await withDaemon(
+      async ({ socket, daemon }) => {
+        slowDeliveryInit(daemon, () => Math.random() * 80);
+        const ids = Array.from({ length: 10 }, (_, index) => `t${index}`);
+        const puts = await Promise.all(
+          ids.map((id, index) =>
+            index % 2 === 0
+              ? call(socket, "PUT", `/v1/triggers/${id}`, { toml: webhookToml(id, `p-${id}`) })
+              : call(socket, "PUT", `/v1/triggers/${id}`, { trigger: { id, source: { kind: "schedule", timing: { type: "every", interval: "1h" } }, action: { kind: "emit", subject: id } } }),
+          ),
+        );
+        expect(puts.map((put) => put.status)).toEqual(ids.map(() => 200));
+        const verify = async () => {
+          for (const [index, id] of ids.entries()) {
+            if (index % 2 === 0) {
+              const posted = await fetch(puts[index]!.body.webhook.localUrl, { method: "POST", body: "{}" });
+              expect(posted.status, id).toBe(202);
+            } else {
+              const got = await call(socket, "GET", `/v1/triggers/${id}`);
+              expect(Date.parse(got.body.trigger.state.nextFireAt), id).toBeGreaterThan(Date.now());
+            }
+          }
+          expect((await call(socket, "GET", "/v1/health")).body.triggers.total).toBe(10);
+        };
+        await verify();
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await verify();
+      },
+      DAEMON_CONFIG.replace("triggerReloadMs = 60000", "triggerReloadMs = 20"),
+    );
+  });
+
+  test("a PUT while a file reload is in flight leaves both triggers live", async () => {
+    await withDaemon(
+      async ({ socket, store, root, daemon }) => {
+        const slow = slowDeliveryInit(daemon, () => 150);
+        for (let round = 0; round < 3; round += 1) {
+          const reloading = slow.nextInit();
+          await writeFile(join(root, "triggers", `cli${round}.toml`), webhookToml(`cli${round}`, `cli-${round}`));
+          await reloading;
+          const put = await call(socket, "PUT", `/v1/triggers/api${round}`, { toml: webhookToml(`api${round}`, `api-${round}`) });
+          expect(put.status).toBe(200);
+          const port = put.body.webhook.localUrl.split(":")[2].split("/")[0];
+          const postBoth = async (when: string) => {
+            for (const path of [`cli-${round}`, `api-${round}`]) {
+              const posted = await fetch(`http://127.0.0.1:${port}/hook/${path}`, { method: "POST", body: "{}" });
+              expect(posted.status, `${when} round ${round} ${path}`).toBe(202);
+            }
+          };
+          await postBoth("right after the PUT");
+          await new Promise((resolve) => setTimeout(resolve, 600));
+          await postBoth("after reload ticks");
+        }
+        expect((await store.loadTriggers()).length).toBe(6);
+        expect((await call(socket, "GET", "/v1/triggers")).body.triggers).toHaveLength(6);
+      },
+      DAEMON_CONFIG.replace("triggerReloadMs = 60000", "triggerReloadMs = 200"),
+    );
   });
 
   test("requests during shutdown answer 503 stopping", async () => {

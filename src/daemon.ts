@@ -71,8 +71,8 @@ export class PollinateDaemon {
   private stopping = false;
   private daemonConfigSignature = "";
   private api?: ApiServer;
-  private applyGeneration = 0;
-  private appliesInFlight = 0;
+  private triggerQueue: Promise<unknown> = Promise.resolve();
+  private reloadQueued = false;
   private startedAt = nowIso();
   private reloadedAt = this.startedAt;
   private hiveStatus?: { path: string; version: string | null } | null;
@@ -267,9 +267,31 @@ export class PollinateDaemon {
     this.store.onJobAllocated = undefined;
   }
 
+  private serially<T>(step: () => Promise<T>): Promise<T> {
+    const run = this.triggerQueue.then(step, step);
+    this.triggerQueue = run.catch(() => undefined);
+    return run;
+  }
+
   private async reloadTriggers(): Promise<void> {
+    if (this.reloadQueued) return;
+    this.reloadQueued = true;
+    await this.serially(async () => {
+      this.reloadQueued = false;
+      await this.reloadTriggersNow();
+    });
+  }
+
+  private async pushTriggersToEngines(): Promise<void> {
+    if (!this.delivery || !this.schedule || !this.poll || !this.webhook) return;
+    this.webhook.updateTriggers(this.triggers);
+    await this.delivery.init(this.triggers);
+    await this.schedule.applyNow(this.triggers);
+    this.poll.updateTriggers(this.triggers);
+  }
+
+  private async reloadTriggersNow(): Promise<void> {
     if (this.stopping || !this.delivery || !this.schedule || !this.poll || !this.webhook) return;
-    const generation = this.applyGeneration;
     try {
       const config = await this.store.daemonConfig();
       const configSignature = signatureForConfig(config);
@@ -279,7 +301,6 @@ export class PollinateDaemon {
       }
       await gcTemporaryHooks(this.store, { hasLiveJobs: (triggerId) => this.delivery?.hasLiveJobs(triggerId) ?? false });
       const { triggers, invalid } = await this.store.loadTriggerFiles();
-      if (this.appliesInFlight > 0 || generation !== this.applyGeneration) return;
       const signature = signatureForTriggers(triggers);
       if (signature === this.triggerSignature) {
         await this.health?.syncTriggerFiles(triggers, invalid);
@@ -289,10 +310,7 @@ export class PollinateDaemon {
       this.setTriggers(triggers);
       this.reloadedAt = nowIso();
       await this.health?.syncTriggerFiles(triggers, invalid);
-      await this.delivery.init(triggers);
-      this.schedule.updateTriggers(triggers);
-      this.poll.updateTriggers(triggers);
-      this.webhook.updateTriggers(triggers);
+      await this.pushTriggersToEngines();
       await this.store.appendLedger({ event: "pollinate.daemon.triggers_reloaded", trigger_count: triggers.length });
       await this.log(`triggers reloaded: ${triggers.length} active definitions`);
     } catch (error) {
@@ -338,30 +356,24 @@ export class PollinateDaemon {
   }
 
   private async applyTrigger<T extends Trigger | null>(id: string, write: () => Promise<T>, fetchedPoll?: string): Promise<{ stored: T; poll?: PollCheck }> {
-    const { delivery, schedule, poll, webhook } = this;
-    if (this.stopping || !delivery || !schedule || !poll || !webhook) throw new ApiError("stopping", "the daemon is stopping");
-    this.appliesInFlight += 1;
-    this.applyGeneration += 1;
-    try {
+    const applied = await this.serially(async () => {
+      const { poll } = this;
+      if (this.stopping || !this.delivery || !this.schedule || !poll || !this.webhook) throw new ApiError("stopping", "the daemon is stopping");
       const stored = await write();
-      this.applyGeneration += 1;
       const triggers = this.triggers.filter((trigger) => trigger.id !== id);
       if (stored) triggers.push(stored);
       triggers.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
       this.setTriggers(triggers);
       this.triggerSignature = signatureForTriggers(triggers);
       this.reloadedAt = nowIso();
-      webhook.updateTriggers(triggers);
-      await delivery.init(triggers);
-      await schedule.applyNow(triggers);
-      if (stored && fetchedPoll !== undefined && stored.enabled && stored.source.kind === "poll") {
-        return { stored, poll: await poll.adoptChecked(triggers, stored, fetchedPoll) };
-      }
-      poll.updateTriggers(triggers);
-      return { stored };
-    } finally {
-      this.appliesInFlight -= 1;
-    }
+      const checksPoll = stored !== null && fetchedPoll !== undefined && stored.enabled && stored.source.kind === "poll";
+      const check = checksPoll ? poll.adoptChecked(this.triggers, stored, fetchedPoll) : undefined;
+      check?.catch(() => undefined);
+      await this.pushTriggersToEngines();
+      return { stored, check };
+    });
+    if (!applied.check) return { stored: applied.stored };
+    return { stored: applied.stored, poll: await applied.check };
   }
 
   private async fireTrigger(trigger: Trigger, payload: JsonValue, deliveryId?: string): Promise<{ job: Job | null; duplicate: boolean }> {

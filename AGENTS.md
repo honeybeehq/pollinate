@@ -567,9 +567,10 @@ The daemon serves the v1 API (HTTP/1.1 + JSON, `node:http`) on
 - API writes (`PUT`, `PATCH`, `DELETE`) go through the same store functions as
   the CLI (`putTrigger`, `setTriggerEnabled`, `removeTrigger`), then hand the
   trigger straight to delivery, schedules, polls and webhooks before
-  answering. A file reload that read the disk before an API write finished is
-  discarded, so it cannot undo the write. CLI writes still arrive through the
-  1 s file reload.
+  answering. API writes and the file reload run one at a time through a single
+  queue, and each pushes the daemon's current trigger list to every engine, so
+  neither can leave an engine on an older list. A PUT that arrives during a
+  file reload waits for it. CLI writes still arrive through the 1 s file reload.
 - `PUT` of an enabled poll runs the first check inside the call: a failure is
   `422 poll_failed` and nothing is stored; otherwise the fetched result goes
   through the normal check (baseline or dispatch), and the next check follows
