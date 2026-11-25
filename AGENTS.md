@@ -981,7 +981,7 @@ socket streams the ledger as `application/x-ndjson` (`src/events.ts`).
   than the current one, or an offset past the file's end): the first line is
   `{"gap": true, "cursor"}` naming the oldest available position, and the
   stream continues from there. A cursor that does not parse, or does not sit at
-  a line end, answers 400 `invalid_cursor`.
+  a line end, answers 400 `invalid_request`.
 - Without `follow`: sends what exists, then a final heartbeat with the end
   cursor (only when `after` was given), and closes. With `follow`: keeps the
   connection open; a heartbeat every 15 s (`POLLINATE_EVENTS_HEARTBEAT_MS`

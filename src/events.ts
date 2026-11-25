@@ -23,7 +23,7 @@ export type EventsQuery = {
 
 export class EventsRequestError extends Error {
   constructor(
-    readonly code: "invalid_cursor" | "invalid_request",
+    readonly code: "invalid_request",
     message: string,
   ) {
     super(message);
@@ -36,7 +36,7 @@ export function formatCursor(position: LedgerPosition): string {
 
 export function parseCursor(value: string): LedgerPosition {
   const match = /^(\d{1,15})-(\d{1,15})$/.exec(value);
-  if (!match) throw new EventsRequestError("invalid_cursor", `Malformed cursor ${JSON.stringify(value)}; expected <generation>-<offset>`);
+  if (!match) throw new EventsRequestError("invalid_request", `Malformed cursor ${JSON.stringify(value)}; expected <generation>-<offset>`);
   return { generation: Number(match[1]), offset: Number(match[2]) };
 }
 
@@ -320,7 +320,7 @@ async function resolveCursor(root: string, cursor: LedgerPosition): Promise<{ po
     if (cursor.offset > 0) {
       const byte = Buffer.alloc(1);
       await handle.read(byte, 0, 1, cursor.offset - 1);
-      if (byte[0] !== 0x0a) throw new EventsRequestError("invalid_cursor", `Cursor ${formatCursor(cursor)} does not point at the end of a ledger line`);
+      if (byte[0] !== 0x0a) throw new EventsRequestError("invalid_request", `Cursor ${formatCursor(cursor)} does not point at the end of a ledger line`);
     }
     return { position: cursor, gap: false };
   } finally {

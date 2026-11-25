@@ -72,7 +72,7 @@ describe("events cursor", () => {
     await withTempStore(async (store, root) => {
       for (const bad of ["abc", "1-", "-5", "1-2-3", "1.5-3"]) expect(() => query(`after=${bad}`)).toThrow(EventsRequestError);
       await store.appendLedger({ event: "pollinate.test.one" });
-      await expect(collect(root, "after=1-3")).rejects.toMatchObject({ code: "invalid_cursor" });
+      await expect(collect(root, "after=1-3")).rejects.toMatchObject({ code: "invalid_request" });
     });
   });
 
