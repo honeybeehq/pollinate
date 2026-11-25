@@ -1,10 +1,14 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
+import { promisify } from "node:util";
 import { PollinateStore } from "../src/store.js";
 import type { Job, JobStatus, Trigger } from "../src/types.js";
 
 const pathStubRefs = new Map<string, number>();
+const execFileAsync = promisify(execFile);
 
 export async function withTempStore<T>(fn: (store: PollinateStore, root: string) => Promise<T>): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), "pollinate-test-"));
@@ -94,8 +98,7 @@ export async function installHiveStub(root: string, options: { script?: string }
 export async function installCommandStub(root: string, name: string, script: string, logPath = join(root, `${name}.log`)): Promise<CommandStub> {
   const binDir = join(root, "bin");
   await mkdir(binDir, { recursive: true });
-  await writeFile(join(binDir, name), stripNoopStdinDrain(script));
-  await chmod(join(binDir, name), 0o700);
+  await writePrewarmedExecutable(join(binDir, name), stripNoopStdinDrain(script));
   const refs = pathStubRefs.get(binDir) ?? 0;
   if (refs === 0 && !pathParts(process.env.PATH).includes(binDir)) process.env.PATH = [binDir, ...pathParts(process.env.PATH)].join(delimiter);
   pathStubRefs.set(binDir, refs + 1);
@@ -120,6 +123,15 @@ export async function installCommandStub(root: string, name: string, script: str
       else delete process.env.PATH;
     },
   };
+}
+
+async function writePrewarmedExecutable(path: string, script: string): Promise<void> {
+  const staging = `${path}.${randomUUID()}.staging`;
+  await writeFile(staging, "#!/bin/sh\n");
+  await chmod(staging, 0o700);
+  await execFileAsync(staging);
+  await writeFile(staging, script);
+  await rename(staging, path);
 }
 
 function pathParts(value: string | undefined): string[] {
