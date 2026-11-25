@@ -96,6 +96,7 @@ export function isValidStoreId(id: string): boolean {
 export class PollinateStore {
   readonly root: string;
   private ledgerCache?: LedgerCache;
+  private ledgerRead: Promise<unknown> = Promise.resolve();
   private readonly warnedInvalidTriggers = new Map<string, string>();
   onJobAllocated?: (triggerId: string) => void;
 
@@ -709,7 +710,12 @@ export class PollinateStore {
   async readLedger(lines?: number): Promise<string[]> {
     const path = ledgerPath(this.root);
     if (lines !== undefined) return readLedgerTail(path, lines);
+    const read = this.ledgerRead.then(() => this.readLedgerThroughCache(path));
+    this.ledgerRead = read.catch(() => undefined);
+    return read;
+  }
 
+  private async readLedgerThroughCache(path: string): Promise<string[]> {
     const info = await stat(path).catch((error) => {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
@@ -720,13 +726,15 @@ export class PollinateStore {
     }
 
     if (!this.ledgerCache || this.ledgerCache.path !== path || info.size < this.ledgerCache.size) {
-      const text = await readTextOrNull(path);
-      if (!text) {
-        this.ledgerCache = { path, size: info.size, lines: [], partial: "" };
+      const text = await readFileRange(path, 0, info.size).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (text === undefined) {
+        this.ledgerCache = undefined;
         return [];
       }
-      const parsed = splitLedgerText(text);
-      this.ledgerCache = { path, size: info.size, ...parsed };
+      this.ledgerCache = { path, size: info.size, ...splitLedgerText(text) };
       return ledgerLinesWithPartial(this.ledgerCache);
     }
 
