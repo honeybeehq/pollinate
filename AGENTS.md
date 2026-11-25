@@ -129,6 +129,8 @@ symlinks, then
   state/delivery-state.json       throttle/batch/debounce queues, in-flight jobs, admissions (see Retry)
   state/deliveries-seen.json      stable delivery ids already fired (dedup; see Delivery identity)
   state/cursors.json              poll cursors
+  state/trigger-health.json       per-trigger failure streaks and onFailure notifications (see Failure reporting)
+  state/trigger-health.lock       lock for trigger-health.json
   state/job-id-index.json         UUIDs used for visible job ID suffixes
   state/job-id-index.lock         lock for the job ID index
   state/jobs-store.json           last retention sweep: job file count, bytes, largest triggers, warnings
@@ -167,7 +169,8 @@ symlinks, then
 Answering "why didn't my trigger fire?": check `pol ledger -n 200` for
 `delivery.filtered`, `router.open_filtered`, `webhook.rejected`,
 `webhook.duplicate`, `delivery.duplicate`, `router.unbound`, or `delivery.throttled` events, then
-`pol daemon logs` for daemon lifecycle and binding-GC lines.
+`pol daemon logs` for daemon lifecycle and binding-GC lines. "Is it failing?":
+`state/trigger-health.json` and `pollinate.trigger.failed` (see Failure reporting).
 
 ## Trigger TOML schema
 
@@ -233,6 +236,13 @@ backoff = "2s"               # first delay, doubling per attempt, ±20% jitter
 maxBackoff = "5m"
 maxElapsed = "1h"            # no attempt starts later than this after the first
 on = ["transport", "timeout", "status:408", "status:429", "status:5xx"]   # default depends on the action kind
+
+[trigger.onFailure]          # optional; see Failure reporting (also on_failure)
+after = 1                    # consecutive failures before notifying
+cooldown = "1h"              # at most one notification per cooldown while still failing
+disabled = false             # true: never notify, not even through [defaults.onFailure]
+[trigger.onFailure.action]   # any action kind; rendered with the failure vars
+kind = "http"
 
 [trigger.context]            # extra template vars resolved before the action
 [[trigger.context.sources]]
@@ -356,6 +366,19 @@ Plain (non-router) actions:
 | `event` | JSON of the (transformed) payload |
 | `batch`, `batch_count` | JSON array of batched payloads / count |
 | `<context vars>` | from `[trigger.context]` static + sources |
+
+`[trigger.onFailure.action]` (and `[defaults.onFailure.action]`) renders with
+the plain vars (`job_id`, `attempt` and `event` belong to the notification job)
+plus:
+
+| var | value |
+|---|---|
+| `trigger_id`, `trigger_name` | the failing trigger (the name is the id for an invalid file) |
+| `failure_kind` | `job`, `poll`, `router_open`, `router_close`, `schedule` or `invalid` |
+| `failure_error` | the error, cut at 2,000 characters |
+| `failed_job_id`, `delivery_id` | the failed job and its delivery id; empty when the failure has none (e.g. a poll fetch) |
+| `consecutive_failures`, `first_failed_at` | the streak length and when it began |
+| `event` | JSON object of the vars above; use it as an http `body` (templates are not JSON-escaped) |
 
 Router actions (onOpen / onActivity / onClose) get the canonical event payload
 plus:
@@ -499,6 +522,14 @@ hiveStartingWait = "15m"     # how long a hive call keeps retrying while Honeybe
 tickMs = 1000
 triggerReloadMs = 1000
 bindingGcMs = 60000          # router binding GC sweep interval
+[defaults.onFailure]         # for triggers without their own (see Failure reporting)
+after = 1
+cooldown = "1h"
+[defaults.onFailure.action]
+kind = "honeybee"
+run = "send"
+target = "owner"
+message = "[trigger {{trigger_id}}] {{failure_kind}} failed {{consecutive_failures}}x: {{failure_error}}"
 
 [execution]                  # shell profile for command actions / polls
 shell = "/bin/sh"
@@ -643,6 +674,57 @@ without `[trigger.action]`) ignore it.
   `pollinate.job.errored` carries `attempts` and `gave_up` (true when the
   failure was retryable but attempts or `maxElapsed` ran out).
 
+## Failure reporting
+
+The daemon keeps `state/trigger-health.json`, keyed by trigger id:
+`consecutiveFailures`, `firstFailedAt`, `lastFailureAt`, `lastFailureKind`,
+`lastError` (2,000 characters at most), `lastSuccessAt` (written at most once a
+minute while healthy) and `notifiedAt`.
+
+A failure is one of:
+
+| kind | when |
+|---|---|
+| `job` | a job ends `errored` or `timed-out` after its retries (a `retrying` job is not a failure yet), including one marked errored at startup ("daemon restarted mid-execution"). Router triggers' own jobs are not counted; their failures are the next two |
+| `poll` | a poll check fails (fetch error, non-2xx, timeout, bad JSON for a jsonpath cursor) |
+| `router_open` | the binding GC abandons an errored binding (`open-retries-exhausted` or `no-open-context`) |
+| `router_close` | an `onClose` action fails, from a close event or the GC |
+| `schedule` | the scheduler ledgers `pollinate.schedule.errored` for the trigger |
+| `invalid` | the trigger file no longer loads (once per distinct error) |
+
+Each failure adds one to the streak and ledgers `pollinate.trigger.failed
+{trigger_id, kind, error, job_id?, delivery_id?, consecutive}`. A success ends
+the streak and ledgers `pollinate.trigger.recovered {trigger_id, kind,
+consecutive, first_failed_at}` (`kind` is the last failure's): a completed job
+ends any streak except a `poll` or `invalid` one, a successful poll check ends
+a `poll` streak, and a file that loads again ends an `invalid` streak.
+
+`[trigger.onFailure]` (keys also `on_failure`), and `[defaults.onFailure]` in
+`pollinate.toml` for the keys a trigger leaves out, decide whether to notify.
+Without an action from either, or with `disabled = true`, nothing is sent; a
+trigger without either behaves as before. An invalid file has no trigger
+config, so only the default applies to it.
+
+- A notification goes out when `consecutiveFailures >= after` (default 1) and
+  none went out during this streak in the last `cooldown` (default `1h`). A new
+  streak after a recovery notifies again without waiting for the cooldown.
+- It is its own job, `source = "failure"`, under the failing trigger's id. It
+  tries three times over about 30 s (W3's retry: backoff 10 s then 20 s; it
+  retries the action kind's default classes plus `exit` and `timeout`), with
+  delivery id `<trigger_id>:failure:<notifiedAt>`. It never counts as a
+  failure or success of the trigger and never triggers `onFailure` itself.
+- If it cannot be delivered: `pollinate.trigger.on_failure_errored {trigger_id,
+  job_id, error, attempts}`. A daemon restart in the middle marks it errored
+  and ledgers the same event; it is not resumed.
+
+Poll backoff: after three failed checks in a row the next check waits twice the
+interval, doubling per further failure up to 2^16 times the interval; the first
+successful check returns to the interval. `pollinate.poll.errored` carries
+`consecutive_errors` and `next_check_in_ms`.
+
+Health entries follow the trigger like the other state files (see Lifecycle,
+baseline and state cleanup: removal and the startup prune).
+
 ## Delivery identity
 
 Every activation, and so every job (`Job.deliveryId`), has a delivery id
@@ -677,9 +759,11 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 - `pollinate.state.pruned` (per-trigger state removed with its trigger or at startup)
 - `pollinate.trigger.invalid` (a trigger file that fails to load, e.g. one
   using a removed action kind; once per file change, keyed on path, mtime and size)
+- `pollinate.trigger.{failed,recovered,on_failure_errored}` (see Failure reporting)
 - `pollinate.job.{queued,started,completed,errored,cancelled,hive_starting,retry_scheduled,resumed}`
 - `pollinate.delivery.{filtered,throttled,duplicate,dropped}`
-- `pollinate.schedule.{fired,missed,errored}` · `pollinate.poll.{checked,detected,errored,baselined}`
+- `pollinate.schedule.{fired,missed,errored}` · `pollinate.poll.{checked,detected,errored,baselined}`;
+  `poll.errored` carries `consecutive_errors` and `next_check_in_ms`
 - `pollinate.webhook.{received,rejected,duplicate}`
 - `pollinate.hook.{created,delivered,expired,gc_removed}`
 - `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,already_bound,unbound,open_filtered,activity_errored,gc}`
@@ -699,3 +783,5 @@ Jobs use Honeybee-style IDs `<TRIGGER-PREFIX>.<uuid-prefix>` (e.g. `HE.a3f`).
 `pol job <ref>` accepts the visible id, the suffix, or a longer UUID prefix.
 Terminal statuses: `completed`, `errored`, `timed-out`, `cancelled`.
 Non-terminal: `queued`, `resolving-context`, `running`, `retrying`.
+`Job.source` is the trigger's source kind, `manual`, or `failure` for an
+onFailure notification.

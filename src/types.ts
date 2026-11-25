@@ -2,7 +2,7 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
-export type SourceKind = "schedule" | "poll" | "webhook" | "manual";
+export type SourceKind = "schedule" | "poll" | "webhook" | "manual" | "failure";
 
 export type ScheduleTiming =
   | { type: "cron"; expression: string; timezone?: string; missedFirePolicy?: MissedFirePolicy }
@@ -63,6 +63,27 @@ export type RetryPolicy = {
   maxElapsed: string;
   on?: string[];
 };
+
+export type OnFailurePolicy = {
+  after?: number;
+  cooldown?: string;
+  disabled?: boolean;
+  action?: Action;
+};
+
+export type FailureKind = "job" | "poll" | "router_open" | "router_close" | "schedule" | "invalid";
+
+export type TriggerHealthEntry = {
+  consecutiveFailures: number;
+  firstFailedAt?: string;
+  lastFailureAt?: string;
+  lastFailureKind?: FailureKind;
+  lastError?: string;
+  lastSuccessAt?: string;
+  notifiedAt?: string;
+};
+
+export type TriggerHealth = Record<string, TriggerHealthEntry>;
 
 export type HoneybeeAction =
   | {
@@ -133,6 +154,7 @@ export type Trigger = {
   filter?: Filter;
   delivery: Delivery;
   retry?: RetryPolicy;
+  onFailure?: OnFailurePolicy;
   context?: ContextResolver;
   lifecycle?: TriggerLifecycle;
   router?: RouterConfig;
@@ -309,6 +331,7 @@ export type DaemonConfig = {
     tickMs: number;
     triggerReloadMs: number;
     bindingGcMs: number;
+    onFailure?: OnFailurePolicy;
   };
   execution: ExecutionProfile;
   retention: RetentionConfig;

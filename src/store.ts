@@ -18,7 +18,7 @@ import {
   writeJson,
 } from "./fsx.js";
 import { idFromPath, parseDaemonConfigToml, parseTriggerToml, triggerToToml } from "./config.js";
-import type { CursorState, DaemonConfig, DeliveriesSeen, DeliveryState, Job, JobStatus, LedgerEvent, RouterBinding, ScheduleState, Trigger } from "./types.js";
+import type { CursorState, DaemonConfig, DeliveriesSeen, DeliveryState, Job, JobStatus, LedgerEvent, RouterBinding, ScheduleState, Trigger, TriggerHealth, TriggerHealthEntry } from "./types.js";
 import { nowIso } from "./time.js";
 import { allocateJobIdentity, jobUuidsOf, matchesJobReference, readJobIdIndexSnapshot, reconcileJobIdIndex, type JobIdentity } from "./job-ids.js";
 import { insertNewestFirst, jobFileNames, orderJobForWrite, readJobSummary, scanJobSummaries, type JobSummary } from "./job-scan.js";
@@ -77,6 +77,10 @@ type LedgerCache = {
 };
 
 type InvalidTriggerFile = { path: string; signature: string; message: string };
+
+export type InvalidTrigger = { id: string; path: string; error: string };
+
+export type LoadedTriggerFiles = { triggers: Trigger[]; invalid: InvalidTrigger[] };
 
 export class PollinateStore {
   readonly root: string;
@@ -140,6 +144,14 @@ export class PollinateStore {
     return join(stateDir(this.root), "cursors.json");
   }
 
+  triggerHealthPath(): string {
+    return join(stateDir(this.root), "trigger-health.json");
+  }
+
+  triggerHealthLockPath(): string {
+    return join(stateDir(this.root), "trigger-health.lock");
+  }
+
   async daemonConfig(): Promise<DaemonConfig> {
     return parseDaemonConfigToml(await readTextOrNull(daemonConfigPath(this.root)));
   }
@@ -184,6 +196,10 @@ export class PollinateStore {
   }
 
   async loadTriggers(): Promise<Trigger[]> {
+    return (await this.loadTriggerFiles()).triggers;
+  }
+
+  async loadTriggerFiles(): Promise<LoadedTriggerFiles> {
     await this.ensure();
     const entries = await readdir(triggerDir(this.root)).catch(() => []);
     const triggers: Trigger[] = [];
@@ -211,7 +227,7 @@ export class PollinateStore {
       }
     }
     await this.reportInvalidTriggerFiles(invalid);
-    return triggers;
+    return { triggers, invalid: invalid.map((file) => ({ id: idFromPath(file.path), path: file.path, error: file.message })) };
   }
 
   private async reportInvalidTriggerFiles(invalid: InvalidTriggerFile[]): Promise<void> {
@@ -283,6 +299,12 @@ export class PollinateStore {
     return this.pruneTriggerState({ keepOnly: await this.triggerIdsOnDisk() }, { reason: "startup" });
   }
 
+  private triggerStateLockPath(file: TriggerStateFile): string | undefined {
+    if (file === "deliveries-seen.json") return this.deliveriesSeenLockPath();
+    if (file === "trigger-health.json") return this.triggerHealthLockPath();
+    return undefined;
+  }
+
   async pruneTriggerState(selector: TriggerStatePruneSelector, ledgerFields: Record<string, unknown> = {}): Promise<TriggerStatePruneResult> {
     await this.ensure();
     const result: TriggerStatePruneResult = { entries: 0, files: {} };
@@ -300,7 +322,8 @@ export class PollinateStore {
         await writeJson(path, state);
         result.entries += dropped.length;
       };
-      if (file === "deliveries-seen.json") await withFileLock(this.deliveriesSeenLockPath(), prune);
+      const lock = this.triggerStateLockPath(file);
+      if (lock) await withFileLock(lock, prune);
       else await prune();
     }
     if (result.entries > 0) await this.appendLedger({ event: "pollinate.state.pruned", ...ledgerFields, entries: result.entries, files: result.files });
@@ -357,6 +380,20 @@ export class PollinateStore {
       if (!seen[triggerId]) return;
       delete seen[triggerId];
       await writeJson(this.deliveriesSeenPath(), pruneDeliveriesSeen(seen, Date.now()));
+    });
+  }
+
+  async readTriggerHealth(): Promise<TriggerHealth> {
+    return readJsonOr<TriggerHealth>(this.triggerHealthPath(), {});
+  }
+
+  async updateTriggerHealth(triggerId: string, update: (current: TriggerHealthEntry | undefined) => TriggerHealthEntry): Promise<TriggerHealth> {
+    await this.ensure();
+    return withFileLock(this.triggerHealthLockPath(), async () => {
+      const health = await this.readTriggerHealth();
+      health[triggerId] = update(health[triggerId]);
+      await writeJson(this.triggerHealthPath(), health, { sync: false });
+      return health;
     });
   }
 

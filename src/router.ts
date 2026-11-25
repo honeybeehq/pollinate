@@ -4,6 +4,7 @@ import { matchesFilter } from "./filter.js";
 import { getRouterPlugin } from "./router-plugins/index.js";
 import type { Activation, Action, CanonicalRouterEvent, JsonValue, RouterBinding, RouterConfig, Trigger } from "./types.js";
 import type { PollinateStore } from "./store.js";
+import type { HealthRecorder } from "./health.js";
 import { nowIso } from "./time.js";
 
 export type RouterActionExecutor = {
@@ -18,6 +19,7 @@ export type RouterDeps = {
   trigger: Trigger;
   cwd?: string;
   executionFor?: (subjectKey: string, phase: RouterPhase) => ActionExecutionContext;
+  health?: HealthRecorder;
 };
 
 export type ExecuteRouterOptions = RouterDeps & {
@@ -235,7 +237,13 @@ export async function closeBinding(
   await deps.store.saveRouterBinding(closing);
   const execution = deps.executionFor?.(event.subjectKey, "close");
   const action = renderRouterAction(router.onClose ?? defaultCloseAction(), event, closing, execution);
-  await deps.executor.executeAction(action, deps.cwd, execution);
+  try {
+    await deps.executor.executeAction(action, deps.cwd, execution);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await deps.health?.recordFailure(deps.trigger.id, { kind: "router_close", error: message, deliveryId: execution?.deliveryId });
+    throw error;
+  }
   const closed = { ...closing, status: "closed" as const, updatedAt: nowIso(), lastActivityAt: nowIso() };
   await deps.store.saveRouterBinding(closed);
   await deps.store.appendLedger({

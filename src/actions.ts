@@ -8,6 +8,7 @@ import { DEFAULT_HIVE_STARTING_WAIT_MS, execHive, withHiveStartingObserver, type
 import { nowIso, parseDuration } from "./time.js";
 import { executeRouter } from "./router.js";
 import { activationDeliveryIds, admitDelivery, deliveryIdFor, withDeliveryId } from "./delivery.js";
+import type { HealthRecorder } from "./health.js";
 
 export type ActionExecutorOptions = {
   contextTimeoutMs: number;
@@ -72,6 +73,8 @@ type AttemptFailure = {
 };
 
 export class ActionExecutor {
+  health?: HealthRecorder;
+
   constructor(
     private readonly store: PollinateStore,
     private readonly options: ActionExecutorOptions,
@@ -315,6 +318,7 @@ export class ActionExecutor {
         activation,
         cwd: running.cwd,
         execution,
+        health: this.health,
       });
       const completed = await this.store.updateJob(job.id, { status: "completed", result, completedAt: nowIso() });
       await this.store.appendLedger({

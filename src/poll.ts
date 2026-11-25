@@ -2,15 +2,25 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { Activation, CursorState, ExecutionProfile, JsonValue, PollSpec, Trigger } from "./types.js";
 import { DeliveryManager, deliveryIdFor } from "./delivery.js";
+import type { HealthRecorder } from "./health.js";
 import { PollinateStore } from "./store.js";
 import { execShell } from "./process.js";
 import { selectJsonPathArray } from "./jsonpath.js";
 import { nowIso, parseDuration, stableStringify } from "./time.js";
 
+export const POLL_BACKOFF_AFTER_ERRORS = 2;
+export const POLL_BACKOFF_MAX_DOUBLINGS = 16;
+
+export function pollDelayMs(intervalMs: number, consecutiveErrors: number): number {
+  const doublings = Math.min(Math.max(0, consecutiveErrors - POLL_BACKOFF_AFTER_ERRORS), POLL_BACKOFF_MAX_DOUBLINGS);
+  return intervalMs * 2 ** doublings;
+}
+
 export class PollEngine {
   private cursors: CursorState = {};
   private timers = new Map<string, NodeJS.Timeout>();
   private polling = new Map<string, Promise<number>>();
+  private errors = new Map<string, number>();
   private cursorWrite: Promise<void> = Promise.resolve();
   private running = false;
 
@@ -19,6 +29,7 @@ export class PollEngine {
     private readonly delivery: DeliveryManager,
     private triggers: Trigger[],
     private readonly execution?: ExecutionProfile,
+    private readonly health?: HealthRecorder,
   ) {}
 
   async start(): Promise<void> {
@@ -105,16 +116,26 @@ export class PollEngine {
       this.timers.delete(trigger.id);
       try {
         const latest = this.pollTriggers().find((item) => item.id === trigger.id);
-        if (latest) await this.pollNow(latest);
+        if (latest) {
+          await this.pollNow(latest);
+          this.errors.delete(latest.id);
+          await this.health?.recordSuccess(latest.id, "poll");
+        }
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const consecutive = (this.errors.get(trigger.id) ?? 0) + 1;
+        this.errors.set(trigger.id, consecutive);
         await this.store.appendLedger({
           event: "pollinate.poll.errored",
           trigger_id: trigger.id,
-          error: error instanceof Error ? error.message : String(error),
+          error: message,
+          consecutive_errors: consecutive,
+          next_check_in_ms: this.nextDelayMs(trigger),
         });
+        await this.health?.recordFailure(trigger.id, { kind: "poll", error: message });
       } finally {
         const latest = this.pollTriggers().find((item) => item.id === trigger.id);
-        if (latest && latest.source.kind === "poll") this.schedule(latest, parseDuration(latest.source.poll.interval));
+        if (latest && latest.source.kind === "poll") this.schedule(latest, this.nextDelayMs(latest));
       }
     }, delayMs);
     this.timers.set(trigger.id, timer);
@@ -127,11 +148,17 @@ export class PollEngine {
       if (!active.has(triggerId)) {
         clearTimeout(timer);
         this.timers.delete(triggerId);
+        this.errors.delete(triggerId);
       }
     }
     for (const trigger of active.values()) {
       if (!this.timers.has(trigger.id) && !this.polling.has(trigger.id)) this.schedule(trigger, 0);
     }
+  }
+
+  private nextDelayMs(trigger: Trigger): number {
+    if (trigger.source.kind !== "poll") return 0;
+    return pollDelayMs(parseDuration(trigger.source.poll.interval), this.errors.get(trigger.id) ?? 0);
   }
 
   private async writeCursors(): Promise<void> {

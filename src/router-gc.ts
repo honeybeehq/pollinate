@@ -2,6 +2,7 @@ import { closeBinding, createBinding, type RouterActionExecutor, type RouterDeps
 import { getRouterPlugin } from "./router-plugins/index.js";
 import type { CanonicalRouterEvent, ExecutionProfile, RouterBinding, RouterConfig, Trigger } from "./types.js";
 import type { PollinateStore } from "./store.js";
+import type { HealthRecorder } from "./health.js";
 import { nowIso, parseDuration } from "./time.js";
 
 export type RouterGcOptions = {
@@ -9,6 +10,7 @@ export type RouterGcOptions = {
   executor: RouterActionExecutor;
   triggers: Trigger[];
   execution?: ExecutionProfile;
+  health?: HealthRecorder;
   /** Errored bindings are retried this many times before being abandoned. */
   maxOpenRetries?: number;
   /** Pending bindings older than this are assumed interrupted and marked errored. */
@@ -86,6 +88,7 @@ async function gcBinding(
     executor: options.executor,
     trigger,
     cwd: trigger.cwd,
+    health: options.health,
     executionFor: (_subjectKey, phase) => {
       const attempt = phase === "open" ? binding.openAttempts ?? 1 : 1;
       return { triggerId: trigger.id, deliveryId: `gc:${binding.id}:${phase}:${attempt}`, attempt };
@@ -154,6 +157,10 @@ async function gcBinding(
           subject_key: binding.subjectKey,
           reason: binding.context ? "open-retries-exhausted" : "no-open-context",
           error: binding.error,
+        });
+        await options.health?.recordFailure(trigger.id, {
+          kind: "router_open",
+          error: binding.error ?? (binding.context ? "open retries exhausted" : "no open context"),
         });
         result.abandoned.push(binding.id);
       }

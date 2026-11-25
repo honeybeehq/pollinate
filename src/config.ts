@@ -10,6 +10,7 @@ import type {
   DeliveryMode,
   Filter,
   ExecutionProfile,
+  OnFailurePolicy,
   PollCursor,
   PollFetch,
   PollSpec,
@@ -68,6 +69,7 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
   const defaults = asOptionalRecord(doc.defaults) ?? {};
   const execution = asOptionalRecord(doc.execution) ?? {};
   const retention = asOptionalRecord(doc.retention) ?? {};
+  const onFailure = normalizeOnFailure(asOptionalRecord(defaults.onFailure ?? defaults.on_failure), "defaults.onFailure");
   return {
     webhook: {
       bind: stringOr(webhook.bind, DEFAULT_DAEMON_CONFIG.webhook.bind),
@@ -82,6 +84,7 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
       tickMs: numberOr(defaults.tickMs ?? defaults.tick_ms, DEFAULT_DAEMON_CONFIG.defaults.tickMs),
       triggerReloadMs: numberOr(defaults.triggerReloadMs ?? defaults.trigger_reload_ms, DEFAULT_DAEMON_CONFIG.defaults.triggerReloadMs),
       bindingGcMs: numberOr(defaults.bindingGcMs ?? defaults.binding_gc_ms, DEFAULT_DAEMON_CONFIG.defaults.bindingGcMs),
+      ...(onFailure ? { onFailure } : {}),
     },
     execution: normalizeExecution(execution),
     retention: normalizeRetention(retention),
@@ -154,6 +157,7 @@ function normalizeTrigger(raw: AnyRecord, fallbackId?: string): Trigger {
     filter: normalizeFilter(asOptionalRecord(raw.filter)),
     delivery,
     retry: normalizeRetry(asOptionalRecord(raw.retry)),
+    onFailure: normalizeOnFailure(asOptionalRecord(raw.onFailure ?? raw.on_failure), "trigger.onFailure"),
     context: normalizeContext(asOptionalRecord(raw.context)),
     lifecycle: normalizeLifecycle(asOptionalRecord(raw.lifecycle)),
     router,
@@ -309,6 +313,26 @@ function normalizeRetry(raw: AnyRecord | undefined): RetryPolicy | undefined {
     if (invalid !== undefined) throw new Error(`trigger.retry.on: unsupported entry "${invalid}"; use transport, timeout, exit, status:<code>, status:<n>xx or a hive error code`);
     policy.on = on;
   }
+  return policy;
+}
+
+function normalizeOnFailure(raw: AnyRecord | undefined, label: string): OnFailurePolicy | undefined {
+  if (!raw) return undefined;
+  const policy: OnFailurePolicy = {};
+  if (raw.after !== undefined) {
+    const after = numberOr(raw.after, Number.NaN);
+    if (!Number.isInteger(after) || after < 1) throw new Error(`${label}.after must be a whole number of at least 1`);
+    policy.after = after;
+  }
+  if (raw.cooldown !== undefined) {
+    const cooldown = String(raw.cooldown);
+    parseDuration(cooldown);
+    policy.cooldown = cooldown;
+  }
+  if (raw.disabled !== undefined) policy.disabled = booleanOr(raw.disabled, false);
+  const action = asOptionalRecord(raw.action);
+  if (raw.action !== undefined && !action) throw new Error(`Expected table at ${label}.action`);
+  if (action) policy.action = normalizeAction(action);
   return policy;
 }
 
@@ -607,6 +631,7 @@ function stripRuntimeDates(trigger: Trigger): AnyRecord {
     filter: trigger.filter,
     delivery: deliveryToToml(trigger.delivery),
     retry: trigger.retry,
+    onFailure: trigger.onFailure,
     context: trigger.context,
     lifecycle: trigger.lifecycle,
     router: trigger.router,

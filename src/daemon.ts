@@ -20,6 +20,7 @@ import {
 } from "./fsx.js";
 import { gcTemporaryHooks } from "./hooks.js";
 import { gcRouterBindings, routerGcSummary } from "./router-gc.js";
+import { TriggerHealthMonitor } from "./health.js";
 import { jobStoreWarnings, recordDaemonStart, recordDaemonStop, topTriggersByFiles, writeJobStoreHealth } from "./daemon-health.js";
 import type { DaemonConfig, JobStatus, Trigger } from "./types.js";
 
@@ -49,8 +50,10 @@ export class PollinateDaemon {
   private poll?: PollEngine;
   private webhook?: WebhookServer;
   private executor?: ActionExecutor;
+  private health?: TriggerHealthMonitor;
   private config?: DaemonConfig;
   private triggers: Trigger[] = [];
+  private triggerById = new Map<string, Trigger>();
   private reloadTimer?: NodeJS.Timeout;
   private bindingGcTimer?: NodeJS.Timeout;
   private bindingGcRunning = false;
@@ -115,6 +118,7 @@ export class PollinateDaemon {
   private async abandonStart(): Promise<void> {
     this.stopping = true;
     this.clearTimers();
+    this.health?.shutdown();
     await this.webhook?.stop().catch(() => undefined);
     await this.poll?.stop().catch(() => undefined);
     await this.schedule?.stop().catch(() => undefined);
@@ -141,7 +145,7 @@ export class PollinateDaemon {
     const config = await this.store.daemonConfig();
     await gcTemporaryHooks(this.store);
     await this.pruneOrphanedTriggerState();
-    const triggers = await this.store.loadTriggers();
+    const { triggers, invalid } = await this.store.loadTriggerFiles();
     const executor = new ActionExecutor(this.store, {
       contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
       commandTimeoutMs: parseDuration(config.defaults.commandTimeout, 600_000),
@@ -152,15 +156,22 @@ export class PollinateDaemon {
     this.store.onJobAllocated = (triggerId) => this.noteJobAllocated(triggerId);
     this.daemonConfigSignature = signatureForConfig(config);
     this.executor = executor;
-    this.triggers = triggers;
-    this.delivery = new DeliveryManager(this.store, executor);
+    this.setTriggers(triggers);
+    this.health = new TriggerHealthMonitor(this.store, executor, {
+      defaults: config.defaults.onFailure,
+      triggerFor: (triggerId) => this.triggerById.get(triggerId),
+    });
+    executor.health = this.health;
+    await this.health.load();
+    this.delivery = new DeliveryManager(this.store, executor, this.health);
     await this.delivery.init(triggers);
     this.webhook = new WebhookServer(this.store, this.delivery, triggers, config.webhook.bind, config.webhook.port, config.webhook.relay);
     await this.webhook.start();
-    this.schedule = new ScheduleEngine(this.store, this.delivery, triggers, config.defaults.tickMs);
-    this.poll = new PollEngine(this.store, this.delivery, triggers, config.execution);
+    this.schedule = new ScheduleEngine(this.store, this.delivery, triggers, config.defaults.tickMs, this.health);
+    this.poll = new PollEngine(this.store, this.delivery, triggers, config.execution, this.health);
     await this.schedule.start();
     await this.poll.start();
+    await this.health.syncTriggerFiles(triggers, invalid);
     this.triggerSignature = signatureForTriggers(triggers);
     this.reloadTimer = setInterval(() => {
       void this.reloadTriggers();
@@ -207,6 +218,7 @@ export class PollinateDaemon {
     if (this.stopping) return;
     this.stopping = true;
     this.clearTimers();
+    this.health?.shutdown();
     await this.webhook?.stop();
     await this.poll?.stop();
     await this.schedule?.stop();
@@ -235,11 +247,15 @@ export class PollinateDaemon {
         await this.log("pollinate.toml changed; restart the daemon to apply webhook, defaults, relay, or execution-profile changes");
       }
       await gcTemporaryHooks(this.store, { hasLiveJobs: (triggerId) => this.delivery?.hasLiveJobs(triggerId) ?? false });
-      const triggers = await this.store.loadTriggers();
+      const { triggers, invalid } = await this.store.loadTriggerFiles();
       const signature = signatureForTriggers(triggers);
-      if (signature === this.triggerSignature) return;
+      if (signature === this.triggerSignature) {
+        await this.health?.syncTriggerFiles(triggers, invalid);
+        return;
+      }
       this.triggerSignature = signature;
-      this.triggers = triggers;
+      this.setTriggers(triggers);
+      await this.health?.syncTriggerFiles(triggers, invalid);
       await this.delivery.init(triggers);
       this.schedule.updateTriggers(triggers);
       this.poll.updateTriggers(triggers);
@@ -256,6 +272,11 @@ export class PollinateDaemon {
     }
   }
 
+  private setTriggers(triggers: Trigger[]): void {
+    this.triggers = triggers;
+    this.triggerById = new Map(triggers.map((trigger) => [trigger.id, trigger]));
+  }
+
   private async runBindingGc(): Promise<void> {
     if (this.stopping || this.bindingGcRunning || !this.executor) return;
     this.bindingGcRunning = true;
@@ -265,6 +286,7 @@ export class PollinateDaemon {
         executor: this.executor,
         triggers: this.triggers,
         execution: this.config?.execution,
+        health: this.health,
       });
       const summary = routerGcSummary(result);
       if (summary) {
@@ -401,6 +423,11 @@ export class PollinateDaemon {
           error,
           recovered_from: previousStatus,
         });
+        if (job.source === "failure") {
+          await this.store.appendLedger({ event: "pollinate.trigger.on_failure_errored", trigger_id: job.triggerId, job_id: job.id, error });
+        } else if (job.action) {
+          await this.health?.recordFailure(job.triggerId, { kind: "job", error, jobId: job.id, deliveryId: job.deliveryId });
+        }
         recovered += 1;
       } catch (error) {
         await this.log(`stale job recovery failed for ${listed.id}: ${error instanceof Error ? error.message : String(error)}`);

@@ -1,6 +1,7 @@
 import type { Activation, MissedFirePolicy, ScheduleState, ScheduleTiming, Trigger } from "./types.js";
 import { DeliveryManager, deliveryIdFor } from "./delivery.js";
 import { PollinateStore } from "./store.js";
+import type { HealthRecorder } from "./health.js";
 import { nowIso, parseDuration, parseIsoDate } from "./time.js";
 
 type ScheduleEntry = ScheduleState[string] & { timingHash?: string };
@@ -25,6 +26,7 @@ export class ScheduleEngine {
     private readonly delivery: DeliveryManager,
     private triggers: Trigger[],
     private readonly tickMs: number,
+    private readonly health?: HealthRecorder,
   ) {}
 
   async start(): Promise<void> {
@@ -295,16 +297,18 @@ export class ScheduleEngine {
   }
 
   private async ledgerScheduleError(stage: string, error: unknown, triggerId?: string): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
     try {
       await this.store.appendLedger({
         event: "pollinate.schedule.errored",
         stage,
         ...(triggerId ? { trigger_id: triggerId } : {}),
-        error: error instanceof Error ? error.message : String(error),
+        error: message,
       });
     } catch {
       // If the ledger itself is unavailable, keep the daemon alive.
     }
+    if (triggerId) await this.health?.recordFailure(triggerId, { kind: "schedule", error: message });
   }
 }
 

@@ -6,6 +6,7 @@ import { PollinateStore } from "./store.js";
 import { nowIso, parseDuration } from "./time.js";
 import { appendTextLine, daemonLogPath } from "./fsx.js";
 import { lifecycleEnded } from "./hooks.js";
+import type { HealthRecorder } from "./health.js";
 
 const DEBOUNCE_MAX_WAIT_MULTIPLIER = 6;
 
@@ -87,6 +88,7 @@ export class DeliveryManager {
   constructor(
     private readonly store: PollinateStore,
     private readonly executor: ActionExecutor,
+    private readonly health?: HealthRecorder,
   ) {}
 
   async init(triggers: Trigger[]): Promise<void> {
@@ -194,6 +196,7 @@ export class DeliveryManager {
 
   async adoptOrphan(job: Job): Promise<boolean> {
     if (this.ownsJob(job.id)) return true;
+    if (job.source === "failure") return false;
     const trigger = this.triggers.get(job.triggerId);
     if (!trigger || !keepsJobs(trigger) || !trigger.action) return false;
     if (job.status !== "retrying" && !(retryPolicyFor(trigger) && RESUMABLE_INTERRUPTED_STATUSES.includes(job.status))) return false;
@@ -298,38 +301,47 @@ export class DeliveryManager {
 
   private runEntry(trigger: Trigger, entry: DeliveryEntry, resumedFrom?: Job): void {
     this.executeToTerminal(trigger, entry, resumedFrom)
-      .catch((error) => {
-        void this.store.appendLedger({
-          event: "pollinate.job.errored",
-          job_id: entry.job.id,
-          trigger_id: trigger.id,
-          error: error instanceof Error ? error.message : String(error),
-        }).catch((ledgerError) => this.logAsyncError("job error ledger", trigger, ledgerError));
-      })
+      .then(
+        (job) => this.recordJobHealth(trigger, job),
+        async (error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          await this.store.appendLedger({
+            event: "pollinate.job.errored",
+            job_id: entry.job.id,
+            trigger_id: trigger.id,
+            error: message,
+          }).catch((ledgerError) => this.logAsyncError("job error ledger", trigger, ledgerError));
+          if (!isRouterTrigger(trigger)) await this.health?.recordFailure(trigger.id, { kind: "job", error: message, jobId: entry.job.id, deliveryId: entry.job.deliveryId });
+        },
+      )
+      .catch((error) => this.logAsyncError("health", trigger, error))
       .finally(() => {
         void this.finishEntry(trigger, entry.job.id).catch((error) => this.logAsyncError("finish", trigger, error));
       });
   }
 
-  private async executeToTerminal(trigger: Trigger, entry: DeliveryEntry, resumedFrom?: Job): Promise<void> {
+  private async executeToTerminal(trigger: Trigger, entry: DeliveryEntry, resumedFrom?: Job): Promise<Job | undefined> {
     let job = resumedFrom ? await this.resumeJob(trigger, entry, resumedFrom) : await this.executor.executeJob(entry.job, trigger, entry.activation, entry.batch);
     while (job.status === "retrying") {
       const before = this.triggers.get(trigger.id);
-      if (!before || !keepsJobs(before)) {
-        await this.store.cancelJob(job.id, { reason: TRIGGER_REMOVED });
-        return;
-      }
+      if (!before || !keepsJobs(before)) return this.store.cancelJob(job.id, { reason: TRIGGER_REMOVED });
       await this.waitForRetry(job);
-      if (this.stopping) return;
+      if (this.stopping) return undefined;
       const current = this.triggers.get(trigger.id);
-      if (!current || !keepsJobs(current)) {
-        await this.store.cancelJob(job.id, { reason: TRIGGER_REMOVED });
-        return;
-      }
+      if (!current || !keepsJobs(current)) return this.store.cancelJob(job.id, { reason: TRIGGER_REMOVED });
       const latest = await this.store.getJob(job.id);
-      if (latest?.status !== "retrying") return;
+      if (latest?.status !== "retrying") return latest ?? undefined;
       job = await this.executor.executeJob(entry.job, current, entry.activation, entry.batch);
     }
+    return job;
+  }
+
+  private async recordJobHealth(trigger: Trigger, job: Job | undefined): Promise<void> {
+    if (!this.health || !job) return;
+    if (job.status === "completed") return this.health.recordSuccess(trigger.id, "job");
+    if (isRouterTrigger(trigger) || (job.status !== "errored" && job.status !== "timed-out")) return;
+    const error = job.status === "timed-out" ? "action timed out" : (job.error ?? "job errored");
+    await this.health.recordFailure(trigger.id, { kind: "job", error, jobId: job.id, deliveryId: job.deliveryId });
   }
 
   private async resumeJob(trigger: Trigger, entry: DeliveryEntry, job: Job): Promise<Job> {
@@ -668,6 +680,10 @@ export class DeliveryManager {
     this.persistChain = write.catch(() => undefined);
     return write;
   }
+}
+
+function isRouterTrigger(trigger: Trigger): boolean {
+  return Boolean(trigger.router && !trigger.action);
 }
 
 function keepsJobs(trigger: Trigger): boolean {
