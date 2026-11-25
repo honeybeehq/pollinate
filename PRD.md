@@ -1,5 +1,17 @@
 # pollinate PRD
 
+> **Status, 2026-11-25.** This is the original product requirements document.
+> §1–§8 (except §7.5 and §7.6) and §10–§19 are history: they record the design
+> intent and are kept only as background; on 2026-11-25 their references to
+> removed Honeybee features were replaced or marked. §7.5, §7.6, §9, §13 and §14
+> were rewritten that day to describe Pollinate as it is today, using the hive
+> v2 grammar. For current
+> behaviour read [AGENTS.md](AGENTS.md) (the operating contract) and
+> [README.md](README.md); where this document disagrees with them, they win.
+> Pollinate no longer has honeybee `run = "buz" | "comb" | "flow" | "loop"`,
+> the `hermes` action, or `pol sidebar`; `pol add` refuses the removed kinds
+> and names the replacement.
+
 ## 1. Summary
 
 **pollinate** is a standalone **trigger substrate**: a small, always-on, dumb-but-reliable
@@ -21,9 +33,9 @@ Triggering logic — "every morning at 08:00", "when a run seals", "on this webh
 "poll this source every 5 minutes" — currently has no home. It ends up trapped inside
 individual agents/systems, where it is invisible, non-reusable, and inconsistent.
 
-- The honeybee **loop** already covers one shape: a *continuous, hot, repeat-until* body
-  where the trigger is internal. It does not (and should not) cover *discrete activation*:
-  scheduled, event-driven, or webhook-driven firing of fresh runs.
+- honeybee runs bees: durable sessions that work while they have mail. It does not
+  cover *discrete activation*: scheduled, event-driven, or webhook-driven spawning of
+  fresh bees or messages to existing ones.
 - honeybee deliberately refuses to grow a scheduler ("no hidden autonomous background
   work" is its anti-goal). It stays the executor.
 - Hermes has its own internal scheduling for its own jobs, which is fine — but that is
@@ -39,9 +51,9 @@ subsystem) but provider-agnostic and free of Valhall's NATS/gRPC mesh.
   fired actions.
 - **Delivery policy** that plain cron lacks: immediate / throttled / batched / debounced,
   with per-trigger concurrency caps and queueing.
-- **Generic action targets**: honeybee (`hive flow run` / `hive loop start`), arbitrary
-  shell command, outbound HTTP, Hermes, or an internal emit (for chaining). pollinate is
-  execution-agnostic.
+- **Generic action targets**: honeybee (`hive spawn` / `hive send` / `hive stop`),
+  arbitrary shell command (which can call Hermes), outbound HTTP, or an internal emit
+  (for chaining). pollinate is execution-agnostic.
 - **Context resolver**: gather state from pluggable sources before firing and inject it
   into the action via simple `{{var}}` templating.
 - **Restart-safe**: persisted schedule clocks, delivery timers, pending batches, and poll
@@ -54,7 +66,7 @@ subsystem) but provider-agnostic and free of Valhall's NATS/gRPC mesh.
 - **No reasoning / judgment / planning.** That is Hermes. pollinate fires; it does not
   decide what *should* be done.
 - **No agent execution.** pollinate never spawns a bee in-process; it invokes honeybee.
-- **Not the honeybee loop.** Continuous hot repeat-until stays in honeybee. pollinate owns
+- **No resident agent work.** A bee that keeps working stays in honeybee. pollinate owns
   discrete activation. (See §8.)
 - **Does not absorb or replace Hermes's internal cron.** Hermes self-schedules its own
   work; pollinate is an opt-in shared plane with a delegation seam. (See §8.)
@@ -70,8 +82,8 @@ subsystem) but provider-agnostic and free of Valhall's NATS/gRPC mesh.
 Register a schedule, a webhook, or a poll once and forget it; inspect what fired and why.
 
 ### honeybee / Hermes / automation
-A trigger fires `hive flow run …` / `hive loop start …`, or calls Hermes, or runs a
-command. Hermes can also *register* triggers in pollinate when it wants the shared,
+A trigger fires `hive spawn …` / `hive send …`, or runs a command (which can call
+Hermes). Hermes can also *register* triggers in pollinate when it wants the shared,
 observable plane rather than its own internal cron.
 
 ## 6. Position in the Stack
@@ -85,7 +97,7 @@ observable plane rather than its own internal cron.
                             │ fires an action            │
                    ┌────────▼────────┐          ┌────────▼─────────┐
                    │ honeybee        │          │ Hermes           │
-                   │ run flow / loop │          │ reason / decide  │   (+ command / http / emit)
+                   │ spawn/send/stop │          │ reason / decide  │   (+ command / http / emit)
                    └─────────────────┘          └──────────────────┘
 ```
 
@@ -122,7 +134,7 @@ type Trigger = {
 ```
 
 `cwd` is a trigger-level default. Command poll fetches, command context sources,
-command actions, and Honeybee/Hermes CLI actions inherit it unless they define a
+command actions, and Honeybee actions inherit it unless they define a
 more specific `cwd`. Jobs snapshot the trigger `cwd` when queued so later trigger
 edits do not move already queued work.
 
@@ -159,8 +171,8 @@ type PollSpec = {
 };
 ```
 
-The **poll source is the honeybee event bridge**: a poll over `hive`'s `ledger.jsonl` /
-`hive ps --json` / `hive seals` turns honeybee's pull-only, file-based events into
+The **poll source is the honeybee event bridge**: a poll over `hive seal list --json` /
+`hive events --json` / `hive list --json` turns honeybee's pull-only, file-based events into
 triggers — no push bus, no NATS, no honeybee changes. (See §13.)
 
 **Webhook source** — an HTTP endpoint that becomes a trigger:
@@ -201,16 +213,29 @@ action as `{{batch}}` / `{{batch_count}}`. Schedules are effectively `immediate`
 
 ```ts
 type Action =
-  | { kind: "honeybee"; run: "flow"; flow: string; args?: Record<string,string> }
-  | { kind: "honeybee"; run: "loop"; loop: LoopArgs }    // bee/cwd/context/prompt/until/max/...
-  | { kind: "command";  command: string; cwd?: string; timeout: string }
-  | { kind: "http";     method: string; url: string; headers?: Record<string,string>; body?: string }
-  | { kind: "hermes";   invoke: string; payload?: string } // delegation seam — CLI or HTTP
-  | { kind: "emit";     subject: string; payload?: string }; // internal event for chaining
+  | { kind: "honeybee"; run: "spawn"; bee: string; name?: string; colony?: string;
+      home?: string; cwd?: string; yolo?: boolean; args?: string[]; message?: string; timeout?: string }
+  | { kind: "honeybee"; run: "send"; target: string; message: string; timeout?: string }
+  | { kind: "honeybee"; run: "kill"; target: string; timeout?: string }
+  | { kind: "command";  command: string; cwd?: string; timeout?: string }
+  | { kind: "http";     method: string; url: string; headers?: Record<string,string>; body?: string; timeout?: string }
+  | { kind: "emit";     subject: string; payload?: string }  // internal event for chaining
+  | { kind: "sequence"; mode?: "serial" | "parallel"; primary?: string; continueOnError?: boolean;
+      actions: { id?: string; action: Action }[] };
 ```
 
-`honeybee`/`hermes` are typed conveniences over `command`/`http`; everything templates
-through `{{var}}`. honeybee actions shell out to `hive flow run` / `hive loop start`.
+Everything templates through `{{var}}`. honeybee actions run `hive` argv-style, never
+through a shell, in the hive v2 grammar:
+
+- `spawn` → `hive spawn <name> --agent <bee> --json [--cwd <cwd>] [--tag colony=<colony>]
+  [--account <home>] [--arg <value>]…`, then `hive send <handle> <message>` when
+  `message` is set.
+- `send` → `hive send <target> <message>`.
+- `kill` → `hive stop <target>` (the bee stays revivable; Pollinate never deletes bees).
+
+A `hermes` action and honeybee `run = "buz" | "comb" | "flow" | "loop"` existed earlier
+and were removed on 2026-11-25. Use a `command` action that runs hermes, `run = "send"`
+for buz, and a scheduled `run = "spawn"` or `run = "send"` for comb, flow and loop.
 
 ### 7.6 Context Resolver
 
@@ -224,7 +249,7 @@ type ContextResolver = {
     | { var: string; kind: "command"; command: string; cwd?: string }   // stdout → var
     | { var: string; kind: "http"; url: string; jsonpath?: string }
     | { var: string; kind: "file"; path: string }
-    | { var: string; kind: "honeybee"; query: string }                  // e.g. `hive search "..."`
+    | { var: string; kind: "honeybee"; query: string; timeout?: string } // hive read argv, e.g. "seal list --json"
   >;
   static?: Record<string, string>;
 };
@@ -255,16 +280,15 @@ type Job = {
 
 ## 8. The Two Boundaries (the conceptual crux)
 
-### 8.1 pollinate vs the honeybee loop
+### 8.1 pollinate vs honeybee
 
 | "over and over" | owner | shape |
 |---|---|---|
-| continuous, hot, repeat-until | **honeybee loop** | one resident process, trigger internal |
-| discrete activation (cron/interval/event/webhook) | **pollinate** | N separate fires, fresh run each |
+| a bee that keeps working while it has mail | **honeybee** | one durable session |
+| discrete activation (cron/interval/event/webhook) | **pollinate** | N separate fires: spawn a bee or send one a message |
 
-They compose: a pollinate schedule can fire a `honeybee loop` (start a bounded Ralph
-loop every night); a webhook can fire a one-shot `flow`. pollinate does not replace the
-loop — it owns the *discrete* cases.
+They compose: a pollinate schedule can spawn a bee every night, or send the next task
+to a long-lived one; a webhook can spawn a one-shot reviewer.
 
 ### 8.2 pollinate vs Hermes self-scheduling
 
@@ -274,20 +298,22 @@ loop — it owns the *discrete* cases.
 - **pollinate** is the *shared, observable* plane for triggers that are cross-system /
   external-facing / need delivery policy / need to be centrally managed.
 - **Delegation seam:** Hermes can register a trigger in pollinate (CLI/API) whose action
-  is `{ kind: "hermes", … }` — pollinate fires back into Hermes. "Both" coexist precisely
+  is a `command` that calls Hermes — pollinate fires back into Hermes. "Both" coexist precisely
   because of this boundary. Hermes opts in per-trigger; reversible.
 
 ## 9. CLI Surface
 
-Binary `pollinate` (alias `pol`). All commands support `--json`.
+Binary `pollinate` (alias `pol`). All commands support `--json`. `pol --help` and
+AGENTS.md → "CLI map" are the full reference.
 
 ```
-# Triggers (unified create/list/inspect/enable/disable/remove)
+# Triggers
 pollinate add <config.toml>              # register a trigger from file
-pollinate list [--enabled|--disabled] [--tag <t>] [--source schedule|poll|webhook]
+pollinate create <id> …                  # build a trigger from flags (see pol --help)
+pollinate list [--enabled|--disabled] [--tag <t>] [--source schedule|poll|webhook|manual]
 pollinate get <id>
 pollinate enable <id> | disable <id> | remove <id>
-pollinate edit <id>                      # open the config
+pollinate edit <id>                      # open the config; validated on editor exit
 
 # Manual fire / testing
 pollinate trigger <id> [--payload '{"k":"v"}']   # fire now, ignore timing/source
@@ -295,17 +321,23 @@ pollinate trigger <id> --dry-run                 # resolve context + render acti
 
 # Jobs
 pollinate jobs [--status running|queued|completed|errored] [--trigger <id>] [--last <n>]
+pollinate jobs gc [--max-age 14d] [--keep-last 50] [--dry-run]
 pollinate job <jobId>
 pollinate job cancel <jobId>
 
 # Job IDs
-# Visible IDs are <trigger-prefix><uuid-prefix>, e.g. HE.a3f. The suffix is the
+# Visible IDs are <trigger-prefix>.<uuid-prefix>, e.g. HE.a3f. The suffix is the
 # shortest globally unused backing-UUID prefix, never shorter than three chars,
 # and state/job-id-index.json prevents suffix reuse across historical jobs.
 
-# Webhooks (introspection; endpoints come from webhook-source triggers)
+# Webhooks and routers
 pollinate hooks                          # list webhook routes + secrets-configured
+pollinate hook create|inbox|wait|gc      # temporary webhooks
 pollinate hook test <id> --payload '{...}'
+pollinate bindings [--trigger <id>] | bindings get <id>
+pollinate routers [list] | routers init <name>
+pollinate github create-pr-router <id> | github install-pr-router <id>
+pollinate satellite run --target <url> --secret <secret>
 
 # Daemon
 pollinate daemon install | uninstall | start | stop | restart | status | logs
@@ -314,15 +346,16 @@ pollinate daemon run --foreground        # used by the service manager
 # System
 pollinate status                         # active triggers, running/queued jobs, next fires
 pollinate ledger [-n <lines>] [--follow]
+pollinate --version [--json]
 ```
 
 ### 9.1 Config format (TOML, one file per trigger)
 
 ```toml
-# ~/.pollinate/triggers/morning-audit.toml
+# ~/.pollinate/triggers/morning-audit.toml — spawn a bee every weekday morning
 [trigger]
 name = "morning-audit"
-description = "Nightly repo audit loop"
+description = "Weekday repo audit"
 tags = ["audit", "daily"]
 enabled = true
 
@@ -335,24 +368,20 @@ timezone = "Europe/Oslo"
 
 [trigger.delivery]
 mode = "immediate"
-maxConcurrent = 1                # skip if last night's run is still going
+maxConcurrent = 1                # skip if the previous fire is still going
 
 [trigger.action]
 kind = "honeybee"
-run = "loop"
-[trigger.action.loop]
+run = "spawn"
 bee = "claude"
 cwd = "/Users/trmd/Projects/trmd/honeybee/repos/honeybee"
-context = "ralph"
-max = 50
-until = "test -z \"$(grep -rl TODO src)\""
-prompt = "Pick the next TODO, resolve it, seal done."
+message = "Pick the next TODO in src, resolve it, and seal what you did."
 ```
 
 ```toml
-# ~/.pollinate/triggers/on-seal-review.toml — poll honeybee's ledger, debounce, then review
+# ~/.pollinate/triggers/on-seal-review.toml — poll honeybee seals, debounce, then review
 [trigger]
-name = "review-completed-runs"
+name = "review-new-seals"
 tags = ["review"]
 enabled = true
 
@@ -363,29 +392,25 @@ interval = "30s"
 emit = "per-item"
 [trigger.source.poll.fetch]
 kind = "command"
-command = "hive search seal --type seals --json --since 1h"
+command = "hive seal list --json"
 [trigger.source.poll.cursor]
 strategy = "jsonpath"
-jsonpath = "$.hits[*].id"
-
-[trigger.filter]
-status = "done"
+jsonpath = "$.seals[*].id"
 
 [trigger.delivery]
 mode = "debounced"
 quietPeriod = "2m"
-maxConcurrent = 2
+maxConcurrent = 1
 
 [trigger.action]
 kind = "honeybee"
-run = "flow"
-flow = "deep-review"
-[trigger.action.args]
-batch = "{{batch}}"
+run = "send"
+target = "seal-reviewer"
+message = "New seals to review:\n{{batch}}"
 ```
 
 ```toml
-# ~/.pollinate/triggers/telegram-in.toml — webhook → Hermes
+# ~/.pollinate/triggers/telegram-in.toml — webhook → message a bee
 [trigger]
 name = "telegram-inbound"
 enabled = true
@@ -404,9 +429,10 @@ mode = "immediate"
 maxConcurrent = 4
 
 [trigger.action]
-kind = "hermes"
-invoke = "respond-to-message"
-payload = '{"text":"{{text}}","chat":"{{chat_id}}"}'
+kind = "honeybee"
+run = "send"
+target = "telegram-desk"
+message = "Telegram message: {{event}}"   # event is the transformed payload as JSON
 ```
 
 ## 10. On-disk Layout / Persistence
@@ -438,7 +464,7 @@ pollinated
 ├── WebhookServer      — HTTP listener, HMAC validation, transform → Dispatcher
 ├── DeliveryManager    — immediate / throttled / batched / debounced + concurrency/queue
 ├── ContextResolver    — parallel resolution of context sources (timeout, partial-ok)
-├── Dispatcher / ActionExecutor — render templates, invoke honeybee/command/http/hermes/emit
+├── Dispatcher / ActionExecutor — render templates, invoke honeybee/command/http/emit/sequence
 ├── StateManager       — persist schedule/delivery/cursor state on every change
 └── LedgerEmitter      — append pollinate.* events
 ```
@@ -449,6 +475,8 @@ each schedule declares a policy: `skip` (default), `fire-once` (single catch-up)
 `fire-all` (every missed slot). Logged on catch-up.
 
 ## 12. Events Emitted (its own ledger)
+
+History: the planned core set. The current list is AGENTS.md → "Ledger events".
 
 ```
 pollinate.schedule.fired     { trigger_id, job_id, at }
@@ -465,23 +493,31 @@ poll/filter), enabling "A then B" without a hardcoded DAG.
 
 ## 13. honeybee Integration
 
-- **As a target:** `honeybee` actions shell out to `hive flow run <flow> --arg k=v` and
-  `hive loop start …` (the two executor entrypoints). Zero honeybee changes required.
-- **As an event source:** a `poll` source over honeybee's file-based outputs
-  (`hive search --json`, `hive ps --json`, `ledger.jsonl`) with a persisted cursor turns
-  honeybee events into triggers. honeybee stays pull-only; pollinate does the polling.
-- **Shared store visibility:** pollinate runs on the same machine and can read honeybee's
-  `HIVE_STORE_ROOT`. (Future optional: a `hive events --follow` emit seam in honeybee
-  would let pollinate switch a poll source to a stream — build only if polling proves
-  insufficient.)
+- **As a target:** `honeybee` actions run `hive` argv-style in the v2 grammar:
+  `run = "spawn"` → `hive spawn <name> --agent <bee> --json …` (plus `hive send` for
+  `message`), `run = "send"` → `hive send <target> <message>`, `run = "kill"` →
+  `hive stop <target>`. Router triggers use the spawn handle as the binding target and
+  default `onClose` to `kill`. Every call retries while Honeybee reports
+  `daemon_starting` (AGENTS.md → "Honeybee starting window").
+- **As an event source:** a `poll` source over hive reads with a persisted cursor turns
+  honeybee events into triggers, for example `hive seal list --json` with
+  `jsonpath = "$.seals[*].id"`, `hive events --json` with `jsonpath = "$.rows[*].seq"`,
+  or `hive list --json`. honeybee stays pull-only; pollinate does the polling.
+- **As a context source:** `kind = "honeybee"` runs one hive read before the action, with
+  `query` as its argv without the leading `hive`, for example `query = "seal list --json"`,
+  `query = "view {{bee}} --json"`, `query = "mailbox {{bee}} --unread --json"` or
+  `query = "last {{bee}}"`.
+- **Not used:** Honeybee v2 has no flows, loops, combs, tracks, tmux sessions or
+  `hive search`, and `hive buz` is a v1 compatibility alias for `hive send`. Pollinate
+  uses none of them.
 
 ## 14. Hermes Integration
 
 - **Leave Hermes internals alone.** Hermes keeps its own internal cron for its own jobs.
-- **pollinate → Hermes:** the `hermes` action invokes Hermes (CLI or local HTTP) as a
-  delegation seam.
-- **Hermes → pollinate:** Hermes can register/enable/disable triggers via `pollinate`'s
-  CLI or local API when it wants the shared, observable plane. Opt-in per trigger.
+- **pollinate → Hermes:** a `command` action runs the Hermes CLI. There is no dedicated
+  Hermes action; one existed and was removed on 2026-11-25, and `pol add` refuses it.
+- **Hermes → pollinate:** Hermes can register/enable/disable triggers via the `pollinate`
+  CLI when it wants the shared, observable plane. Opt-in per trigger.
 
 ## 15. Safety / Operating Defaults
 
@@ -516,7 +552,8 @@ poll/filter), enabling "A then B" without a hardcoded DAG.
 - **v0 (core):** trigger registry + config load; ScheduleEngine (cron/every/once);
   Dispatcher with `command` + `honeybee` actions; job tracking; daemon install/run;
   `pollinate add/list/get/trigger --dry-run/jobs/status`. State persistence + missed-fire.
-- **v1 (the value):** WebhookServer (HMAC, transform); `http`/`hermes`/`emit` actions;
+- **v1 (the value):** WebhookServer (HMAC, transform); `http`/`emit` actions (and a
+  `hermes` action, removed 2026-11-25);
   full DeliveryManager (immediate/throttled/batched/debounced + concurrency/queue);
   context resolver (parallel, partial-ok).
 - **v2 (events):** PollEngine + cursors (honeybee ledger/seals bridge); `emit`-based
@@ -538,8 +575,8 @@ poll/filter), enabling "A then B" without a hardcoded DAG.
 - `maxConcurrent` caps concurrent fires; excess queues and drains FIFO.
 - The context resolver injects vars, runs sources in parallel, and proceeds on partial
   failure with a warning.
-- `honeybee` actions successfully run `hive flow run` / `hive loop start`; `command`/`http`
-  work; `dry-run` renders without executing.
+- `honeybee` actions successfully run `hive spawn` / `hive send` / `hive stop`;
+  `command`/`http` work; `dry-run` renders without executing.
 - The daemon survives restart: schedule clocks, delivery timers, pending batches, and poll
   cursors are restored from `state/`; the missed-fire policy is honored.
 - `pollinate status` / `jobs` / `ledger` reflect reality; `pollinate.*` events are emitted.
@@ -550,8 +587,8 @@ poll/filter), enabling "A then B" without a hardcoded DAG.
   (hardened daemon, closer to HJUL). Decide before v0.
 - **Binary/alias name:** `pollinate` + `pol`? Any bee-flavored subcommand vocabulary
   (`pollinate bloom`/`pollinate scout`), or keep literal (`schedule`/`poll`/`webhook`)?
-- **Hermes seam:** does Hermes expose a CLI or a local HTTP API for the `hermes` action and
-  for trigger registration? That fixes the delegation shape.
+- **Hermes seam:** resolved. Pollinate calls Hermes through a `command` action; Hermes
+  registers triggers through the `pollinate` CLI.
 - **Chaining bus:** keep `emit` events internal (poll-the-ledger) for v2, or expose a
   lightweight subscribe API later?
 - **Schedule engine:** own cron evaluator vs lean on system cron/systemd timers for pure
@@ -566,5 +603,5 @@ poll/filter), enabling "A then B" without a hardcoded DAG.
 - HJUL MVP spec (design reference; Valhall, deprecated):
   `/Users/trmd/Projects/trmd/valhall/repos/valhall/docs/9004-hjul-mvp.md`
 - honeybee (the primary executor target): `/Users/trmd/Projects/trmd/honeybee/repos/honeybee`
-  — entrypoints `hive flow run` / `hive loop start`; see its `LOOPS_PRD.md` for the
-  loop-vs-trigger boundary.
+  — entrypoints `hive spawn` / `hive send` / `hive stop`; the v2 CLI is
+  `v2/cli/src/main.ts`.

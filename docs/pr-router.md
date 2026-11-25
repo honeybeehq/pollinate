@@ -189,11 +189,6 @@ Use `--dry-run` to inspect the request without calling `gh api`.
 Use `honeybee` `run = "send"` when the bee must react to new PR activity as a
 normal prompt.
 
-`run = "buz"` is still available for addressed messages, but queue/passive buz
-delivery depends on Hive delivery policy and daemon behavior. It is not the
-right default for an automated review loop that should wake the target bee on
-each comment, review, or commit-related event.
-
 ## Loop Prevention
 
 Router-controlled bees that post PR comments should include this hidden marker:
@@ -301,7 +296,8 @@ rg 'pollinate-pr-2|github:pull_request' ~/.pollinate/jobs
 Inspect Hive lifecycle proof:
 
 ```sh
-rg 'pollinate-pr-2|session.save|prompt.send|session.kill' ~/.hive/ledger.jsonl
+hive events --bee pollinate-pr-2
+hive mailbox pollinate-pr-2
 ```
 
 Provider-side proof should still be checked at the provider. For GitHub:

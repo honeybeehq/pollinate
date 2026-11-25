@@ -149,6 +149,8 @@ quietPeriod = "20s"          # debounced
 var = "diff"
 kind = "command" | "http" | "file" | "honeybee"
 command = "gh pr diff {{pr_number}}"
+# kind = "honeybee": query is argv for a hive read, without the leading `hive`,
+# e.g. query = "seal list --json" or query = "mailbox {{bee}} --unread --json"
 [trigger.context.static]
 team = "platform"
 
@@ -158,7 +160,7 @@ expiresAt = "…"
 maxDeliveries = 1
 
 [trigger.action]             # required unless [trigger.router] is present
-kind = "command" | "http" | "emit" | "hermes" | "honeybee" | "sequence"
+kind = "command" | "http" | "emit" | "honeybee" | "sequence"
 ```
 
 ### Action kinds
@@ -168,29 +170,36 @@ kind = "command" | "http" | "emit" | "hermes" | "honeybee" | "sequence"
 | `command` | `command`, `cwd?`, `timeout?` — runs through the configured shell |
 | `http` | `method`, `url`, `headers?`, `body?`, `timeout?` |
 | `emit` | `subject`, `payload?` — appends a ledger event only |
-| `hermes` | `invoke` (name or URL), `payload?`, `timeout?` |
-| `honeybee` | `run = "spawn"\|"send"\|"buz"\|"kill"\|"flow"\|"loop"` (below) |
+| `honeybee` | `run = "spawn"\|"send"\|"kill"` (below) |
 | `sequence` | `mode = "serial"\|"parallel"`, `primary?`, `continueOnError?`, `actions = [{id, action}]` |
 
 Honeybee runs (executed argv-style, never through a shell — payload text cannot
-inject commands):
+inject commands) use the hive v2 grammar:
 
 - `spawn`: `bee` (required), `name?`, `colony?`, `home?`, `cwd?`, `yolo?`,
-  `acceptTrust?`, `args?` (passed after `--`), `message?` (sent after spawn),
-  `timeout?`. The spawn result handle must match `^[A-Za-z0-9._:-]+$`; garbage
-  hive output fails the action loudly instead of binding silently.
-- `send`: `target`, `message`, `timeout?`
-- `buz`: `target`, `message`, `tier = "interrupt"|"queue"|"passive"`,
-  `subject?`, `senderHuman?` (default `pollinate`), `timeout?`
-- `kill`: `target`, `timeout?`
-- `flow`: `flow`, `args?` (map → `--arg k=v`)
-- `loop`: `loop` table (flags passed to `hive loop start`)
-- `comb`: `comb`, `version`, `product`, `input`, `collision?`. The comb,
-  product, and positive version are literal control fields. Pollinate writes
-  the recursively rendered input object to `hive comb run --input -`, passes
-  stable `--origin-trigger`/`--origin-delivery` provenance, and parses only the
-  `comb.run` JSON envelope. Comb router leaves are rejected until run bindings
-  land.
+  `args?`, `message?` (alias `prompt`), `timeout?`. Runs
+  `hive spawn <name> --agent <bee> --json`, adding `--cwd <cwd>`,
+  `--tag colony=<colony>`, `--account <home>` and one `--arg <value>` per
+  entry of `args` (`yolo = true` prepends the harness's own bypass flag).
+  `name` defaults to `pol-<delivery id>`. When `message` is set it is then sent
+  with `hive send <handle> <message>`. The spawn result handle must match
+  `^[A-Za-z0-9._:-]+$`; garbage hive output fails the action loudly instead of
+  binding silently.
+- `send`: `target`, `message`, `timeout?` — `hive send <target> <message>`
+- `kill`: `target`, `timeout?` — `hive stop <target>`; the bee stays revivable,
+  Pollinate never runs `hive delete`
+
+Removed kinds are refused. `pol add` and `pol create` exit 1 with the
+replacement; an existing trigger file that uses one is skipped at load and
+ledgered `pollinate.trigger.invalid`. The messages from `src/config.ts`:
+
+| removed | replacement |
+|---|---|
+| `kind = "hermes"` | use a `"command"` action that runs hermes instead |
+| `honeybee run = "buz"` | use `run = "send"` instead |
+| `honeybee run = "comb"` | schedule a `run = "spawn"` or `run = "send"` instead |
+| `honeybee run = "flow"` | schedule a `run = "spawn"` or `run = "send"` instead |
+| `honeybee run = "loop"` | schedule a `run = "spawn"` or `run = "send"` instead |
 
 ### Router triggers
 
@@ -204,7 +213,7 @@ idleTtl = "48h"              # GC closes bindings idle longer than this
 pr_author = "trmdy"
 [trigger.router.onOpen]      # action; its handle becomes binding.target
 [trigger.router.onActivity]  # action; runs for every non-open/non-close event
-[trigger.router.onClose]     # optional; defaults to honeybee kill {{binding.target}}
+[trigger.router.onClose]     # optional; defaults to honeybee kill {{binding.target}} (hive stop)
 ```
 
 Binding lifecycle: `pending → active → closing → closed`, with `errored` on
@@ -271,11 +280,6 @@ plus:
 `github.<webhook_event>.<action>`, with `github.pull_request.merged` synthesized
 when a close has `merged: true`.
 
-Comb input rendering is stricter than ordinary action rendering: an exact
-placeholder is JSON-decoded (`"{{event}}"` can become an object and
-`"{{count}}"` can become a number), while an unresolved placeholder is a fatal
-job error before Hive is invoked.
-
 ## Loop prevention contract
 
 Bees that post PR comments **must** include `<!-- pollinate-router -->` at the
@@ -340,8 +344,8 @@ While Honeybee backs up and migrates its store, `hive` refuses every call with
 `daemon_starting` (the CLI holds 15 s first, then exits 1) and `hive health`
 exits 75. A first start on a large store on a loaded Mac can take minutes.
 
-- Every `hive` call Pollinate makes (honeybee actions, router actions, comb
-  runs, honeybee context sources) retries on exactly those two signals:
+- Every `hive` call Pollinate makes (honeybee actions, router actions,
+  honeybee context sources) retries on exactly those two signals:
   `error (daemon_starting)` on stderr or `error.code = "daemon_starting"` in
   `--json` output, or `hive health` exit 75. Any other failure, including a
   timeout, fails as before.
@@ -413,10 +417,10 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 
 - `pollinate.trigger.{added,enabled,disabled,removed}`
 - `pollinate.trigger.invalid` (a trigger file that fails to load, e.g. one
-  using a removed action kind; once per file change, keyed on path and mtime)
+  using a removed action kind; once per file change, keyed on path, mtime and size)
 - `pollinate.job.{queued,started,completed,errored,cancelled,hive_starting}`
 - `pollinate.delivery.{filtered,throttled}`
-- `pollinate.schedule.{fired,missed}` · `pollinate.poll.{checked,detected,errored}`
+- `pollinate.schedule.{fired,missed,errored}` · `pollinate.poll.{checked,detected,errored}`
 - `pollinate.webhook.{received,rejected,duplicate}`
 - `pollinate.hook.{created,delivered,expired,gc_removed}`
 - `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,already_bound,unbound,open_filtered,activity_errored,gc}`
