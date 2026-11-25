@@ -26,6 +26,8 @@ import { gcTemporaryHooks } from "./hooks.js";
 import { DEFAULT_BINDING_RETENTION, gcRouterBindings, routerGcSummary } from "./router-gc.js";
 import { TriggerHealthMonitor } from "./health.js";
 import { jobStoreWarnings, recordDaemonStart, recordDaemonStop, topTriggersByFiles, writeJobStoreHealth } from "./daemon-health.js";
+import { readBuildCommit } from "./build-info.js";
+import { realpath } from "node:fs/promises";
 import type { DaemonConfig, Job, JobStatus, JsonValue, Trigger } from "./types.js";
 
 const STALE_JOB_RECOVERY_MS = 60_000;
@@ -197,8 +199,13 @@ export class PollinateDaemon {
     this.jobsGcTimer = setInterval(() => {
       void this.runJobsGc();
     }, config.retention.jobsGcMs);
+    const build = await readBuildCommit();
     await this.store.appendLedger({
       event: "pollinate.daemon.started",
+      pid: process.pid,
+      entry: process.argv[1] ? await realpath(process.argv[1]).catch(() => process.argv[1]) : null,
+      commit: build?.commit ?? null,
+      dirty: build?.dirty ?? null,
       trigger_count: triggers.length,
       webhook_bind: config.webhook.bind,
       webhook_port: config.webhook.port,

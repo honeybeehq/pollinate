@@ -9,6 +9,7 @@ import { parseTriggerToml, removedActionMessage, removedActionMessageIn, slugify
 import { shellQuote } from "./process.js";
 import { applyWebhookTransform } from "./webhook.js";
 import { runForeground } from "./daemon.js";
+import { explainTrigger, renderDoctor, renderWhy, runDoctor } from "./doctor.js";
 import { crashLoopStatus, jobStoreWarnings, readDaemonRuns, readJobStoreHealth, topTriggersByFiles, type DaemonRun } from "./daemon-health.js";
 import { SatelliteServer } from "./satellite.js";
 import { API_VERSION, readBuildInfo, readVersion } from "./version.js";
@@ -136,6 +137,17 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     case "ledger":
       await cmdLedger(await getStore(), args);
       return;
+    case "doctor": {
+      const report = await runDoctor(await getStore(), { fix: Boolean(args.flags.fix) });
+      console.log(args.json ? JSON.stringify(report, null, 2) : renderDoctor(report));
+      process.exitCode = report.exitCode;
+      return;
+    }
+    case "why": {
+      const report = await explainTrigger(await getStore(), requiredArg(args.rest[0], "Usage: pollinate why <trigger> [--json]"));
+      console.log(args.json ? JSON.stringify(report, null, 2) : renderWhy(report));
+      return;
+    }
     case "help":
     case undefined:
       await printHelp();
@@ -1602,6 +1614,7 @@ const BOOLEAN_FLAGS = new Set([
   "dry-run",
   "follow",
   "foreground",
+  "fix",
   "collect",
   "force",
   "install-webhook",
@@ -1903,6 +1916,8 @@ async function printHelp(): Promise<void> {
       ["github install-pr-router <id>", "create or update the GitHub webhook"],
       ["status", "dashboard: triggers, jobs, upcoming fires"],
       ["ledger [-n <lines>] [--follow]", "stream the event ledger"],
+      ["doctor [--fix]", "check daemon, hive, triggers, bindings, state and config; exit 0 clean, 1 warnings, 2 errors"],
+      ["why <trigger>", "last 20 activations of a trigger and what happened to each"],
     ]),
   );
   out.push("");

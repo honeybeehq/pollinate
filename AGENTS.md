@@ -146,6 +146,7 @@ symlinks, then
   ledger.jsonl                    append-only event log (the source of truth)
   ledger.jsonl.1                  previous ledger generation (size-based rotation, see Job retention)
   daemon.log                      daemon lifecycle + GC log (pol daemon logs)
+  daemon.log.1                    previous daemon.log (pol doctor --fix rotates it past 10 MB)
   daemon.out.log                  macOS launchd stdout log
   daemon.err.log                  macOS launchd stderr log
   pollinate.toml                  daemon config
@@ -168,8 +169,10 @@ symlinks, then
 | `pol satellite run --target … --secret …` | public relay → local daemon |
 | `pol --version [--json]` | version and the commit this build came from (`dist/build-info.json`) |
 | `pol status / ledger [-n N] [--follow]` | dashboard (incl. job file count, size, store and crash-loop warnings) / event stream |
+| `pol doctor [--json] [--fix]` | check daemon, hive, triggers, bindings, state and config; exit 0 clean, 1 warnings, 2 errors (see Doctor) |
+| `pol why <trigger> [--json]` | the trigger's last 20 activations from the ledger, each with its outcome (see Doctor) |
 
-Answering "why didn't my trigger fire?": check `pol ledger -n 200` for
+Answering "why didn't my trigger fire?": start with `pol why <trigger>`, or check `pol ledger -n 200` for
 `delivery.filtered`, `router.open_filtered`, `webhook.rejected`,
 `webhook.duplicate`, `delivery.duplicate`, `router.unbound`, or `delivery.throttled` events, then
 `pol daemon logs` for daemon lifecycle and binding-GC lines. "Is it failing?":
@@ -581,6 +584,73 @@ The daemon serves the v1 API (HTTP/1.1 + JSON, `node:http`) on
 - `state/store.json` is `{"schema": 1}`, written when missing. A higher schema
   refuses the start: `store schema N in … is newer than this Pollinate supports`.
 
+## Doctor
+
+`pol doctor [--json] [--fix]` reads the store (set by `POLLINATE_STORE_ROOT`) and
+reports one line per check. Exit code: `0` clean, `1` warnings only, `2` any
+error. `--json` prints `{store, checkedAt, status, exitCode, counts: {errors,
+warnings}, findings: [{area, check, severity, message, fixable?, details?}],
+fixes?}`. Without `--fix` it writes nothing.
+
+| area | check | severity |
+|---|---|---|
+| daemon | no live `state/daemon.lock` holder | warning |
+| daemon | daemon commit differs from the CLI's (`commit` from `pollinate.daemon.started`, else `build-info.json` next to the daemon's `cli.js`) or is unknown | warning |
+| daemon | another `pollinate … daemon run` process on the same store (process list, its `POLLINATE_STORE_ROOT`, a `package.json` named `pollinate`) | error |
+| daemon | crash loop (`state/daemon-runs.json`); unclean exits in the last hour without a loop are a warning | error |
+| daemon | the daemon's `cli.js` is inside a git checkout | warning |
+| hive | the resolved hive (`[honeybee] bin`, else the execution PATH) fails `--version --json`; a warning when no enabled trigger uses hive | error |
+| hive | `hive health --json` fails (exit 75, still starting, is a warning) | error |
+| hive | a different `hive` earlier on the execution PATH whose `--version --json` fails or differs from the configured one | error |
+| triggers | trigger files that do not parse; files that use a removed action kind | error |
+| triggers | `consecutiveFailures >= 3` in `state/trigger-health.json` | error |
+| triggers | spent but present: `maxDeliveries` reached, `expiresAt` past, a `once` schedule that fired (`completedOnce`) or is disabled with `at` past | warning |
+| router | errored and closing bindings per trigger; open bindings of a removed trigger | warning |
+| router | closed bindings older than `[router] bindingRetention` | warning, fixable |
+| state | entries in the per-trigger state files for triggers with no file | warning, fixable |
+| state | jobs folder past `jobsWarnFiles` / `jobsWarnMb`; `ledger.jsonl` past twice `ledgerMaxMb` | warning |
+| state | `daemon.log`, `daemon.out.log` or `daemon.err.log` over 10 MB | warning, fixable |
+| state | files Pollinate does not own in the store root, `state/`, `triggers/` (non-`.toml`) or `jobs/` (non-`.json`) | warning |
+| config | `[execution.env].PATH` entries that do not exist | warning |
+| config | `pollinate.toml` modified after the running daemon started | warning |
+| config | `pollinate.toml` does not parse | error |
+
+`--fix` does only three things, then checks again and reports what is left:
+
+- prunes orphan entries from `TRIGGER_STATE_FILES` (ledger `pollinate.state.pruned`
+  with `reason: "doctor"`). While a daemon runs it prunes only the lock-guarded
+  `deliveries-seen.json` and `trigger-health.json`; the daemon prunes the rest
+  at its next start.
+- deletes closed bindings past `bindingRetention` under the binding lock
+  (ledger `pollinate.router.binding_pruned` with `reason: "doctor"`).
+- rotates logs over 10 MB: `daemon.log` is renamed to `daemon.log.1`;
+  `daemon.out.log` and `daemon.err.log` are cut in place to their last 1 MB
+  (copy-truncate, because launchd holds them open).
+
+It never removes triggers, jobs or open bindings. When it changed anything it
+ledgers `pollinate.doctor.fixed {fixes: [{action, message}]}`.
+
+`pol why <trigger> [--json]` reads `ledger.jsonl` (then `ledger.jsonl.1`) from
+the end and lists the trigger's last 20 activations, newest first, with
+`{at, outcome, event, jobId?, deliveryId?, status?, detail?}`. Outcomes:
+
+| outcome | from |
+|---|---|
+| `fired` | `pollinate.job.queued`, ended `completed` (or still running: `status` says so) |
+| `errored` | a job that ended `errored` / `timed-out`; `pollinate.schedule.errored`; `pollinate.poll.errored` |
+| `filtered` | `pollinate.delivery.filtered`, `pollinate.router.open_filtered` |
+| `throttled` | `pollinate.delivery.throttled` |
+| `duplicate` | `pollinate.delivery.duplicate`, `pollinate.webhook.duplicate` |
+| `dropped` | `pollinate.delivery.dropped`, `pollinate.router.open_rate_limited`, `pollinate.webhook.rejected`, a cancelled job |
+
+onFailure notification jobs are not activations. The job file, when it still
+exists, supplies the delivery id and the final status.
+
+Both commands redact secrets in all output: values under keys that look like
+secrets (`secret`, `token`, `password`, `authorization`, `cookie`, `api_key`,
+`signature`, …), every value under a `headers` key, and bearer tokens,
+`Authorization:`-style pairs and GitHub/OpenAI/Slack token shapes inside text.
+
 ## Webhooks
 
 - Local endpoint: `POST /hook/<path>` on `127.0.0.1:3978` (configurable via
@@ -878,12 +948,16 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
   occurrence), `missed_count`, `detected: "tick" | "startup"` and, past 10,000,
   `missed_count_capped` (see Schedules and missed fires)
 - `pollinate.api.errored` (an API call failed with `500 internal`; carries `method`, `path`, `error`)
-- `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored,crash_loop,refused}`; `started` carries `socket`;
+- `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored,crash_loop,refused}`;
+  `started` carries `socket`, `pid`, `entry` (the real path of the running
+  `cli.js`), `commit` and `dirty` (from `dist/build-info.json`; `pol doctor`
+  compares them);
   `refused` carries `reason: "locked" | "lock_lost"` and the lock holder's `pid`
   (see One daemon per store)
 - `pollinate.jobs.{gc,store_warning}` · `pollinate.ledger.rotated` (job/ledger retention, see Job retention)
 - `pollinate.emit` (from `emit` actions)
 - `pollinate.hive.probed {path, version, ok, error?}` (daemon start, when a trigger uses hive; see Action kinds)
+- `pollinate.doctor.fixed {fixes}` (`pol doctor --fix` changed something; see Doctor)
 
 ## Job IDs
 
