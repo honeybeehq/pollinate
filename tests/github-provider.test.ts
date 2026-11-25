@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
-import { installGithubWebhook } from "../src/index.js";
+import { installGithubWebhook } from "../src/providers/github.js";
 import { installCommandStub, withTempStore } from "./helpers.js";
 
 describe("GitHub provider setup", () => {

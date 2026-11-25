@@ -160,6 +160,24 @@ ${action}
     expect(() => parseTriggerToml(base(ok.source, ok.delivery, 'kind = "honeybee"\nrun = "dance"'))).toThrow(/Unsupported honeybee run mode/);
   });
 
+  test("refuses removed action kinds with the replacement named", () => {
+    const toml = (action: string) => `[trigger]
+id = "x"
+
+[trigger.source]
+kind = "manual"
+
+[trigger.action]
+${action}
+`;
+    expect(() => parseTriggerToml(toml('kind = "honeybee"\nrun = "buz"\ntarget = "b"\nmessage = "m"'))).toThrow('honeybee run "buz" was removed from Pollinate; use run = "send" instead.');
+    for (const run of ["comb", "flow", "loop"]) {
+      expect(() => parseTriggerToml(toml(`kind = "honeybee"\nrun = "${run}"`))).toThrow(`honeybee run "${run}" was removed from Pollinate; schedule a run = "spawn" or run = "send" instead.`);
+    }
+    expect(() => parseTriggerToml(toml('kind = "hermes"\ninvoke = "respond"'))).toThrow('action kind "hermes" was removed from Pollinate; use a "command" action that runs hermes instead.');
+    expect(() => parseTriggerToml(toml('kind = "sequence"\n[[trigger.action.actions]]\nkind = "hermes"\ninvoke = "x"'))).toThrow(/"hermes" was removed/);
+  });
+
   test("rejects routers missing event lists or actions", () => {
     const toml = (routerBody: string) => `[trigger]
 id = "r"

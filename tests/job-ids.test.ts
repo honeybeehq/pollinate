@@ -1,11 +1,6 @@
 import { describe, expect, test } from "vitest";
-import {
-  allocateJobIdentity,
-  jobPrefixForTrigger,
-  matchesJobReference,
-  minimumUniqueUuidPrefixLength,
-  type Job,
-} from "../src/index.js";
+import { allocateJobIdentity, jobPrefixForTrigger, matchesJobReference, minimumUniqueUuidPrefixLength } from "../src/job-ids.js";
+import type { Job } from "../src/types.js";
 import { trigger, withTempStore } from "./helpers.js";
 
 describe("job ids", () => {

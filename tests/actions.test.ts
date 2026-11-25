@@ -1,25 +1,8 @@
 import { describe, expect, test } from "vitest";
-import { ActionExecutor, isValidHiveHandle, parseHiveHandle, pathExists } from "../src/index.js";
+import { ActionExecutor, isValidHiveHandle } from "../src/actions.js";
+import { pathExists } from "../src/fsx.js";
 import { join } from "node:path";
 import { installHiveStub, withTempStore } from "./helpers.js";
-
-describe("parseHiveHandle", () => {
-  test("takes the first token of the first handle-shaped line", () => {
-    expect(parseHiveHandle("pr-123\tcodex\t/tmp\tlocal\n")).toBe("pr-123");
-    expect(parseHiveHandle("\n\n  bee.7:local  extra\n")).toBe("bee.7:local");
-  });
-
-  test("skips warning-style prefix lines", () => {
-    expect(parseHiveHandle("warning: hive is out of date\npr-9\tcodex\n")).toBe("pr-9");
-    expect(parseHiveHandle("Error:\n")).toBeUndefined();
-  });
-
-  test("returns undefined for output with no valid handle", () => {
-    expect(parseHiveHandle("")).toBeUndefined();
-    expect(parseHiveHandle("!! something exploded !!\n")).toBeUndefined();
-    expect(parseHiveHandle("$(rm -rf /) oops\n")).toBeUndefined();
-  });
-});
 
 describe("isValidHiveHandle", () => {
   test("accepts hive-style handles and rejects shell metacharacters", () => {
@@ -44,26 +27,6 @@ describe("ActionExecutor honeybee argv execution", () => {
 
         expect(await pathExists(marker)).toBe(false);
         expect(await hive.log()).toContain(`send bee-1 ${message}`);
-      } finally {
-        hive.restore();
-      }
-    });
-  });
-
-  test("composes buz argv with sender, tier, subject, and prompt", async () => {
-    await withTempStore(async (store, root) => {
-      const hive = await installHiveStub(root);
-      try {
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 10_000 });
-        await executor.executeAction({
-          kind: "honeybee",
-          run: "buz",
-          target: "bee-2",
-          message: "hello there",
-          tier: "interrupt",
-          subject: "ci failed",
-        });
-        expect(await hive.log()).toContain("buz send bee-2 --sender-human pollinate --tier interrupt -p [ci failed] hello there");
       } finally {
         hive.restore();
       }

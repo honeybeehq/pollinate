@@ -1,16 +1,12 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PollinateStore, type JobRetentionResult } from "./store.js";
-import { ActionExecutor, createExecutor, fireTriggerNow, parseHiveHandle } from "./actions.js";
+import { ActionExecutor, createExecutor, fireTriggerNow } from "./actions.js";
 import { parseDuration, sleep, nowIso } from "./time.js";
-import { parseTriggerToml, slugify, triggerToToml } from "./config.js";
-import { execArgv, shellQuote } from "./process.js";
-import { tmux } from "./tmux.js";
-import { isSidebarTab, readSidebarTab, toggleSidebar, writeSidebarTab, type SidebarTab } from "./sidebar.js";
-import { runSidebarTui, type NewTriggerDraft, type SidebarData } from "./sidebarTui.js";
+import { parseTriggerToml, removedActionMessage, removedActionMessageIn, slugify } from "./config.js";
+import { shellQuote } from "./process.js";
 import { applyWebhookTransform } from "./webhook.js";
 import { runForeground } from "./daemon.js";
 import { crashLoopStatus, jobStoreWarnings, readDaemonRuns, readJobStoreHealth, topTriggersByFiles, type DaemonRun } from "./daemon-health.js";
@@ -49,7 +45,7 @@ import {
   table,
   truncate,
 } from "./ui.js";
-import type { Action, Activation, ContextResolver, Delivery, Filter, Job, JobStatus, JsonValue, MissedFirePolicy, RouterBinding, RouterConfig, ScheduleTiming, Source, SourceKind, Trigger } from "./types.js";
+import type { Action, Activation, ContextResolver, Delivery, Filter, Job, JobStatus, JsonValue, MissedFirePolicy, RouterBinding, RouterConfig, Source, SourceKind, Trigger } from "./types.js";
 
 type ParsedArgs = {
   command?: string;
@@ -109,9 +105,6 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     case "jobs":
       await cmdJobs(await getStore(), args);
       return;
-    case "sidebar":
-      await cmdSidebar(await getStore(), args);
-      return;
     case "bindings":
       await cmdBindings(await getStore(), args);
       return;
@@ -164,6 +157,8 @@ async function cmdCreate(store: PollinateStore, args: ParsedArgs): Promise<void>
   const router = routerFromFlags(args);
   const action = actionFromFlagsOptional(args);
   if (!router && !action) throw new Error("Create requires --action <kind>, --action-json, or --router-json");
+  const removed = [action, router?.onOpen, router?.onActivity, router?.onClose].map(removedActionMessageIn).find(Boolean);
+  if (removed) throw new Error(removed);
   const trigger: Trigger = {
     id,
     name: stringFlag(args, "name") ?? id,
@@ -354,184 +349,6 @@ function renderJobsGcResult(result: JobRetentionResult, dryRun: boolean): string
     lines.push(c.dim("No terminal jobs found."));
   }
   return lines.join("\n");
-}
-
-async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void> {
-  if (args.flags["toggle-sidebar"]) {
-    const state = await toggleSidebar(numberFlag(args, "width"));
-    // Stay silent in human mode: this is bound to a key via tmux `run-shell`,
-    // which would otherwise pop the stdout into a copy-mode view over the screen.
-    if (args.json) console.log(JSON.stringify({ state }, null, 2));
-    return;
-  }
-
-  const loadData = async (): Promise<SidebarData> => {
-    const [triggers, recent, bindings, scheduleState] = await Promise.all([
-      store.loadTriggers(),
-      store.listJobs({ last: 300 }),
-      store.listRouterBindings(),
-      store.readScheduleState(),
-    ]);
-    return {
-      triggers,
-      active: recent.filter((job) => !TERMINAL.has(job.status)),
-      history: recent.filter((job) => TERMINAL.has(job.status)).slice(0, 100),
-      bindings,
-      scheduleState,
-    };
-  };
-
-  // Non-interactive (piped / non-tmux without a TTY): print one snapshot, exit.
-  const tabFlag = stringFlag(args, "tab");
-  const initialTab: SidebarTab = isSidebarTab(tabFlag) ? tabFlag : (await readSidebarTab()) ?? "triggers";
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    const data = await loadData();
-    print(args, data, renderSidebarSnapshot(data));
-    return;
-  }
-
-  await runSidebarTui({
-    sidebar: Boolean(args.flags.sidebar),
-    initialTab,
-    loadData,
-    syncTab: () => readSidebarTab(),
-    onTabChange: (tab) => writeSidebarTab(tab),
-    renderTriggerPreview: (trigger) => renderTrigger(trigger),
-    renderJobPreview: (job) => renderJob(job),
-    renderBindingPreview: (binding) => renderBinding(binding),
-    // Keep the current dedicated-sidebar behavior until tmux popup focus/size
-    // handling is verified there; the normal full-window TUI still gets popups.
-    openPopup: args.flags.sidebar ? undefined : (title, text) => openPreviewPopup(title, text),
-    runNow: async (trigger, payloadJson) => {
-      const job = await fireTriggerNow(store, trigger, parsePayload(payloadJson));
-      return `${jobBadge(job.status)} ${shortId(job.id)}`;
-    },
-    toggleEnabled: async (trigger) => {
-      const updated = await store.setTriggerEnabled(trigger.id, !trigger.enabled);
-      return updated.enabled ? `enabled ${updated.id}` : `disabled ${updated.id}`;
-    },
-    cancelJob: async (job) => {
-      const cancelled = await store.cancelJob(job.id);
-      return `${jobBadge(cancelled.status)} ${shortId(cancelled.id)}`;
-    },
-    saveSchedule: async (trigger, timing) => {
-      await store.saveTrigger({ ...trigger, source: { kind: "schedule", timing } });
-      return `updated schedule for ${trigger.id}`;
-    },
-    createTrigger: async (draft) => {
-      const trigger = triggerFromDraft(draft);
-      const created = await store.addTriggerFromToml(triggerToToml(trigger), trigger.id);
-      return `created ${created.id}`;
-    },
-    duplicateJob: async (job, payloadJson) => {
-      const trigger = await store.getTrigger(job.triggerId);
-      if (!trigger) throw new Error(`trigger ${job.triggerId} no longer exists`);
-      const fired = await fireTriggerNow(store, trigger, parsePayload(payloadJson));
-      return `${jobBadge(fired.status)} ${shortId(fired.id)}`;
-    },
-    hiveJump: async (handle) => {
-      const result = await execArgv("hive", ["open", handle], { timeoutMs: 15_000 });
-      if (result.exitCode !== 0) throw new Error(`hive open ${handle}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
-      return `opened ${handle}`;
-    },
-    spawnHiveAuthor: async (trigger, request) => {
-      const cwd = trigger?.cwd ?? process.cwd();
-      const prompt = hiveAuthorPrompt(trigger, request);
-      const result = await execArgv("hive", ["x", "codex", prompt], { cwd, timeoutMs: 30_000 });
-      if (result.exitCode !== 0) throw new Error(`hive x: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
-      const handle = parseHiveHandle(result.stdout);
-      if (handle) await execArgv("hive", ["open", handle], { timeoutMs: 15_000 });
-      return handle ? `authoring with ${handle}` : "spawned hive authoring session";
-    },
-  });
-}
-
-/**
- * Show rendered text in a centered tmux popup for the normal full-window TUI.
- * The dedicated tmux sidebar pane gates this at the call site pending behavior
- * verification. Returns false outside tmux so the caller can fall back to an
- * in-pane overlay. `less -R` keeps the ANSI colors and closes on `q`;
- * `display-popup -E` then tears the popup down.
- */
-async function openPreviewPopup(title: string, text: string): Promise<boolean> {
-  if (!process.env.TMUX) return false;
-  const file = join(tmpdir(), `pol-preview-${process.pid}-${Date.now()}-${randomHookToken()}.txt`);
-  await writeFile(file, `${title}\n\n${text}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-  const q = shellQuote(file);
-  // The popup deletes its own file after `less` exits, so cleanup never races
-  // `less` — display-popup returns immediately when invoked from within the
-  // client's own pane (rather than blocking until close). `less -R` keeps ANSI.
-  const result = await tmux(["display-popup", "-E", "-w", "85%", "-h", "85%", `less -R -- ${q}; rm -f ${q}`]);
-  if (!result.ok) {
-    await rm(file, { force: true }); // no attached client / unsupported → in-pane fallback
-    return false;
-  }
-  return true;
-}
-
-function triggerFromDraft(draft: NewTriggerDraft): Trigger {
-  const id = slugify(draft.name || "trigger");
-  const now = nowIso();
-  let source: Source;
-  if (draft.sourceKind === "schedule") {
-    const t = draft.scheduleType.trim();
-    const v = draft.scheduleValue.trim();
-    const timing: ScheduleTiming =
-      t === "cron" ? { type: "cron", expression: v } : t === "once" ? { type: "once", at: v } : { type: "every", interval: v };
-    source = { kind: "schedule", timing };
-  } else if (draft.sourceKind === "webhook") {
-    source = { kind: "webhook", webhook: { path: draft.webhookPath.trim() || id } };
-  } else {
-    source = { kind: "manual" };
-  }
-  const action: Action =
-    draft.actionKind === "honeybee"
-      ? { kind: "honeybee", run: "spawn", bee: draft.bee.trim() || "codex" }
-      : { kind: "command", command: draft.command.trim() || "true" };
-  return {
-    id,
-    name: draft.name || id,
-    tags: [],
-    enabled: true,
-    source,
-    delivery: { mode: { strategy: "immediate" }, maxConcurrent: 1 },
-    action,
-    createdAt: now,
-    updatedAt: now,
-  };
-}
-
-function hiveAuthorPrompt(trigger: Trigger | undefined, request: string): string {
-  const trimmed = request.trim();
-  const base = [
-    "Help me author a Pollinate trigger.",
-    "Pollinate (`pol`) is a trigger substrate; triggers are TOML files managed with `pol create`, `pol add`, `pol get`, and `pol edit`.",
-    "Read the trigger schema in this repo's AGENTS.md and inspect current triggers before changing anything.",
-    "Important: `pol add` and `pol create` overwrite triggers with the same id, so check `pol get <id>` first.",
-  ].join(" ");
-  const context = trigger
-    ? [
-        `Selected trigger: ${trigger.id}.`,
-        `Working directory: ${trigger.cwd ?? process.cwd()}.`,
-        "Use that trigger as the starting point unless the operator request clearly asks for a new trigger.",
-      ].join(" ")
-    : "No trigger is selected; help design a new trigger unless the operator request says otherwise.";
-  const goal = trimmed
-    ? `Operator request:\n${trimmed}`
-    : "Operator request:\nAsk a short clarifying question first, then propose the smallest useful trigger change.";
-  return `${base}\n\n${context}\n\n${goal}`;
-}
-
-function renderSidebarSnapshot(data: SidebarData): string {
-  return [
-    heading("pollinate sidebar"),
-    "",
-    `${c.bold(String(data.triggers.length))} triggers ${c.dim(sym.mid)} ${c.bold(String(data.active.length))} active ${c.dim(sym.mid)} ${c.bold(String(data.history.length))} in history`,
-    "",
-    data.triggers.length ? renderTriggerList(data.triggers) : c.dim("No triggers yet."),
-    "",
-    c.dim("sidebar TUI needs a TTY — bind cmd+option+B or run `pol sidebar` in a terminal"),
-  ].join("\n");
 }
 
 async function cmdBindings(store: PollinateStore, args: ParsedArgs): Promise<void> {
@@ -1393,11 +1210,7 @@ function describeAction(action: Action): string {
       return `${c.bold("http")} ${action.method} ${c.dim(action.url)}`;
     case "emit":
       return `${c.bold("emit")} ${action.subject}`;
-    case "hermes":
-      return `${c.bold("hermes")} ${action.invoke}`;
     case "honeybee":
-      if (action.run === "flow") return `${c.bold("honeybee")} flow ${action.flow}`;
-      if (action.run === "loop") return `${c.bold("honeybee")} loop`;
       return `${c.bold("honeybee")} ${action.run}`;
     case "sequence":
       return `${c.bold("sequence")} ${action.mode ?? "serial"} ${c.dim(`${action.actions.length} actions`)}`;
@@ -1436,9 +1249,7 @@ function routerActionSummary(action: Action): string {
       if (action.name) parts.push(`name=${action.name}`);
       if (action.args?.length) parts.push(c.dim(`args=${truncate(action.args.join(" "), max)}`));
     }
-    if (action.run === "send" || action.run === "buz" || action.run === "kill") parts.push(`target=${action.target}`);
-    if (action.run === "buz" && action.tier) parts.push(`tier=${action.tier}`);
-    if (action.run === "flow") parts.push(`flow=${action.flow}`);
+    if (action.run === "send" || action.run === "kill") parts.push(`target=${action.target}`);
     const lines = [parts.join(c.dim(` ${sym.mid} `))];
     const message = "message" in action ? action.message : undefined;
     if (message) lines.push(c.dim(`message: ${truncate(message.replace(/\s+/g, " "), max)}`));
@@ -1461,7 +1272,7 @@ function actionDetail(action: Action): string | undefined {
   const max = Math.max(20, (process.stdout.columns || 80) - 16);
   if (action.kind === "command") return truncate(action.command, max);
   if (action.kind === "http" && action.body) return truncate(action.body, max);
-  if ((action.kind === "emit" || action.kind === "hermes") && action.payload) return truncate(action.payload, max);
+  if (action.kind === "emit" && action.payload) return truncate(action.payload, max);
   if (action.kind === "sequence") return action.actions.map((step) => step.id ?? step.action.kind).join(", ");
   return undefined;
 }
@@ -1676,29 +1487,6 @@ function actionFromFlags(args: ParsedArgs): Action {
       payload: stringFlag(args, "payload"),
     };
   }
-  if (action === "hermes") {
-    return {
-      kind: "hermes",
-      invoke: requiredFlag(args, "invoke", "Hermes actions require --invoke <name-or-url>"),
-      payload: stringFlag(args, "payload"),
-      timeout: stringFlag(args, "timeout"),
-    };
-  }
-  if (action === "honeybee-flow" || (action === "honeybee" && stringFlag(args, "run") === "flow")) {
-    return {
-      kind: "honeybee",
-      run: "flow",
-      flow: requiredFlag(args, "flow", "Honeybee flow actions require --flow <name>"),
-      args: keyValueRecord(flagValues(args, "arg")),
-    };
-  }
-  if (action === "honeybee-loop" || (action === "honeybee" && stringFlag(args, "run") === "loop")) {
-    return {
-      kind: "honeybee",
-      run: "loop",
-      loop: keyValueJsonRecord(flagValues(args, "loop")),
-    };
-  }
   if (action === "honeybee-spawn" || (action === "honeybee" && stringFlag(args, "run") === "spawn")) {
     return {
       kind: "honeybee",
@@ -1709,7 +1497,6 @@ function actionFromFlags(args: ParsedArgs): Action {
       home: stringFlag(args, "home"),
       cwd: stringFlag(args, "cwd"),
       yolo: args.flags.yolo === true ? true : args.flags["no-yolo"] === true ? false : undefined,
-      acceptTrust: args.flags["accept-trust"] === true ? true : args.flags["no-accept-trust"] === true ? false : undefined,
       args: flagValues(args, "bee-arg"),
       message: stringFlag(args, "message") ?? stringFlag(args, "prompt"),
       timeout: stringFlag(args, "timeout"),
@@ -1724,20 +1511,6 @@ function actionFromFlags(args: ParsedArgs): Action {
       timeout: stringFlag(args, "timeout"),
     };
   }
-  if (action === "honeybee-buz" || (action === "honeybee" && stringFlag(args, "run") === "buz")) {
-    const tier = stringFlag(args, "tier");
-    if (tier && tier !== "interrupt" && tier !== "queue" && tier !== "passive") throw new Error("--tier must be interrupt, queue, or passive");
-    return {
-      kind: "honeybee",
-      run: "buz",
-      target: requiredFlag(args, "target", "Honeybee buz actions require --target <bee>"),
-      message: requiredFlag(args, "message", "Honeybee buz actions require --message <text>"),
-      tier: tier as "interrupt" | "queue" | "passive" | undefined,
-      subject: stringFlag(args, "subject"),
-      senderHuman: stringFlag(args, "sender-human"),
-      timeout: stringFlag(args, "timeout"),
-    };
-  }
   if (action === "honeybee-kill" || (action === "honeybee" && stringFlag(args, "run") === "kill")) {
     return {
       kind: "honeybee",
@@ -1746,7 +1519,11 @@ function actionFromFlags(args: ParsedArgs): Action {
       timeout: stringFlag(args, "timeout"),
     };
   }
-  throw new Error("Create requires --action <command|http|emit|hermes|honeybee-flow|honeybee-loop|honeybee-spawn|honeybee-send|honeybee-buz|honeybee-kill> or --action-json");
+  const removed = action === "hermes"
+    ? removedActionMessage("hermes")
+    : removedActionMessage("honeybee", action === "honeybee" ? stringFlag(args, "run") : action?.replace(/^honeybee-/, ""));
+  if (removed) throw new Error(removed);
+  throw new Error("Create requires --action <command|http|emit|honeybee-spawn|honeybee-send|honeybee-kill> or --action-json");
 }
 
 function routerFromFlags(args: ParsedArgs): RouterConfig | undefined {
@@ -1813,8 +1590,6 @@ function parseScalar(value: string): JsonValue {
 
 const BOOLEAN_FLAGS = new Set([
   "json",
-  "sidebar",
-  "toggle-sidebar",
   "enabled",
   "disabled",
   "dry-run",
@@ -1825,14 +1600,11 @@ const BOOLEAN_FLAGS = new Set([
   "install-webhook",
   "yolo",
   "no-yolo",
-  "accept-trust",
-  "no-accept-trust",
 ]);
 
 const VALUE_FLAGS = new Set([
   "action",
   "action-json",
-  "arg",
   "base-url",
   "bee",
   "bee-arg",
@@ -1858,14 +1630,11 @@ const VALUE_FLAGS = new Set([
   "fetch-method",
   "filter",
   "filter-json",
-  "flow",
   "header",
   "home",
-  "invoke",
   "keep-last",
   "last",
   "lines",
-  "loop",
   "max-age",
   "max-batch",
   "max-concurrent",
@@ -1890,23 +1659,19 @@ const VALUE_FLAGS = new Set([
   "router-json",
   "run",
   "secret",
-  "sender-human",
   "source",
   "source-json",
   "static",
   "status",
   "subject",
-  "tab",
   "tag",
   "target",
-  "tier",
   "timeout",
   "timezone",
   "transform",
   "trigger",
   "ttl",
   "url",
-  "width",
   "window",
 ]);
 
@@ -2150,8 +1915,6 @@ async function printHelp(): Promise<void> {
       ["jobs [--status <s>] [--last 100]", "list recent jobs"],
       ["jobs gc [--max-age 14d] [--keep-last 50] [--max-per-trigger 500] [--max-total 20000] [--dry-run]", "remove terminal job files by age and by the configured per-trigger and total caps (flags override config)"],
       ["job <jobId> | job cancel <id>", "inspect or cancel a job"],
-      ["sidebar [--tab <t>]", "live TUI: triggers, active jobs, history (cmd+option+B)"],
-      ["sidebar --toggle-sidebar", "open/close the tmux sidebar pane on the right"],
       ["bindings [--trigger <id>]", "list router subject→target bindings"],
       ["bindings get <id>", "inspect a router binding"],
       ["routers [list]", "list built-in and user-space router plugins"],

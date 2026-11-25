@@ -2,7 +2,9 @@ import http from "node:http";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { ActionExecutor, DeliveryManager, resolveContext } from "../src/index.js";
+import { ActionExecutor } from "../src/actions.js";
+import { resolveContext } from "../src/context.js";
+import { DeliveryManager } from "../src/delivery.js";
 import { installCommandStub, installHiveStub, trigger, waitForJobs, waitForTerminalJobs, withTempStore } from "./helpers.js";
 
 describe("delivery manager", () => {
@@ -442,51 +444,6 @@ describe("context and actions", () => {
     });
   });
 
-  test("honeybee and hermes actions invoke their CLIs without in-process execution", async () => {
-    await withTempStore(async (store, root) => {
-      const hive = await installHiveStub(root);
-      const hiveLog = hive.logPath;
-      const hermesLog = join(root, "hermes.log");
-      const hermesStub = await installCommandStub(root, "hermes", `#!/bin/sh\necho "$@" >> "${hermesLog}"\ncat >/dev/null\n`, hermesLog);
-      try {
-        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
-        const flow = trigger({
-          id: "flow",
-          action: { kind: "honeybee", run: "flow", flow: "review", args: { topic: "{{topic}}" } },
-          context: { static: { topic: "auth" } },
-        });
-        // flows/loops were retired in the hive v2 cutover (2026-08-19):
-        // the actions now fail LOUDLY with rewrite guidance and never shell
-        // out to hive — a silent unknown-verb spawn would be worse.
-        const flowActivation = { triggerId: "flow", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-        const flowJob = await executor.createQueuedJob(flow, flowActivation, [{}]);
-        await store.saveJob(flowJob);
-        const flowResult = await executor.executeJob(flowJob, flow, flowActivation, [{}]);
-        expect(flowResult.status).toBe("errored");
-        expect(String(flowResult.error ?? "")).toMatch(/honeybee-flow is a pre-reset action/);
-
-        const loop = trigger({ id: "loop", action: { kind: "honeybee", run: "loop", loop: { bee: "codex", cwd: root, max: 2 } } });
-        const loopActivation = { triggerId: "loop", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-        const loopJob = await executor.createQueuedJob(loop, loopActivation, [{}]);
-        await store.saveJob(loopJob);
-        const loopResult = await executor.executeJob(loopJob, loop, loopActivation, [{}]);
-        expect(loopResult.status).toBe("errored");
-        expect(String(loopResult.error ?? "")).toMatch(/honeybee-loop is a pre-reset action/);
-        expect(await readFile(hiveLog, "utf8").catch(() => "")).not.toContain("flow run");
-        expect(await readFile(hiveLog, "utf8").catch(() => "")).not.toContain("loop start");
-
-        const hermes = trigger({ id: "hermes", action: { kind: "hermes", invoke: "respond", payload: '{"ok":true}' } });
-        const hermesActivation = { triggerId: "hermes", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-        const hermesJob = await executor.createQueuedJob(hermes, hermesActivation, [{}]);
-        await store.saveJob(hermesJob);
-        expect((await executor.executeJob(hermesJob, hermes, hermesActivation, [{}])).status).toBe("completed");
-        expect(await readFile(hermesLog, "utf8")).toContain("respond");
-      } finally {
-        hermesStub.restore();
-        hive.restore();
-      }
-    });
-  });
 });
 
 function forgetRuntimeQueue(delivery: DeliveryManager, triggerId: string): void {

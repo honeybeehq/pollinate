@@ -1,6 +1,8 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, test } from "vitest";
-import { ActionExecutor, DeliveryManager, WebhookServer } from "../src/index.js";
+import { ActionExecutor } from "../src/actions.js";
+import { DeliveryManager } from "../src/delivery.js";
+import { WebhookServer } from "../src/webhook.js";
 import { trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
 
 async function withServer(

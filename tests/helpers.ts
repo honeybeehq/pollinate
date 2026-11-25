@@ -1,7 +1,8 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
-import { PollinateStore, type Job, type JobStatus, type Trigger } from "../src/index.js";
+import { PollinateStore } from "../src/store.js";
+import type { Job, JobStatus, Trigger } from "../src/types.js";
 
 const pathStubRefs = new Map<string, number>();
 
@@ -93,7 +94,7 @@ export async function installHiveStub(root: string, options: { script?: string }
 export async function installCommandStub(root: string, name: string, script: string, logPath = join(root, `${name}.log`)): Promise<CommandStub> {
   const binDir = join(root, "bin");
   await mkdir(binDir, { recursive: true });
-  await writeFile(join(binDir, name), name === "hermes" ? script : stripNoopStdinDrain(script));
+  await writeFile(join(binDir, name), stripNoopStdinDrain(script));
   await chmod(join(binDir, name), 0o700);
   const refs = pathStubRefs.get(binDir) ?? 0;
   if (refs === 0 && !pathParts(process.env.PATH).includes(binDir)) process.env.PATH = [binDir, ...pathParts(process.env.PATH)].join(delimiter);

@@ -1,7 +1,9 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { PollinateDaemon, type PollinateStore, type RouterBinding, type Trigger } from "../src/index.js";
+import { PollinateDaemon } from "../src/daemon.js";
+import type { PollinateStore } from "../src/store.js";
+import type { RouterBinding, Trigger } from "../src/types.js";
 import { trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
 
 async function waitForLedgerEvent(

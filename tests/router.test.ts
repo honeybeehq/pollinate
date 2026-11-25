@@ -1,7 +1,11 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { ActionExecutor, DeliveryManager, WebhookServer, githubPrRouterPlugin, routerPluginsDir } from "../src/index.js";
+import { ActionExecutor } from "../src/actions.js";
+import { DeliveryManager } from "../src/delivery.js";
+import { routerPluginsDir } from "../src/fsx.js";
+import { githubPrRouterPlugin } from "../src/router-plugins/github-pr.js";
+import { WebhookServer } from "../src/webhook.js";
 import { installHiveStub, trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
 
 describe("github-pr router plugin", () => {
@@ -308,11 +312,9 @@ export default {
             },
             onActivity: {
               kind: "honeybee",
-              run: "buz",
+              run: "send",
               target: "{{binding.target}}",
-              tier: "queue",
-              subject: "{{event_kind}}",
-              message: "{{activity_markdown}}",
+              message: "[{{event_kind}}] {{activity_markdown}}",
             },
             onClose: {
               kind: "honeybee",
@@ -437,7 +439,7 @@ export default {
           expect(log.match(/--agent codex/g)).toHaveLength(2);
           expect(log.match(/stop pr-trmd-pollinate-123/g)).toHaveLength(2);
           expect(log).toContain("send pr-trmd-pollinate-123 Review trmd/pollinate#123: Add router");
-          expect(log).toContain("buz send pr-trmd-pollinate-123 --sender-human pollinate --tier queue -p [github.issue_comment.created]");
+          expect(log).toContain("send pr-trmd-pollinate-123 [github.issue_comment.created]");
           expect(log).toContain("stop pr-trmd-pollinate-123");
           const ledger = (await store.readLedger()).map((line) => JSON.parse(line) as Record<string, unknown>);
           expect(ledger).toEqual(

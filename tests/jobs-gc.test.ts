@@ -1,7 +1,9 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { jobsDir, ledgerPath, readJobSummary, rotateLedgerIfLarge, type Job, type JobStatus } from "../src/index.js";
+import { jobsDir, ledgerPath, rotateLedgerIfLarge } from "../src/fsx.js";
+import { readJobSummary } from "../src/job-scan.js";
+import type { Job, JobStatus } from "../src/types.js";
 import { withTempStore } from "./helpers.js";
 
 function isoAgo(ms: number): string {

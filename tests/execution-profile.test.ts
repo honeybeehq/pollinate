@@ -1,11 +1,8 @@
 import { describe, expect, test } from "vitest";
-import {
-  ActionExecutor,
-  PollEngine,
-  parseDaemonConfigToml,
-  fetchPoll,
-  type ExecutionProfile,
-} from "../src/index.js";
+import { ActionExecutor } from "../src/actions.js";
+import { parseDaemonConfigToml } from "../src/config.js";
+import { PollEngine, fetchPoll } from "../src/poll.js";
+import type { ExecutionProfile } from "../src/types.js";
 import { DeliveryManager } from "../src/delivery.js";
 import { trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
 

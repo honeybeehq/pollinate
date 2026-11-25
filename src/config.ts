@@ -3,7 +3,6 @@ import { parse, stringify } from "smol-toml";
 import type {
   Action,
   ActionStep,
-  BuzTier,
   ContextSource,
   ContextResolver,
   DaemonConfig,
@@ -11,7 +10,6 @@ import type {
   DeliveryMode,
   Filter,
   ExecutionProfile,
-  JsonValue,
   PollCursor,
   PollFetch,
   PollSpec,
@@ -351,9 +349,6 @@ function normalizeRouter(raw: AnyRecord | undefined): RouterConfig | undefined {
   const onActivity = normalizeAction(asRecord(raw.onActivity ?? raw.on_activity, "trigger.router.onActivity"));
   const onCloseRaw = asOptionalRecord(raw.onClose ?? raw.on_close);
   const onClose = onCloseRaw ? normalizeAction(onCloseRaw) : undefined;
-  if ([onOpen, onActivity, onClose].some((action) => action && containsCombAction(action))) {
-    throw new Error("Comb actions are not supported in router actions until run bindings land");
-  }
   return {
     plugin,
     openOn,
@@ -366,13 +361,35 @@ function normalizeRouter(raw: AnyRecord | undefined): RouterConfig | undefined {
   };
 }
 
-function containsCombAction(action: Action): boolean {
-  if (action.kind === "honeybee") return action.run === "comb";
-  return action.kind === "sequence" && action.actions.some((step) => containsCombAction(step.action));
+const REMOVED_HONEYBEE_RUNS = new Map([
+  ["buz", 'use run = "send" instead.'],
+  ["comb", 'schedule a run = "spawn" or run = "send" instead.'],
+  ["flow", 'schedule a run = "spawn" or run = "send" instead.'],
+  ["loop", 'schedule a run = "spawn" or run = "send" instead.'],
+]);
+
+export function removedActionMessage(kind: string, run?: string): string | undefined {
+  if (kind === "hermes") return 'action kind "hermes" was removed from Pollinate; use a "command" action that runs hermes instead.';
+  const replacement = kind === "honeybee" && run !== undefined ? REMOVED_HONEYBEE_RUNS.get(run) : undefined;
+  return replacement ? `honeybee run "${run}" was removed from Pollinate; ${replacement}` : undefined;
+}
+
+export function removedActionMessageIn(action: Action | undefined): string | undefined {
+  if (!action) return undefined;
+  if (action.kind === "sequence") {
+    for (const step of action.actions ?? []) {
+      const message = removedActionMessageIn(step.action);
+      if (message) return message;
+    }
+    return undefined;
+  }
+  return removedActionMessage(action.kind, (action as { run?: string }).run);
 }
 
 function normalizeAction(raw: AnyRecord): Action {
   const kind = stringOr(raw.kind, "");
+  const removed = removedActionMessage(kind, optionalString(raw.run));
+  if (removed) throw new Error(removed);
   if (kind === "sequence") {
     const mode = optionalString(raw.mode) ?? "serial";
     if (mode !== "serial" && mode !== "parallel") throw new Error(`Unsupported sequence mode: ${mode}`);
@@ -408,35 +425,6 @@ function normalizeAction(raw: AnyRecord): Action {
   }
   if (kind === "honeybee") {
     const run = stringOr(raw.run, "");
-    if (run === "comb") {
-      const comb = requiredLiteralString(raw.comb, "trigger.action.comb");
-      const product = requiredLiteralString(raw.product, "trigger.action.product");
-      const version = Number(raw.version);
-      if (!Number.isSafeInteger(version) || version <= 0) {
-        throw new Error("trigger.action.version must be a positive safe integer");
-      }
-      const collision = optionalString(raw.collision);
-      if (collision !== undefined && collision !== "refuse" && collision !== "join-existing") {
-        throw new Error(`Unsupported Comb collision mode: ${collision}`);
-      }
-      if (raw.input === undefined) throw new Error("Missing required table: trigger.action.input");
-      const input = normalizeJsonObject(asRecord(raw.input, "trigger.action.input"), "trigger.action.input");
-      return {
-        kind,
-        run,
-        comb,
-        version,
-        product,
-        input,
-        ...(collision ? { collision } : {}),
-      };
-    }
-    if (run === "flow") {
-      return { kind, run, flow: requiredString(raw.flow, "trigger.action.flow"), args: stringRecord(asOptionalRecord(raw.args)) };
-    }
-    if (run === "loop") {
-      return { kind, run, loop: (asOptionalRecord(raw.loop) ?? {}) as Record<string, JsonValue> };
-    }
     if (run === "spawn") {
       return {
         kind,
@@ -447,7 +435,6 @@ function normalizeAction(raw: AnyRecord): Action {
         home: optionalString(raw.home),
         cwd: optionalString(raw.cwd),
         yolo: optionalBoolean(raw.yolo),
-        acceptTrust: optionalBoolean(raw.acceptTrust ?? raw.accept_trust),
         args: stringArray(raw.args ?? raw.beeArgs ?? raw.bee_args),
         message: optionalString(raw.message ?? raw.prompt),
         timeout: optionalString(raw.timeout),
@@ -462,25 +449,10 @@ function normalizeAction(raw: AnyRecord): Action {
         timeout: optionalString(raw.timeout),
       };
     }
-    if (run === "buz") {
-      return {
-        kind,
-        run,
-        target: requiredString(raw.target, "trigger.action.target"),
-        message: requiredString(raw.message ?? raw.prompt, "trigger.action.message"),
-        tier: normalizeBuzTier(raw.tier),
-        subject: optionalString(raw.subject),
-        senderHuman: optionalString(raw.senderHuman ?? raw.sender_human),
-        timeout: optionalString(raw.timeout),
-      };
-    }
     if (run === "kill") {
       return { kind, run, target: requiredString(raw.target, "trigger.action.target"), timeout: optionalString(raw.timeout) };
     }
     throw new Error(`Unsupported honeybee run mode: ${run || "(missing)"}`);
-  }
-  if (kind === "hermes") {
-    return { kind, invoke: requiredString(raw.invoke, "trigger.action.invoke"), payload: optionalString(raw.payload), timeout: optionalString(raw.timeout) };
   }
   if (kind === "emit") {
     return { kind, subject: requiredString(raw.subject, "trigger.action.subject"), payload: optionalString(raw.payload) };
@@ -507,13 +479,6 @@ function eventList(value: unknown, label: string): string[] {
   const list = stringArray(value).filter((item) => item.length > 0);
   if (list.length === 0) throw new Error(`Missing required event list: ${label}`);
   return list;
-}
-
-function normalizeBuzTier(value: unknown): BuzTier | undefined {
-  if (value === undefined) return undefined;
-  const tier = String(value);
-  if (tier === "interrupt" || tier === "queue" || tier === "passive") return tier;
-  throw new Error(`Unsupported buz tier: ${tier}`);
 }
 
 function normalizeMissedFirePolicy(value: unknown): ScheduleTiming["missedFirePolicy"] | undefined {
@@ -642,31 +607,6 @@ function requiredString(value: unknown, label: string): string {
   const out = optionalString(value);
   if (!out) throw new Error(`Missing required string: ${label}`);
   return out;
-}
-
-function requiredLiteralString(value: unknown, label: string): string {
-  const out = requiredString(value, label);
-  if (out.includes("{{") || out.includes("}}")) {
-    throw new Error(`${label} must be literal and cannot contain template placeholders`);
-  }
-  return out;
-}
-
-function normalizeJsonObject(value: AnyRecord, label: string): Record<string, JsonValue> {
-  return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [key, normalizeJsonValue(item, `${label}.${key}`)]),
-  );
-}
-
-function normalizeJsonValue(value: unknown, label: string): JsonValue {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error(`Expected finite JSON number at ${label}`);
-    return value;
-  }
-  if (Array.isArray(value)) return value.map((item, index) => normalizeJsonValue(item, `${label}[${index}]`));
-  if (typeof value === "object") return normalizeJsonObject(value as AnyRecord, label);
-  throw new Error(`Expected JSON value at ${label}`);
 }
 
 function optionalString(value: unknown): string | undefined {

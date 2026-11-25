@@ -31,9 +31,6 @@ export function detectColorLevel(env: NodeJS.ProcessEnv = process.env, stream: S
     else return 3;
   }
   if (POLLINATE_NO_COLOR !== undefined && POLLINATE_NO_COLOR !== "") return 0;
-  // NO_COLOR often leaks from non-interactive Codex/tooling parents into tmux.
-  // Keep honoring it outside tmux; inside tmux use POLLINATE_NO_COLOR for an
-  // intentional no-color override.
   if (!TMUX && NO_COLOR !== undefined && NO_COLOR !== "") return 0;
   if (!stream.isTTY) return 0;
   if (!TMUX && TERM === "dumb") return 0;

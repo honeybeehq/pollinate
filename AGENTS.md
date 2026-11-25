@@ -412,6 +412,8 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 `event`. Stream with `pol ledger --follow`.
 
 - `pollinate.trigger.{added,enabled,disabled,removed}`
+- `pollinate.trigger.invalid` (a trigger file that fails to load, e.g. one
+  using a removed action kind; once per file change, keyed on path and mtime)
 - `pollinate.job.{queued,started,completed,errored,cancelled,hive_starting}`
 - `pollinate.delivery.{filtered,throttled}`
 - `pollinate.schedule.{fired,missed}` · `pollinate.poll.{checked,detected,errored}`
@@ -421,8 +423,6 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 - `pollinate.router.plugin.created` · `pollinate.github.webhook.installed`
 - `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored,crash_loop}`
 - `pollinate.jobs.{gc,store_warning}` · `pollinate.ledger.rotated` (job/ledger retention, see Job retention)
-- `pollinate.comb.run_started` (fresh created runs only; joined/replayed
-  deliveries do not emit it)
 - `pollinate.emit` (from `emit` actions)
 
 ## Job IDs

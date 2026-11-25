@@ -62,9 +62,12 @@ type LedgerCache = {
   partial: string;
 };
 
+type InvalidTriggerFile = { path: string; signature: string; message: string };
+
 export class PollinateStore {
   readonly root: string;
   private ledgerCache?: LedgerCache;
+  private readonly warnedInvalidTriggers = new Map<string, string>();
   onJobAllocated?: (triggerId: string) => void;
 
   constructor(root = storeRoot()) {
@@ -101,6 +104,10 @@ export class PollinateStore {
 
   scheduleStatePath(): string {
     return join(stateDir(this.root), "schedule-state.json");
+  }
+
+  invalidTriggersStatePath(): string {
+    return join(stateDir(this.root), "invalid-triggers.json");
   }
 
   deliveryStatePath(): string {
@@ -159,6 +166,7 @@ export class PollinateStore {
     const entries = await readdir(triggerDir(this.root)).catch(() => []);
     const triggers: Trigger[] = [];
     const seen = new Set<string>();
+    const invalid: InvalidTriggerFile[] = [];
     for (const entry of entries.filter((item) => item.endsWith(".toml")).sort()) {
       const path = join(triggerDir(this.root), entry);
       try {
@@ -171,11 +179,35 @@ export class PollinateStore {
         triggers.push(trigger);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[pollinate] Skipping trigger file ${path}: ${message}`);
+        const info = await stat(path).catch(() => undefined);
+        if (!info) continue;
+        invalid.push({
+          path,
+          signature: `${info.mtimeMs}:${info.size}`,
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
     }
+    await this.reportInvalidTriggerFiles(invalid);
     return triggers;
+  }
+
+  private async reportInvalidTriggerFiles(invalid: InvalidTriggerFile[]): Promise<void> {
+    if (invalid.length === 0) return;
+    for (const file of invalid) {
+      if (this.warnedInvalidTriggers.get(file.path) === file.signature) continue;
+      this.warnedInvalidTriggers.set(file.path, file.signature);
+      console.warn(`[pollinate] Skipping trigger file ${file.path}: ${file.message}`);
+    }
+    const statePath = this.invalidTriggersStatePath();
+    const recorded = await readJsonOr<Record<string, string>>(statePath, {});
+    const unrecorded = invalid.filter((file) => recorded[file.path] !== file.signature);
+    const stale = Object.keys(recorded).some((path) => !invalid.some((file) => file.path === path));
+    if (unrecorded.length === 0 && !stale) return;
+    await writeJson(statePath, Object.fromEntries(invalid.map((file) => [file.path, file.signature])));
+    for (const file of unrecorded) {
+      await this.appendLedger({ event: "pollinate.trigger.invalid", trigger_id: idFromPath(file.path), path: file.path, error: file.message });
+    }
   }
 
   async getTrigger(id: string): Promise<Trigger | null> {

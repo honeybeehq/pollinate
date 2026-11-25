@@ -1,11 +1,5 @@
 import { describe, expect, test } from "vitest";
-import {
-  RELAY_SIGNATURE_HEADER,
-  RELAY_TIMESTAMP_HEADER,
-  SatelliteServer,
-  relaySignatureHeaders,
-  validRelaySignature,
-} from "../src/index.js";
+import { RELAY_SIGNATURE_HEADER, RELAY_TIMESTAMP_HEADER, SatelliteServer, relaySignatureHeaders, validRelaySignature } from "../src/satellite.js";
 
 describe("satellite relay signatures", () => {
   test("rejects expired, future, and missing relay timestamps", () => {

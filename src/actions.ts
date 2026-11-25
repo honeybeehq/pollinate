@@ -2,11 +2,10 @@ import type { Action, Activation, DryRunResult, ExecutionProfile, Job, JsonValue
 import type { PollinateStore } from "./store.js";
 import { resolveContext } from "./context.js";
 import { renderAction, renderString } from "./templates.js";
-import { execArgv, execShell, type ExecResult } from "./process.js";
+import { execShell, type ExecResult } from "./process.js";
 import { DEFAULT_HIVE_STARTING_WAIT_MS, execHive, withHiveStartingObserver, type HiveStartingObserver } from "./hive-exec.js";
 import { nowIso, parseDuration } from "./time.js";
 import { executeRouter } from "./router.js";
-import { CombActionError, executeCombRun } from "./comb-transport.js";
 
 export type ActionExecutorOptions = {
   contextTimeoutMs: number;
@@ -129,7 +128,7 @@ export class ActionExecutor {
       await this.store.appendLedger({ event: "pollinate.job.started", job_id: job.id, trigger_id: trigger.id, action_kind: rendered.action.kind, cwd: rendered.cwd });
       const result = await this.executeAction(rendered.action, rendered.cwd, {
         triggerId: trigger.id,
-        deliveryId: combDeliveryId(job, activation),
+        deliveryId: activationDeliveryId(job, activation),
       });
       const completed = await this.store.updateJob(job.id, {
         status: result.timedOut ? "timed-out" : "completed",
@@ -147,10 +146,8 @@ export class ActionExecutor {
       return completed;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const combResult = error instanceof CombActionError ? error.result : undefined;
       const errored = await this.store.updateJob(job.id, {
         status: "errored",
-        ...(combResult ? { result: combResult } : {}),
         error: message,
         completedAt: nowIso(),
       });
@@ -159,7 +156,6 @@ export class ActionExecutor {
         job_id: job.id,
         trigger_id: trigger.id,
         error: message,
-        ...(combResult ? { retryable: combResult.retryable, comb_error: combResult.error } : {}),
       });
       return errored;
     }
@@ -261,9 +257,6 @@ export class ActionExecutor {
     if (action.kind === "honeybee") {
       return this.executeHoneybee(action, cwd, executionContext);
     }
-    if (action.kind === "hermes") {
-      return this.executeHermes(action, cwd);
-    }
     if (action.kind === "emit") {
       let payload: JsonValue | string | undefined = action.payload;
       if (action.payload) {
@@ -333,46 +326,12 @@ export class ActionExecutor {
     cwd?: string,
     executionContext?: ActionExecutionContext,
   ): Promise<ActionResult> {
-    if (action.run === "comb") {
-      if (!executionContext) throw new Error("Comb actions require Pollinate trigger provenance");
-      const result = await executeCombRun(action, cwd, executionContext, {
-        timeoutMs: this.options.commandTimeoutMs,
-        execution: this.options.execution,
-        hiveStartingWaitMs: this.hiveStartingWaitMs,
-      });
-      if (result.created && !result.replayedDelivery) {
-        await this.store.appendLedger({
-          event: "pollinate.comb.run_started",
-          trigger_id: executionContext.triggerId,
-          delivery_id: executionContext.deliveryId,
-          event_id: executionContext.deliveryId,
-          comb: action.comb,
-          version: action.version,
-          run_id: result.runId,
-        });
-      }
-      return result;
-    }
-    if (action.run === "flow") {
-      // hive flows were retired in the v2 cutover (2026-08-19): the reset has
-      // no flow engine. Loud refusal beats a silent unknown-verb spawn.
-      throw new Error(
-        "honeybee-flow is a pre-reset action: hive flows no longer exist (v2 cutover 2026-08-19). " +
-          "Rewrite this trigger to run=spawn (a coordinator bee owns the fan-out) or run=send.",
-      );
-    }
-    if (action.run === "loop") {
-      throw new Error(
-        "honeybee-loop is a pre-reset action: hive loops no longer exist (v2 cutover 2026-08-19). " +
-          "Rewrite this trigger to run=spawn with a self-looping prompt, or a schedule trigger + run=send.",
-      );
-    }
     if (action.run === "spawn") {
       const spawnCwd = action.cwd ?? cwd;
       // v2 grammar (cutover 2026-08-19): name is positional, harness is
       // --agent, colonies become tags, a home IS an account id, and --yolo
       // maps to the harness's own bypass flag as a per-bee arg (kept across
-      // revives). acceptTrust is moot — v2 seeds harness trust at spawn.
+      // revives).
       const name = action.name ?? `pol-${(executionContext?.deliveryId ?? Date.now().toString(36)).replace(/[^A-Za-z0-9._:-]+/g, "-")}`;
       const v2Args = ["spawn", name, "--agent", action.bee, "--json"];
       if (spawnCwd) v2Args.push("--cwd", spawnCwd);
@@ -396,25 +355,6 @@ export class ActionExecutor {
     if (action.run === "send") {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
       return this.execHive(["send", action.target, action.message], "hive send", { cwd, timeoutMs });
-    }
-    if (action.run === "buz") {
-      const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      // v2's buz compat has no --subject; fold it into the body. Tiers map
-      // onto delivery urgency daemon-side (interrupt→now, next-tool→next,
-      // queue/passive→idle).
-      const message = action.subject ? `[${action.subject}] ${action.message}` : action.message;
-      const args = [
-        "buz",
-        "send",
-        action.target,
-        "--sender-human",
-        action.senderHuman ?? "pollinate",
-        "--tier",
-        action.tier ?? "queue",
-        "-p",
-        message,
-      ];
-      return this.execHive(args, "hive buz send", { cwd, timeoutMs });
     }
     if (action.run === "kill") {
       // v2 split kill into stop (end the process; the bee stays revivable)
@@ -443,23 +383,6 @@ export class ActionExecutor {
     return { ...result };
   }
 
-  private executeHermes(action: Extract<Action, { kind: "hermes" }>, cwd?: string): Promise<ActionResult> {
-    if (/^https?:\/\//.test(action.invoke)) {
-      return this.executeAction({
-        kind: "http",
-        method: "POST",
-        url: action.invoke,
-        headers: { "content-type": "application/json" },
-        body: action.payload ?? "{}",
-        timeout: action.timeout,
-      }, cwd);
-    }
-    const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-    return execArgv("hermes", [action.invoke], { cwd, input: action.payload, timeoutMs, execution: this.options.execution }).then((result) => {
-      if (result.exitCode !== 0) throw new Error(`hermes exited ${result.exitCode}: ${result.stderr.trim()}`);
-      return { ...result };
-    });
-  }
 }
 
 /** Build an ActionExecutor from the store's daemon config (timeouts + shell). */
@@ -475,8 +398,7 @@ export async function createExecutor(store: PollinateStore): Promise<ActionExecu
 
 /**
  * Fire a trigger immediately with the given payload: queue a job, ledger it, run
- * it to completion, and return the terminal job. Shared by `pol trigger`, the
- * sidebar's run-now/duplicate actions, and tests — so the manual-fire path lives
+ * it to completion, and return the terminal job. Shared by `pol trigger` and tests — so the manual-fire path lives
  * in one place. `executor` may be injected to reuse a configured instance.
  */
 export async function fireTriggerNow(
@@ -536,19 +458,11 @@ export function isValidHiveHandle(value: string | undefined): value is string {
   return Boolean(value && HIVE_HANDLE_RE.test(value) && !value.endsWith(":"));
 }
 
-export function parseHiveHandle(stdout: string): string | undefined {
-  for (const line of stdout.split(/\r?\n/)) {
-    const token = line.trim().split(/\s+/)[0];
-    if (isValidHiveHandle(token)) return token;
-  }
-  return undefined;
-}
-
 export function sourceKindForTrigger(trigger: Trigger, fallback: SourceKind = "manual"): SourceKind {
   return trigger.source.kind === "manual" ? fallback : trigger.source.kind;
 }
 
-function combDeliveryId(job: Job, activation: Activation): string {
+function activationDeliveryId(job: Job, activation: Activation): string {
   const providerDeliveryId = activation.metadata?.deliveryId;
   if (!providerDeliveryId) return job.uuid ?? job.id;
   return `pollinate:${job.triggerId}:${activation.source}:${encodeURIComponent(providerDeliveryId)}`;

@@ -37,15 +37,15 @@ mode = "immediate"
 maxConcurrent = 4
 
 [trigger.action]
-kind = "hermes"
-invoke = "respond-to-message"
+kind = "emit"
+subject = "telegram.message"
 payload = '{"text":"{{text}}","chat":"{{chat_id}}"}'
 `);
     expect(trigger.id).toBe("telegram-inbound");
     expect(trigger.source.kind).toBe("webhook");
     expect(trigger.cwd).toBe("/tmp/pollinate-repo");
     expect(trigger.delivery.maxConcurrent).toBe(4);
-    expect(trigger.action.kind).toBe("hermes");
+    expect(trigger.action.kind).toBe("emit");
     expect(triggerToToml(trigger)).toContain('cwd = "/tmp/pollinate-repo"');
   });
 
@@ -79,7 +79,7 @@ message = "Review {{repo}}#{{pr_number}}"
 
 [trigger.router.onActivity]
 kind = "honeybee"
-run = "buz"
+run = "send"
 target = "{{binding.target}}"
 message = "{{activity_markdown}}"
 

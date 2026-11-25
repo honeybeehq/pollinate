@@ -1,7 +1,10 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { ledgerPath, PollinateDaemon, PollinateStore, type Job, type JobStatus } from "../src/index.js";
+import { PollinateDaemon } from "../src/daemon.js";
+import { ledgerPath } from "../src/fsx.js";
+import { PollinateStore } from "../src/store.js";
+import type { Job, JobStatus } from "../src/types.js";
 import { withTempStore } from "./helpers.js";
 
 async function waitForLedgerEvent(

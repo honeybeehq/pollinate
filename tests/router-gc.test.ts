@@ -1,6 +1,9 @@
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { ActionExecutor, gcRouterBindings, routerGcSummary, routerPluginsDir, type RouterBinding, type Trigger } from "../src/index.js";
+import { ActionExecutor } from "../src/actions.js";
+import { routerPluginsDir } from "../src/fsx.js";
+import { gcRouterBindings, routerGcSummary } from "../src/router-gc.js";
+import type { RouterBinding, Trigger } from "../src/types.js";
 import { writeFile } from "node:fs/promises";
 import { installCommandStub, installHiveStub, trigger, withTempStore } from "./helpers.js";
 

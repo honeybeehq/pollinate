@@ -3,20 +3,12 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import {
-  ActionExecutor,
-  DeliveryManager,
-  PollEngine,
-  SatelliteServer,
-  WebhookServer,
-  detectDelta,
-  fetchPoll,
-  relaySignatureHeaders,
-  validRelaySignature,
-  validSignature,
-  applyWebhookTransform,
-  type CursorState,
-} from "../src/index.js";
+import { ActionExecutor } from "../src/actions.js";
+import { DeliveryManager } from "../src/delivery.js";
+import { PollEngine, detectDelta, fetchPoll } from "../src/poll.js";
+import { SatelliteServer, relaySignatureHeaders, validRelaySignature } from "../src/satellite.js";
+import type { CursorState } from "../src/types.js";
+import { WebhookServer, validSignature, applyWebhookTransform } from "../src/webhook.js";
 import { trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
 
 describe("poll cursors", () => {
