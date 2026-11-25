@@ -199,12 +199,17 @@ async function checkDaemonBuild(ctx: Context, proc: DaemonProcess | undefined): 
   const daemonBuild: BuildCommit | null = started?.commit !== undefined ? { commit: started.commit, dirty: started.dirty ?? null, version: null } : entry ? await readBuildCommit(join(dirname(entry), "build-info.json")) : null;
   const cliCommit = cli?.commit ?? null;
   const daemonCommit = daemonBuild?.commit ?? null;
+  const askedByDaemon = ctx.daemon.pid === process.pid;
   if (!daemonCommit || !cliCommit) {
-    add(ctx, "daemon", "commit", "warning", `cannot compare commits: daemon ${short(daemonCommit)}, CLI ${short(cliCommit)}`, { details: { daemon: daemonCommit, cli: cliCommit, entry } });
+    const other = askedByDaemon ? "build on disk" : "CLI";
+    add(ctx, "daemon", "commit", "warning", `cannot compare commits: daemon ${short(daemonCommit)}, ${other} ${short(cliCommit)}`, { details: { daemon: daemonCommit, cli: cliCommit, entry } });
   } else if (daemonCommit !== cliCommit) {
-    add(ctx, "daemon", "commit", "warning", `daemon runs ${short(daemonCommit)}, this CLI is ${short(cliCommit)}; restart the daemon to run the same build`, { details: { daemon: daemonCommit, cli: cliCommit, entry } });
+    const message = askedByDaemon
+      ? `daemon runs ${short(daemonCommit)}, its build on disk is now ${short(cliCommit)}; restart the daemon to run it`
+      : `daemon runs ${short(daemonCommit)}, this CLI is ${short(cliCommit)}; restart the daemon to run the same build`;
+    add(ctx, "daemon", "commit", "warning", message, { details: { daemon: daemonCommit, cli: cliCommit, entry } });
   } else {
-    add(ctx, "daemon", "commit", "ok", `daemon and CLI both run ${short(cliCommit)}`);
+    add(ctx, "daemon", "commit", "ok", askedByDaemon ? `daemon runs ${short(cliCommit)}, the same as its build on disk` : `daemon and CLI both run ${short(cliCommit)}`);
   }
   if (entry) {
     const checkout = await gitCheckoutOf(entry);

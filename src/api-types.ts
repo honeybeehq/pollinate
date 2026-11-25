@@ -1,6 +1,6 @@
 import type { Job, JobStatus, JsonValue, Trigger } from "./types.js";
 
-export const API_FEATURES = ["retry", "baseline", "onFailure", "events"] as const;
+export const API_FEATURES = ["retry", "baseline", "onFailure", "events", "doctor"] as const;
 
 export type ApiFeature = (typeof API_FEATURES)[number];
 

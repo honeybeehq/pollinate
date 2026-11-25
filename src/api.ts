@@ -4,6 +4,7 @@ import { chmod, lstat, unlink } from "node:fs/promises";
 import { parseTriggerRecord, parseTriggerToml } from "./config.js";
 import { EventsRequestError, serveEvents, type TriggerTagIndex } from "./events.js";
 import { MAX_SOCKET_PATH_BYTES, isEnoent } from "./fsx.js";
+import { runDoctor } from "./doctor.js";
 import { isValidStoreId, TriggerExistsError, type PollinateStore } from "./store.js";
 import {
   API_ERROR_STATUS,
@@ -100,7 +101,7 @@ export class ApiServer {
       { method: "GET", pattern: /^\/v1\/jobs\/([^/]+)$/, handle: (request) => this.getJob(request.id) },
       { method: "POST", pattern: /^\/v1\/jobs\/([^/]+)\/cancel$/, handle: (request) => this.cancelJob(request.id) },
       { method: "GET", pattern: /^\/v1\/events$/, stream: (request, response, url) => this.events(request, response, url) },
-      { method: "GET", pattern: /^\/v1\/doctor$/, handle: () => this.unsupported("GET /v1/doctor is not available in this build") },
+      { method: "GET", pattern: /^\/v1\/doctor$/, handle: () => runDoctor(this.host.store) },
     ];
   }
 
@@ -207,10 +208,6 @@ export class ApiServer {
       if (error instanceof EventsRequestError) throw new ApiError("invalid_request", error.message);
       throw error;
     }
-  }
-
-  private unsupported(message: string): Promise<never> {
-    return Promise.reject(new ApiError("unsupported", message));
   }
 
   private async health(): Promise<HealthResponse> {

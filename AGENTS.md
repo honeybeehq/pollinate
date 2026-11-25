@@ -619,7 +619,9 @@ The daemon serves the v1 API (HTTP/1.1 + JSON, `node:http`) on
 reports one line per check. Exit code: `0` clean, `1` warnings only, `2` any
 error. `--json` prints `{store, checkedAt, status, exitCode, counts: {errors,
 warnings}, findings: [{area, check, severity, message, fixable?, details?}],
-fixes?}`. Without `--fix` it writes nothing.
+fixes?}`. Without `--fix` it writes nothing. A running daemon serves the same
+report read-only at `GET /v1/doctor` (see docs/API.md); there its `commit` check
+compares the daemon's start commit with its build on disk.
 
 | area | check | severity |
 |---|---|---|

@@ -29,7 +29,7 @@ Every error answers `{"error": {"code", "message", "details"?}}`.
 | `not_found` | 404 | no such trigger, job or route |
 | `conflict` | 409 | `ifAbsent=1` on an existing id; a duplicate `deliveryId`; firing a disabled trigger; an ambiguous job reference |
 | `poll_failed` | 422 | a poll trigger's first check failed inside `PUT`; nothing was stored |
-| `unsupported` | 501 | a call this build does not serve (`/v1/doctor`); 405 for a wrong method on a known path |
+| `unsupported` | 501 | a call this build does not serve; 405 for a wrong method on a known path |
 | `stopping` | 503 | the daemon is shutting down |
 | `internal` | 500 | anything else; also ledgered as `pollinate.api.errored` |
 
@@ -39,7 +39,7 @@ Every error answers `{"error": {"code", "message", "details"?}}`.
 
 ```json
 {"name":"pollinate","version":"1.0.0","commit":"e8676a50a1415f7c6ea34e229910bef6dd8e240f","api":1,
- "features":["retry","baseline","onFailure","events"],"pid":45937,
+ "features":["retry","baseline","onFailure","events","doctor"],"pid":45937,
  "startedAt":"2026-11-25T11:54:48.261Z","reloadedAt":"2026-11-25T11:54:48.261Z",
  "store":"/tmp/pol-HLr6","triggers":{"total":0,"enabled":0},
  "webhook":{"bind":"127.0.0.1","port":39871,"publicUrl":null},
@@ -228,4 +228,15 @@ See AGENTS.md, Events stream, for generations and rotation.
 
 ### `GET /v1/doctor`
 
-Not served by this build (`501 unsupported`).
+The report `pol doctor --json` prints (see Doctor in AGENTS.md), run by the
+daemon on its store. Read-only: there is no `--fix` over the API. The answer is
+200 whatever the report's `status`; `exitCode` is the exit `pol doctor` would
+give. Run by the daemon, the `commit` check compares the daemon's start commit
+with its build on disk instead of a CLI's.
+
+```json
+{"store":"/tmp/pol-HLr6","checkedAt":"2026-11-25T12:30:02.114Z","status":"warning","exitCode":1,
+ "counts":{"errors":0,"warnings":1},
+ "findings":[{"area":"daemon","check":"running","severity":"ok","message":"daemon pid 45937 running since 2026-11-25T12:29:50.017Z"},
+  {"area":"hive","check":"binary","severity":"warning","message":"hive not found on PATH"}, ...]}
+```

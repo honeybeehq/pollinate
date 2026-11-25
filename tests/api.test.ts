@@ -1,8 +1,9 @@
 import { request as httpRequest } from "node:http";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { PollinateDaemon } from "../src/daemon.js";
 import type { PollinateStore } from "../src/store.js";
@@ -119,7 +120,7 @@ describe("local API v1", () => {
       expect(health.body).toMatchObject({
         name: "pollinate",
         api: 1,
-        features: ["retry", "baseline", "onFailure", "events"],
+        features: ["retry", "baseline", "onFailure", "events", "doctor"],
         pid: process.pid,
         store: root,
         triggers: { total: 0, enabled: 0 },
@@ -131,6 +132,26 @@ describe("local API v1", () => {
       expect(await call(socket, "GET", "/v1/events")).toMatchObject({ status: 200, body: { heartbeat: true } });
       expect(await call(socket, "GET", "/v1/events?after=nope")).toMatchObject({ status: 400, body: { error: { code: "invalid_request" } } });
       expect(await call(socket, "POST", "/v1/health")).toMatchObject({ status: 405, body: { error: { code: "unsupported" } } });
+    });
+  });
+
+  test("GET /v1/doctor answers the report pol doctor --json prints", async () => {
+    await withDaemon(async ({ root, socket }) => {
+      expect((await call(socket, "PUT", "/v1/triggers/wh", { toml: webhookToml("wh", "inbox") })).status).toBe(200);
+      const answer = await call(socket, "GET", "/v1/doctor");
+      expect(answer.status).toBe(200);
+      expect(answer.body).toMatchObject({ store: root, status: expect.any(String), exitCode: expect.any(Number), counts: { errors: expect.any(Number), warnings: expect.any(Number) } });
+      expect(answer.body.fixes).toBeUndefined();
+      expect(answer.body.findings).toContainEqual(expect.objectContaining({ area: "daemon", check: "running", severity: "ok" }));
+      const env: NodeJS.ProcessEnv = { ...process.env, POLLINATE_STORE_ROOT: root };
+      delete env.POLLINATE_SOCKET;
+      const cli = await promisify(execFile)(process.execPath, [join(process.cwd(), "dist", "cli.js"), "doctor", "--json"], { env }).catch((error: { stdout: string }) => error);
+      const printed = JSON.parse(cli.stdout);
+      const withoutBuildCheck = ({ checkedAt: _checkedAt, findings, ...rest }: Record<string, any>) => ({
+        ...rest,
+        findings: findings.filter((finding: { check: string }) => finding.check !== "commit"),
+      });
+      expect(withoutBuildCheck(answer.body)).toEqual(withoutBuildCheck(printed));
     });
   });
 
