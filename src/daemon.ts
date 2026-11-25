@@ -35,6 +35,7 @@ const STALE_JOB_RECOVERY_MS = 60_000;
 const NON_TERMINAL_JOB_STATUSES: JobStatus[] = ["queued", "resolving-context", "running", "retrying"];
 const MS_PER_DAY = 86_400_000;
 const MIN_PRESSURE_GC_SPACING_MS = 60_000;
+const STOP_BACKGROUND_WAIT_MS = 5_000;
 let daemonProcessGuardsInstalled = false;
 
 export class DaemonRefusedError extends Error {
@@ -81,6 +82,7 @@ export class PollinateDaemon {
   private reloadedAt = this.startedAt;
   private hiveStatus?: { path: string; version: string | null } | null;
   private hiveProbing?: Promise<void>;
+  private readonly backgroundTasks = new Map<Promise<void>, string>();
 
   constructor(private readonly store = new PollinateStore()) {
     this.eventTags = TriggerTagIndex.forStore(store.root, (id) => store.getTrigger(id));
@@ -146,6 +148,7 @@ export class PollinateDaemon {
     await this.poll?.stop().catch(() => undefined);
     await this.schedule?.stop().catch(() => undefined);
     await this.delivery?.shutdown().catch(() => undefined);
+    await this.settleBackgroundTasks();
     await this.releaseLock();
   }
 
@@ -196,13 +199,13 @@ export class PollinateDaemon {
     await this.health.syncTriggerFiles(triggers, invalid);
     this.triggerSignature = signatureForTriggers(triggers);
     this.reloadTimer = setInterval(() => {
-      void this.reloadTriggers();
+      this.inBackground("trigger reload", this.reloadTriggers());
     }, config.defaults.triggerReloadMs);
     this.bindingGcTimer = setInterval(() => {
-      void this.runBindingGc();
+      this.inBackground("binding gc", this.runBindingGc());
     }, config.defaults.bindingGcMs);
     this.jobsGcTimer = setInterval(() => {
-      void this.runJobsGc();
+      this.inBackground("jobs gc", this.runJobsGc());
     }, config.retention.jobsGcMs);
     const build = await readBuildCommit();
     await this.store.appendLedger({
@@ -220,14 +223,42 @@ export class PollinateDaemon {
     await this.log(
       `daemon started in ${Date.now() - startedAtMs}ms: ${triggers.length} triggers, webhook ${config.webhook.bind}:${config.webhook.port}, binding gc every ${config.defaults.bindingGcMs}ms, jobs gc every ${config.retention.jobsGcMs}ms`,
     );
-    void this.runBindingGc();
-    void this.runJobsGc("startup");
-    if (triggers.some(triggerUsesHive)) void this.probeHive(config);
+    this.inBackground("binding gc", this.runBindingGc());
+    this.inBackground("jobs gc", this.runJobsGc("startup"));
+    if (triggers.some(triggerUsesHive)) this.probeHive(config);
   }
 
-  private probeHive(config: DaemonConfig): Promise<void> {
-    this.hiveProbing ??= this.runHiveProbe(config);
-    return this.hiveProbing;
+  private probeHive(config: DaemonConfig): void {
+    if (this.hiveProbing || this.stopping) return;
+    this.hiveProbing = this.runHiveProbe(config);
+    this.inBackground("hive probe", this.hiveProbing);
+  }
+
+  private inBackground(name: string, work: Promise<void>): void {
+    const task: Promise<void> = work
+      .catch((error: unknown) => this.log(`${name} failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => this.backgroundTasks.delete(task));
+    this.backgroundTasks.set(task, name);
+  }
+
+  private async settleBackgroundTasks(): Promise<void> {
+    const deadline = Date.now() + STOP_BACKGROUND_WAIT_MS;
+    while (this.backgroundTasks.size > 0) {
+      const remainingMs = deadline - Date.now();
+      let timer: NodeJS.Timeout | undefined;
+      const timedOut = await Promise.race([
+        Promise.all(this.backgroundTasks.keys()).then(() => false),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(true), Math.max(0, remainingMs));
+        }),
+      ]);
+      clearTimeout(timer);
+      if (timedOut) {
+        const running = [...new Set(this.backgroundTasks.values())].join(", ");
+        await this.log(`stopping without waiting for background tasks still running after ${STOP_BACKGROUND_WAIT_MS}ms: ${running}`);
+        return;
+      }
+    }
   }
 
   private async runHiveProbe(config: DaemonConfig): Promise<void> {
@@ -265,6 +296,7 @@ export class PollinateDaemon {
     await this.schedule?.stop();
     await this.delivery?.shutdown();
     await this.api?.stop().catch(() => undefined);
+    await this.settleBackgroundTasks();
     await this.store.appendLedger({ event: "pollinate.daemon.stopped" });
     await recordDaemonStop(this.store.root).catch(() => undefined);
     await this.releaseLock();
@@ -401,14 +433,14 @@ export class PollinateDaemon {
   }
 
   private hive(): { path: string; version: string | null } | undefined {
-    if (this.config) void this.probeHive(this.config);
+    if (this.config) this.probeHive(this.config);
     return this.hiveStatus ?? undefined;
   }
 
   private setTriggers(triggers: Trigger[]): void {
     this.triggers = triggers;
     this.triggerById = new Map(triggers.map((trigger) => [trigger.id, trigger]));
-    void this.eventTags.observe(triggers).catch((error) => this.log(`event tag index update failed: ${error instanceof Error ? error.message : String(error)}`));
+    this.inBackground("event tag index update", this.eventTags.observe(triggers));
   }
 
   private async runBindingGc(): Promise<void> {
@@ -463,7 +495,7 @@ export class PollinateDaemon {
     const delay = Math.max(0, this.jobsGcLastStartedAt + MIN_PRESSURE_GC_SPACING_MS - Date.now());
     this.jobsGcPressureTimer = setTimeout(() => {
       this.jobsGcPressureTimer = undefined;
-      void this.runJobsGc(reason);
+      this.inBackground("jobs gc", this.runJobsGc(reason));
     }, delay);
   }
 
