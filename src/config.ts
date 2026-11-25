@@ -205,6 +205,7 @@ function normalizeSource(raw: AnyRecord): Source {
 function normalizeTiming(raw: AnyRecord): ScheduleTiming {
   const type = stringOr(raw.type, "");
   const missedFirePolicy = normalizeMissedFirePolicy(raw.missedFirePolicy ?? raw.missed_fire_policy);
+  if (type !== "every" && (raw.startAt ?? raw.start_at) !== undefined) throw new Error(`trigger.source.timing.startAt applies only to type = "every"`);
   if (type === "cron") {
     const expression = requiredString(raw.expression, "trigger.source.timing.expression");
     const timezone = stringOr(raw.timezone, "UTC");
@@ -219,7 +220,9 @@ function normalizeTiming(raw: AnyRecord): ScheduleTiming {
   if (type === "every") {
     const interval = requiredString(raw.interval, "trigger.source.timing.interval");
     parseDuration(interval);
-    return { type, interval, ...(missedFirePolicy ? { missedFirePolicy } : {}) };
+    const startAt = optionalString(raw.startAt ?? raw.start_at);
+    if (startAt !== undefined && Number.isNaN(new Date(startAt).getTime())) throw new Error(`Invalid every schedule startAt: ${startAt}`);
+    return { type, interval, ...(startAt !== undefined ? { startAt } : {}), ...(missedFirePolicy ? { missedFirePolicy } : {}) };
   }
   if (type === "once") {
     const at = requiredString(raw.at, "trigger.source.timing.at");
@@ -234,9 +237,11 @@ function normalizePoll(raw: AnyRecord): PollSpec {
   parseDuration(interval);
   const emit = stringOr(raw.emit, "per-item");
   if (emit !== "per-item" && emit !== "per-poll") throw new Error(`Unsupported poll emit mode: ${emit}`);
+  const baseline = booleanOr(raw.baseline, false);
   return {
     interval,
     emit,
+    ...(baseline ? { baseline } : {}),
     fetch: normalizePollFetch(asRecord(raw.fetch, "trigger.source.poll.fetch")),
     cursor: normalizePollCursor(asRecord(raw.cursor, "trigger.source.poll.cursor")),
   };

@@ -26,6 +26,17 @@ import { insertNewestFirst, jobFileNames, orderJobForWrite, readJobSummary, scan
 export const DELIVERIES_SEEN_PER_TRIGGER = 2_000;
 export const DELIVERIES_SEEN_MAX_AGE_MS = 72 * 60 * 60 * 1000;
 
+export const TRIGGER_STATE_FILES = ["schedule-state.json", "delivery-state.json", "cursors.json", "deliveries-seen.json", "trigger-health.json"] as const;
+
+export type TriggerStateFile = (typeof TRIGGER_STATE_FILES)[number];
+
+export type TriggerStatePruneResult = {
+  entries: number;
+  files: Partial<Record<TriggerStateFile, { before: number; after: number }>>;
+};
+
+export type TriggerStatePruneSelector = { remove: string[] } | { keepOnly: Set<string> };
+
 export type JobRetentionOptions = {
   /** Required opt-in retention window; terminal jobs newer than this are never deleted. */
   terminalOlderThanDays: number;
@@ -254,8 +265,46 @@ export class PollinateStore {
     await withFileLock(this.triggerLockPath(id), async () => {
       await unlink(this.triggerPath(id));
     });
-    await this.forgetDeliveries(id);
     await this.appendLedger({ event: "pollinate.trigger.removed", trigger_id: id });
+    await this.pruneTriggerState({ remove: [id] }, { trigger_id: id });
+  }
+
+  async countDelivery(id: string): Promise<Trigger> {
+    return this.mutateTrigger(id, (trigger) => {
+      if (!trigger.lifecycle) return trigger;
+      const deliveries = (trigger.lifecycle.deliveries ?? 0) + 1;
+      const maxDeliveries = trigger.lifecycle.maxDeliveries;
+      const spent = maxDeliveries !== undefined && deliveries >= maxDeliveries;
+      return { ...trigger, enabled: spent ? false : trigger.enabled, lifecycle: { ...trigger.lifecycle, deliveries } };
+    });
+  }
+
+  async pruneOrphanedTriggerState(): Promise<TriggerStatePruneResult> {
+    return this.pruneTriggerState({ keepOnly: await this.triggerIdsOnDisk() }, { reason: "startup" });
+  }
+
+  async pruneTriggerState(selector: TriggerStatePruneSelector, ledgerFields: Record<string, unknown> = {}): Promise<TriggerStatePruneResult> {
+    await this.ensure();
+    const result: TriggerStatePruneResult = { entries: 0, files: {} };
+    const drops = (key: string) => ("remove" in selector ? selector.remove.includes(key) : !selector.keepOnly.has(key));
+    for (const file of TRIGGER_STATE_FILES) {
+      const path = join(stateDir(this.root), file);
+      const prune = async () => {
+        const state = await readJsonOr<Record<string, unknown> | null>(path, null);
+        if (!state || typeof state !== "object" || Array.isArray(state)) return;
+        const keys = Object.keys(state);
+        const dropped = keys.filter(drops);
+        result.files[file] = { before: keys.length, after: keys.length - dropped.length };
+        if (dropped.length === 0) return;
+        for (const key of dropped) delete state[key];
+        await writeJson(path, state);
+        result.entries += dropped.length;
+      };
+      if (file === "deliveries-seen.json") await withFileLock(this.deliveriesSeenLockPath(), prune);
+      else await prune();
+    }
+    if (result.entries > 0) await this.appendLedger({ event: "pollinate.state.pruned", ...ledgerFields, entries: result.entries, files: result.files });
+    return result;
   }
 
   async requireTrigger(id: string): Promise<Trigger> {
@@ -399,6 +448,16 @@ export class PollinateStore {
       if (job) jobs.push(job);
     }
     return jobs;
+  }
+
+  async triggersWithLiveJobs(triggerIds: Set<string>): Promise<Set<string>> {
+    const live = new Set<string>();
+    if (triggerIds.size === 0) return live;
+    await this.ensure();
+    for await (const summary of scanJobSummaries(jobsDir(this.root))) {
+      if (triggerIds.has(summary.triggerId) && !isTerminalJobStatus(summary.status)) live.add(summary.triggerId);
+    }
+    return live;
   }
 
   async censusJobs(): Promise<JobStoreCensus> {

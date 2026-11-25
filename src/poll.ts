@@ -36,7 +36,19 @@ export class PollEngine {
 
   updateTriggers(triggers: Trigger[]): void {
     this.triggers = triggers;
+    if (this.forgetRemovedTriggers()) void this.writeCursors().catch(() => undefined);
     this.reconcileTimers();
+  }
+
+  private forgetRemovedTriggers(): boolean {
+    const known = new Set(this.triggers.map((trigger) => trigger.id));
+    let dirty = false;
+    for (const triggerId of Object.keys(this.cursors)) {
+      if (known.has(triggerId)) continue;
+      delete this.cursors[triggerId];
+      dirty = true;
+    }
+    return dirty;
   }
 
   async pollNow(trigger: Trigger): Promise<number> {
@@ -54,7 +66,14 @@ export class PollEngine {
     if (trigger.source.kind !== "poll") throw new Error(`Trigger ${trigger.id} is not a poll trigger`);
     const spec = trigger.source.poll;
     const fetched = await fetchPoll(spec, trigger.cwd, this.execution);
+    const firstCheck = this.cursors[trigger.id] === undefined;
     const delta = detectDelta(spec, trigger.id, fetched, this.cursors);
+    if (spec.baseline && firstCheck) {
+      this.cursors[trigger.id] = delta.cursors[trigger.id];
+      await this.writeCursors();
+      await this.store.appendLedger({ event: "pollinate.poll.baselined", trigger_id: trigger.id, item_count: delta.itemCount, at: nowIso() });
+      return 0;
+    }
     await this.store.appendLedger({
       event: "pollinate.poll.checked",
       trigger_id: trigger.id,

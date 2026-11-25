@@ -105,18 +105,46 @@ export async function recordWebhookDelivery(store: PollinateStore, trigger: Trig
   return updated;
 }
 
-export async function gcTemporaryHooks(store: PollinateStore, now = Date.now()): Promise<string[]> {
+export type TemporaryTriggerGcOptions = {
+  now?: number;
+  hasLiveJobs?: (triggerId: string) => boolean;
+};
+
+export async function gcTemporaryHooks(store: PollinateStore, options: TemporaryTriggerGcOptions = {}): Promise<string[]> {
+  const now = options.now ?? Date.now();
   const triggers = await store.loadTriggers();
-  const removable = triggers
-    .filter((trigger) => trigger.lifecycle?.temporary)
-    .filter((trigger) => isExpiredTemporaryHook(trigger, now) || reachedMaxDeliveries(trigger))
-    .map((trigger) => trigger.id)
-    .sort();
-  for (const id of removable) {
-    await store.removeTrigger(id);
-    await store.appendLedger({ event: "pollinate.hook.gc_removed", trigger_id: id });
+  const candidates = triggers
+    .filter((trigger) => trigger.lifecycle?.temporary && lifecycleEnded(trigger, now))
+    .filter((trigger) => !options.hasLiveJobs?.(trigger.id))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  if (candidates.length === 0) return [];
+  const live = await store.triggersWithLiveJobs(new Set(candidates.map((trigger) => trigger.id)));
+  const removed: string[] = [];
+  for (const trigger of candidates) {
+    if (live.has(trigger.id)) continue;
+    await store.appendLedger({
+      event: "pollinate.trigger.spent",
+      trigger_id: trigger.id,
+      reason: isExpiredTemporaryHook(trigger, now) ? "expired" : "max_deliveries",
+      source: trigger.source.kind,
+      deliveries: trigger.lifecycle?.deliveries ?? 0,
+      ...(trigger.lifecycle?.maxDeliveries !== undefined ? { max_deliveries: trigger.lifecycle.maxDeliveries } : {}),
+      ...(trigger.lifecycle?.expiresAt ? { expires_at: trigger.lifecycle.expiresAt } : {}),
+    });
+    await store.removeTrigger(trigger.id);
+    if (trigger.source.kind === "webhook") await store.appendLedger({ event: "pollinate.hook.gc_removed", trigger_id: trigger.id });
+    removed.push(trigger.id);
   }
-  return removable;
+  return removed;
+}
+
+export function lifecycleEnded(trigger: Trigger, now = Date.now()): boolean {
+  return lifecycleExpired(trigger, now) || reachedMaxDeliveries(trigger);
+}
+
+function lifecycleExpired(trigger: Trigger, now: number): boolean {
+  const expiresAt = trigger.lifecycle?.expiresAt;
+  return expiresAt !== undefined && new Date(expiresAt).getTime() <= now;
 }
 
 function reachedMaxDeliveries(trigger: Trigger): boolean {

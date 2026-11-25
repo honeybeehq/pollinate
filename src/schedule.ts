@@ -115,10 +115,21 @@ export class ScheduleEngine {
     }
   }
 
+  private forgetRemovedTriggers(): boolean {
+    const known = new Set(this.triggers.map((trigger) => trigger.id));
+    let dirty = false;
+    for (const triggerId of Object.keys(this.state)) {
+      if (known.has(triggerId)) continue;
+      delete this.state[triggerId];
+      dirty = true;
+    }
+    return dirty;
+  }
+
   private async initializeScheduleState(stage: string): Promise<void> {
     try {
       const now = new Date();
-      let dirty = false;
+      let dirty = this.forgetRemovedTriggers();
       for (const trigger of this.scheduleTriggers()) {
         try {
           const timing = trigger.source.kind === "schedule" ? trigger.source.timing : undefined;
@@ -304,13 +315,21 @@ function initialNextFire(timing: ScheduleTiming, now: Date): Date {
 
 export function nextFireAfter(timing: ScheduleTiming, after: Date, options: NextFireOptions = {}): Date {
   if (timing.type === "every") {
-    return new Date(after.getTime() + parseDuration(timing.interval));
+    const intervalMs = parseDuration(timing.interval);
+    if (timing.startAt === undefined) return new Date(after.getTime() + intervalMs);
+    return nextAnchoredFire(parseIsoDate(timing.startAt, "startAt").getTime(), intervalMs, after.getTime());
   }
   if (timing.type === "once") {
     const at = parseIsoDate(timing.at, "once schedule");
     return at.getTime() <= after.getTime() ? NEVER_FIRE : at;
   }
   return nextCronFireAfter(timing.expression, after, timing.timezone ?? "UTC", options);
+}
+
+function nextAnchoredFire(anchorMs: number, intervalMs: number, afterMs: number): Date {
+  if (afterMs < anchorMs) return new Date(anchorMs);
+  if (intervalMs <= 0) return new Date(afterMs + intervalMs);
+  return new Date(anchorMs + (Math.floor((afterMs - anchorMs) / intervalMs) + 1) * intervalMs);
 }
 
 export function nextCronFireAfter(expression: string, after: Date, timezone = "UTC", options: NextFireOptions = {}): Date {
@@ -471,7 +490,7 @@ function latestCronOccurrence(timing: ScheduleTiming, now: Date): Date | undefin
 }
 
 function nextAfterOnTimeFire(timing: ScheduleTiming, scheduledAt: Date, following: Date, now: Date): Date {
-  if (timing.type !== "every" || missedFirePolicy(timing) === "fire-all") return following;
+  if (timing.type !== "every" || timing.startAt !== undefined || missedFirePolicy(timing) === "fire-all") return following;
   const intervalMs = parseDuration(timing.interval);
   if (now.getTime() - scheduledAt.getTime() <= lateGraceMs(intervalMs)) return following;
   return new Date(now.getTime() + intervalMs);
@@ -483,7 +502,7 @@ function lateGraceMs(intervalMs: number): number {
 
 function timingHash(timing: ScheduleTiming): string {
   if (timing.type === "cron") return `cron:${timing.expression}:${timing.timezone ?? "UTC"}:${timing.missedFirePolicy ?? ""}`;
-  if (timing.type === "every") return `every:${timing.interval}:${timing.missedFirePolicy ?? ""}`;
+  if (timing.type === "every") return `every:${timing.interval}:${timing.missedFirePolicy ?? ""}${timing.startAt === undefined ? "" : `:start=${timing.startAt}`}`;
   return `once:${timing.at}:${timing.missedFirePolicy ?? ""}`;
 }
 

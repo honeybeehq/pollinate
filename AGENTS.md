@@ -190,6 +190,7 @@ kind = "schedule" | "poll" | "webhook" | "manual"
 [trigger.source.timing]
 type = "every" | "cron" | "once"
 interval = "5m"              # every; durations: 500ms 30s 5m 2h 1d
+startAt = "2026-06-11T08:00:00Z"  # every only, optional: fires at startAt + n × interval, nothing before
 expression = "0 8 * * 1-5"   # cron
 timezone = "UTC"             # cron only
 at = "2026-06-11T08:00:00Z"  # once
@@ -199,6 +200,7 @@ missedFirePolicy = "skip" | "fire-once" | "fire-all"
 [trigger.source.poll]
 interval = "30s"
 emit = "per-item" | "per-poll"
+baseline = false             # true: the first check (no cursor yet) records the cursor and emits nothing
 [trigger.source.poll.fetch]
 kind = "command" | "http" | "file"   # command=…, url=…/method=…/headers, path=…
 [trigger.source.poll.cursor]
@@ -242,10 +244,10 @@ command = "gh pr diff {{pr_number}}"
 [trigger.context.static]
 team = "platform"
 
-[trigger.lifecycle]          # temporary hooks (pol hook create/inbox/wait)
-temporary = true
-expiresAt = "…"
-maxDeliveries = 1
+[trigger.lifecycle]          # any source; pol hook create/inbox/wait sets it for temporary hooks
+temporary = true             # removed (with its state) once spent or expired and no job is in flight
+expiresAt = "…"              # no delivery at or after this time
+maxDeliveries = 1            # disabled after this many deliveries (count; until = expiresAt)
 
 [trigger.action]             # required unless [trigger.router] is present
 kind = "command" | "http" | "emit" | "honeybee" | "sequence"
@@ -412,6 +414,36 @@ A single late occurrence (the next one not yet due) fires as usual with
 grace (10% of the interval, at least 5 s, at most 60 s) sets next to now plus
 the interval, so it is not followed by an on-time fire seconds later.
 `fire-all` keeps the original cadence.
+
+## Lifecycle, baseline and state cleanup
+
+- `lifecycle.deliveries` counts every delivery of a trigger that has a
+  `[trigger.lifecycle]` table. Webhooks count on receipt (ledger
+  `pollinate.hook.delivered`); schedules and polls count in delivery, after
+  dedup and `[trigger.filter]` (ledger `pollinate.trigger.delivered {trigger_id,
+  source, deliveries, max_deliveries, disabled}`). Reaching `maxDeliveries`
+  disables the trigger; past `expiresAt` nothing is delivered.
+- A `temporary` trigger that is spent or expired is removed only when it has no
+  non-terminal job (anything but `completed`, `errored`, `timed-out`,
+  `cancelled`, so `queued`, `running` and `retrying` all block) and nothing in
+  its delivery state (`queue`, `inFlight`, `admitting`, pending batch), so a
+  running or retrying job is never cut off. The GC runs at daemon start, on every trigger reload and on
+  `pol hook gc`; it ledgers `pollinate.trigger.spent {trigger_id, reason:
+  "expired" | "max_deliveries", source, deliveries, max_deliveries?,
+  expires_at?}`, then `pollinate.trigger.removed` (webhooks also keep
+  `pollinate.hook.gc_removed`).
+- State follows the trigger. Removing a trigger (any way) drops its entries from
+  every per-trigger state file: `schedule-state`, `delivery-state`, `cursors`,
+  `deliveries-seen`, `trigger-health` (`TRIGGER_STATE_FILES` in `src/store.ts`).
+  At daemon start the same prune drops entries of trigger ids with no file in
+  `triggers/`. Each prune that removes something ledgers `pollinate.state.pruned
+  {entries, files: {<file>: {before, after}}}` with `trigger_id` (on removal)
+  or `reason: "startup"`.
+- `[trigger.source.poll] baseline = true`: when the trigger has no cursor yet
+  (new, or re-added after removal) the first check stores the cursor, emits
+  nothing and ledgers `pollinate.poll.baselined {trigger_id, item_count}`.
+  Later checks report only changes. Default `false`: the first check emits
+  everything it sees, as before.
 
 ## One daemon per store
 
@@ -628,7 +660,7 @@ Every activation, and so every job (`Job.deliveryId`), has a delivery id
 
 Sequence steps run with `<delivery id>.s<n>`. Deduped ids are recorded in
 `state/deliveries-seen.json` (per trigger: newest 2,000 ids, 72 h; pruned on
-every write and when the trigger is removed). A repeat is not fired: webhooks
+every write and when the trigger is removed, see Lifecycle, baseline and state cleanup). A repeat is not fired: webhooks
 answer `{duplicate: true}` and ledger `pollinate.webhook.duplicate`, other
 sources ledger `pollinate.delivery.duplicate {trigger_id, delivery_id, source}`.
 A crash between recording an id and running its job no longer loses the
@@ -641,12 +673,13 @@ duplicate. Receivers should key on
 Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 `event`. Stream with `pol ledger --follow`.
 
-- `pollinate.trigger.{added,enabled,disabled,removed}`
+- `pollinate.trigger.{added,enabled,disabled,removed,delivered,spent}` (see Lifecycle, baseline and state cleanup)
+- `pollinate.state.pruned` (per-trigger state removed with its trigger or at startup)
 - `pollinate.trigger.invalid` (a trigger file that fails to load, e.g. one
   using a removed action kind; once per file change, keyed on path, mtime and size)
 - `pollinate.job.{queued,started,completed,errored,cancelled,hive_starting,retry_scheduled,resumed}`
 - `pollinate.delivery.{filtered,throttled,duplicate,dropped}`
-- `pollinate.schedule.{fired,missed,errored}` · `pollinate.poll.{checked,detected,errored}`
+- `pollinate.schedule.{fired,missed,errored}` · `pollinate.poll.{checked,detected,errored,baselined}`
 - `pollinate.webhook.{received,rejected,duplicate}`
 - `pollinate.hook.{created,delivered,expired,gc_removed}`
 - `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,already_bound,unbound,open_filtered,activity_errored,gc}`

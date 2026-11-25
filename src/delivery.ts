@@ -5,6 +5,7 @@ import { matchesFilter } from "./filter.js";
 import { PollinateStore } from "./store.js";
 import { nowIso, parseDuration } from "./time.js";
 import { appendTextLine, daemonLogPath } from "./fsx.js";
+import { lifecycleEnded } from "./hooks.js";
 
 const DEBOUNCE_MAX_WAIT_MULTIPLIER = 6;
 
@@ -122,6 +123,11 @@ export class DeliveryManager {
   async handle(trigger: Trigger, incoming: Activation, options: HandleOptions = {}): Promise<Job | null> {
     if (!trigger.enabled) return null;
     let activation = withDeliveryId(incoming);
+    const deliveryId = activation.metadata?.deliveryId ?? "";
+    if (lifecycleEnded(trigger)) {
+      if (options.admitted) await this.dropAdmission(trigger.id, deliveryId);
+      return null;
+    }
     if (!options.admitted) {
       const admitted = await this.admit(trigger, activation, { preclaimed: options.claimed });
       if (!admitted) {
@@ -130,12 +136,19 @@ export class DeliveryManager {
       }
       activation = admitted;
     }
-    const deliveryId = activation.metadata?.deliveryId ?? "";
     if (!matchesFilter(trigger.filter, activation.payload)) {
       this.settleAdmission(trigger.id, deliveryId);
       await this.persist();
       await this.store.appendLedger({ event: "pollinate.delivery.filtered", trigger_id: trigger.id });
       return null;
+    }
+    if (activation.source !== "webhook" && trigger.lifecycle) {
+      try {
+        await this.countDelivery(trigger, activation.source);
+      } catch (error) {
+        await this.dropAdmission(trigger.id, deliveryId);
+        throw error;
+      }
     }
     this.triggers.set(trigger.id, trigger);
     const mode = trigger.delivery.mode;
@@ -145,6 +158,32 @@ export class DeliveryManager {
     if (mode.strategy === "debounced") return this.handleDebounced(trigger, activation, deliveryId);
     const neverMode: never = mode;
     throw new Error(`Unsupported delivery mode: ${JSON.stringify(neverMode)}`);
+  }
+
+  hasLiveJobs(triggerId: string): boolean {
+    if (this.hasPendingJobs(triggerId) || (this.runtime.get(triggerId)?.running ?? 0) > 0) return true;
+    const state = this.persisted[triggerId];
+    return Boolean(state?.queue?.length || state?.inFlight?.length || state?.pendingBatch?.length || Object.keys(state?.admitting ?? {}).length);
+  }
+
+  private async dropAdmission(triggerId: string, deliveryId: string): Promise<void> {
+    if (!this.persisted[triggerId]?.admitting?.[deliveryId]) return;
+    this.settleAdmission(triggerId, deliveryId);
+    await this.persist();
+  }
+
+  private async countDelivery(trigger: Trigger, source: SourceKind): Promise<void> {
+    const counted = await this.store.countDelivery(trigger.id);
+    trigger.enabled = counted.enabled;
+    trigger.lifecycle = counted.lifecycle;
+    await this.store.appendLedger({
+      event: "pollinate.trigger.delivered",
+      trigger_id: trigger.id,
+      source,
+      deliveries: counted.lifecycle?.deliveries ?? 0,
+      max_deliveries: counted.lifecycle?.maxDeliveries,
+      disabled: !counted.enabled,
+    });
   }
 
   ownsJob(jobId: string): boolean {

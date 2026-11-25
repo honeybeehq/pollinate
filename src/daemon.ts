@@ -140,6 +140,7 @@ export class PollinateDaemon {
     const startedAtMs = Date.now();
     const config = await this.store.daemonConfig();
     await gcTemporaryHooks(this.store);
+    await this.pruneOrphanedTriggerState();
     const triggers = await this.store.loadTriggers();
     const executor = new ActionExecutor(this.store, {
       contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
@@ -184,6 +185,15 @@ export class PollinateDaemon {
     void this.runStartupJobMaintenance(startedAtMs);
   }
 
+  private async pruneOrphanedTriggerState(): Promise<void> {
+    try {
+      const pruned = await this.store.pruneOrphanedTriggerState();
+      if (pruned.entries > 0) await this.log(`startup prune removed ${pruned.entries} state entries of removed triggers`);
+    } catch (error) {
+      await this.log(`startup state prune failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   private async runStartupJobMaintenance(startedAtMs: number): Promise<void> {
     try {
       await this.recoverStaleJobs(startedAtMs);
@@ -224,7 +234,7 @@ export class PollinateDaemon {
         this.daemonConfigSignature = configSignature;
         await this.log("pollinate.toml changed; restart the daemon to apply webhook, defaults, relay, or execution-profile changes");
       }
-      await gcTemporaryHooks(this.store);
+      await gcTemporaryHooks(this.store, { hasLiveJobs: (triggerId) => this.delivery?.hasLiveJobs(triggerId) ?? false });
       const triggers = await this.store.loadTriggers();
       const signature = signatureForTriggers(triggers);
       if (signature === this.triggerSignature) return;

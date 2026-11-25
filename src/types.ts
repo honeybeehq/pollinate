@@ -6,7 +6,7 @@ export type SourceKind = "schedule" | "poll" | "webhook" | "manual";
 
 export type ScheduleTiming =
   | { type: "cron"; expression: string; timezone?: string; missedFirePolicy?: MissedFirePolicy }
-  | { type: "every"; interval: string; missedFirePolicy?: MissedFirePolicy }
+  | { type: "every"; interval: string; startAt?: string; missedFirePolicy?: MissedFirePolicy }
   | { type: "once"; at: string; missedFirePolicy?: MissedFirePolicy };
 
 export type MissedFirePolicy = "skip" | "fire-once" | "fire-all";
@@ -26,6 +26,7 @@ export type PollSpec = {
   fetch: PollFetch;
   cursor: PollCursor;
   emit: "per-item" | "per-poll";
+  baseline?: boolean;
 };
 
 export type WebhookSpec = {
