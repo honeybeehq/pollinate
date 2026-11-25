@@ -62,6 +62,14 @@ const TERMINAL = new Set<JobStatus>(["completed", "errored", "timed-out", "cance
 const DEFAULT_JOBS_LIST_LIMIT = 100;
 
 async function main(argv = process.argv.slice(2)): Promise<void> {
+  if (isVersionRequest(argv)) {
+    await printVersion(argv.includes("--json"));
+    return;
+  }
+  if (isHelpRequest(argv)) {
+    await printHelp();
+    return;
+  }
   const args = parseArgs(argv);
   let store: PollinateStore | undefined;
   const getStore = async () => {
@@ -2061,6 +2069,52 @@ async function readVersion(): Promise<string> {
   }
 }
 
+type BuildInfo = {
+  name: string;
+  version: string;
+  commit: string | null;
+  dirty: boolean | null;
+  builtAt: string | null;
+};
+
+const VERSION_FLAGS = new Set(["--version", "-V"]);
+const HELP_FLAGS = new Set(["--help", "-h"]);
+
+function isVersionRequest(argv: string[]): boolean {
+  return argv.some((token) => VERSION_FLAGS.has(token)) && argv.every((token) => VERSION_FLAGS.has(token) || token === "--json");
+}
+
+function isHelpRequest(argv: string[]): boolean {
+  return argv.length > 0 && argv.every((token) => HELP_FLAGS.has(token));
+}
+
+async function readBuildInfo(): Promise<BuildInfo> {
+  const fallback: BuildInfo = { name: "pollinate", version: await readVersion(), commit: null, dirty: null, builtAt: null };
+  try {
+    const text = await readFile(new URL("./build-info.json", import.meta.url), "utf8");
+    const raw = JSON.parse(text) as Partial<Record<keyof BuildInfo, unknown>>;
+    return {
+      name: typeof raw.name === "string" ? raw.name : fallback.name,
+      version: typeof raw.version === "string" ? raw.version : fallback.version,
+      commit: typeof raw.commit === "string" ? raw.commit : null,
+      dirty: typeof raw.dirty === "boolean" ? raw.dirty : null,
+      builtAt: typeof raw.builtAt === "string" ? raw.builtAt : null,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+async function printVersion(json: boolean): Promise<void> {
+  const info = await readBuildInfo();
+  if (json) {
+    console.log(JSON.stringify(info, null, 2));
+    return;
+  }
+  const build = info.commit ? `${info.commit.slice(0, 12)}${info.dirty ? " dirty" : ""}` : "unknown commit";
+  console.log(`${info.name} ${info.version} (${build})`);
+}
+
 function helpSection(title: string, rows: Array<[string, string]>): string {
   const cmdWidth = Math.max(...rows.map(([cmd]) => cmd.length));
   const body = rows
@@ -2143,6 +2197,7 @@ async function printHelp(): Promise<void> {
   out.push("");
   out.push(c.dim(`  ${sym.mid} --source-json / --delivery-json / --action-json / --router-json / --context-json / --filter-json for full control`));
   out.push(c.dim(`  ${sym.mid} add ${c.bold("--json")} to any command for machine-readable output`));
+  out.push(c.dim(`  ${sym.mid} ${c.bold("pol --version")} [--json] (or ${c.bold("-V")}) prints the version and the commit it was built from`));
   out.push("");
   out.push(c.dim(`Examples:`));
   out.push(`  ${c.dim("$")} ${c.bold("pol create hourly --source schedule --every 1h --action command --command 'echo hi'")}`);

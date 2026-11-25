@@ -12,11 +12,35 @@ everything here is otherwise only discoverable by reading the source.
 - Store root: `~/.pollinate`, overridable with `POLLINATE_STORE_ROOT`.
 - Add `--json` to any command for machine-readable output. Errors with `--json`
   print `{"error": "..."}` to stderr and exit 1.
-- Dev loop: `pnpm build` (tsc), `pnpm test` (build + vitest), `pnpm check`
-  (build + test typecheck + lint + test).
+- Dev loop: `pnpm build` (tsc, then `scripts/write-build-info.mjs`), `pnpm test`
+  (build + vitest), `pnpm check` (build + test typecheck + lint + test).
+- `pol --version` (or `-V`) prints `pollinate <version> (<12-char commit>)`, with
+  ` dirty` after the commit for a dirty build and `(unknown commit)` when there
+  is no build info. `pol --version --json` prints the build info object (see
+  Build info) and always exits 0.
 - `pol add <file.toml>` and `pol create <id>` **overwrite** an existing trigger
   with the same id silently — check `pol get <id>` first if that matters.
 - `--dry-run` exists on `pol trigger`, `pol github …`, and `pol jobs gc`.
+
+## Build info
+
+`pnpm build` runs `tsc`, then `scripts/write-build-info.mjs`, which writes
+`dist/build-info.json`. It ships in the npm package with the rest of `dist/`.
+
+```json
+{"name":"pollinate","version":"1.0.0","commit":"<40-hex sha>","dirty":false,"builtAt":"2026-11-25T12:00:00.000Z"}
+```
+
+- `commit` comes from `POLLINATE_BUILD_COMMIT` when set (release builds set it;
+  it must be a 40-character hex sha or the build fails), else from
+  `git rev-parse HEAD` when the package root is the top of its own git checkout.
+- `dirty` is `git status --porcelain` non-empty. It is `null` when the commit
+  came from `POLLINATE_BUILD_COMMIT` or git is unavailable.
+- With no env var and no git, `commit` and `dirty` are `null` and the build
+  still succeeds.
+- `pol --version [--json]` reads the file next to `dist/cli.js` (symlinked bins
+  resolve to the real file). When the file is missing, `--json` reports
+  `commit`, `dirty` and `builtAt` as `null` and the version from `package.json`.
 
 ## Store layout
 
@@ -58,6 +82,7 @@ everything here is otherwise only discoverable by reading the source.
 | `pol github create-pr-router / install-pr-router` | PR review router scaffolding + GitHub webhook install |
 | `pol daemon install|uninstall|start|stop|restart|status|logs|run` | service management |
 | `pol satellite run --target … --secret …` | public relay → local daemon |
+| `pol --version [--json]` | version and the commit this build came from (`dist/build-info.json`) |
 | `pol status / ledger [-n N] [--follow]` | dashboard (incl. job file count, size, store and crash-loop warnings) / event stream |
 
 Answering "why didn't my trigger fire?": check `pol ledger -n 200` for

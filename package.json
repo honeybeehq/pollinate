@@ -18,7 +18,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/write-build-info.mjs",
     "pretest": "pnpm build",
     "test": "vitest run --pool threads --no-file-parallelism",
     "typecheck:tests": "tsc -p tsconfig.tests.json",

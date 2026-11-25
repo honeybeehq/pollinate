@@ -15,7 +15,13 @@ The package exposes both `pollinate` and `pol` when linked or installed:
 ```sh
 pnpm link --global
 pollinate --help
+pollinate --version          # pollinate 1.0.0 (f594322cb06a)
+pollinate --version --json   # contents of dist/build-info.json
 ```
+
+`pnpm build` writes `dist/build-info.json` with the package version and the git
+commit it was built from (`POLLINATE_BUILD_COMMIT` overrides the commit for
+release builds). See `AGENTS.md` → "Build info".
 
 ## Store
 
