@@ -76,6 +76,49 @@ on a temp store with a free webhook port, add a webhook trigger whose `command`
 action writes a marker, POST to it, wait for the job to complete and the
 marker, stop the daemon by pid. Without `--publish` it only builds locally.
 
+## Running a release (personal daemon)
+
+On Tormod's Mac the launchd daemon `dev.pollinate.pollinated` and
+`/opt/homebrew/bin/{pol,pollinate}` run `~/.local/share/pollinate/current/dist/cli.js`,
+not a checkout, so `pnpm build` in a checkout changes nothing that runs.
+
+`node scripts/install-runtime.mjs [<sha> | latest] [--root <dir>] [--launchd] [--bin <dir>]`
+(Node standard library only, run from any checkout):
+
+- `latest` is the newest non-draft `runtime-*` release (by `created_at`) that
+  has `pollinate-<sha>-standalone.tgz`. Uses `GITHUB_TOKEN` or `gh auth token`
+  when available.
+- Downloads the standalone tarball and `SHA256SUMS`, checks the sha256, refuses
+  entries outside `pollinate-<sha>/` or containing `..` and symlinks leaving the
+  tree, unpacks into a temp dir under the root, requires `--version --json` to
+  report `<sha>`, then renames it to `<root>/<sha>/` (default root
+  `~/.local/share/pollinate`).
+- Repoints `<root>/current` to the relative target `<sha>` atomically and prints
+  the previous target. A sha that is already installed is not downloaded again.
+  Installed versions are never deleted.
+- `--launchd` rewrites `~/Library/LaunchAgents/dev.pollinate.pollinated.plist`
+  to run `<root>/current/dist/cli.js` (the unresolved path), keeping its node,
+  environment and log paths, after copying the old plist to
+  `<root>/rollback/dev.pollinate.pollinated.plist.<UTC stamp>`. It restarts
+  nothing. Don't use `pol daemon install` for this: it writes the resolved
+  `<sha>` path.
+- `--bin /opt/homebrew/bin` points `pol` and `pollinate` there at
+  `<root>/current/dist/cli.js` and writes the old targets to
+  `<root>/rollback/bin-links.<UTC stamp>.sh`.
+
+Upgrade: `node scripts/install-runtime.mjs latest && pol daemon restart`.
+
+Version rollback: repoint `current` to an earlier installed sha and restart,
+`ln -sfn <sha> ~/.local/share/pollinate/current && pol daemon restart` (or
+`node scripts/install-runtime.mjs <sha> && pol daemon restart`).
+
+Full rollback to the checkout: copy the newest
+`~/.local/share/pollinate/rollback/dev.pollinate.pollinated.plist.*` back to
+`~/Library/LaunchAgents/dev.pollinate.pollinated.plist`, run
+`sh ~/.local/share/pollinate/rollback/bin-links.*.sh` to restore the old
+symlinks, then
+`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/dev.pollinate.pollinated.plist; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.pollinate.pollinated.plist`.
+
 ## Store layout
 
 ```text

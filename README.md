@@ -28,6 +28,16 @@ with `pollinate-<sha>.tgz`, a standalone `pollinate-<sha>-standalone.tgz`
 (production `node_modules` included; run `node pollinate-<sha>/dist/cli.js`) and
 `SHA256SUMS`. See `AGENTS.md` → "Releases".
 
+To run a release instead of a checkout, install it under
+`~/.local/share/pollinate/<sha>/` with a `current` symlink, then restart:
+
+```sh
+node scripts/install-runtime.mjs latest && pol daemon restart
+```
+
+`--launchd` and `--bin <dir>` point the launchd plist and the `pol` binaries at
+`current` once. See `AGENTS.md` → "Running a release".
+
 ## Store
 
 `POLLINATE_STORE_ROOT` controls the on-disk store. By default it is `~/.pollinate`:
