@@ -32,6 +32,7 @@ export type WebhookSpec = {
   path: string;
   secret?: string;
   transform?: Record<string, string>;
+  deliveryIdHeader?: string;
 };
 
 export type Source =
@@ -143,6 +144,7 @@ export type Job = {
   idPrefix?: string;
   uuid?: string;
   triggerId: string;
+  deliveryId?: string;
   source: SourceKind;
   status: JobStatus;
   cwd?: string;
@@ -169,8 +171,9 @@ export type Activation = {
   payload: JsonValue;
   receivedAt: string;
   metadata?: {
-    /** Provider delivery key, when one exists; keeps action replay stable across intake redelivery. */
     deliveryId?: string;
+    deliveryIds?: string[];
+    stableDeliveryId?: boolean;
     webhook?: {
       path?: string;
       headers?: Record<string, string>;
@@ -231,6 +234,8 @@ export type DeliveryState = Record<
     queue?: Array<{ job: Job; activation: Activation; batch: JsonValue[] }>;
   }
 >;
+
+export type DeliveriesSeen = Record<string, Record<string, number>>;
 
 export type CursorState = Record<string, JsonValue>;
 

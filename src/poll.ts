@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { Activation, CursorState, ExecutionProfile, JsonValue, PollSpec, Trigger } from "./types.js";
-import { DeliveryManager } from "./delivery.js";
+import { DeliveryManager, deliveryIdFor } from "./delivery.js";
 import { PollinateStore } from "./store.js";
 import { execShell } from "./process.js";
 import { selectJsonPathArray } from "./jsonpath.js";
@@ -65,12 +65,13 @@ export class PollEngine {
     this.cursors[trigger.id] = delta.cursors[trigger.id];
     await this.writeCursors();
     if (delta.items.length > 0) {
+      const checkedAt = nowIso();
       if (spec.emit === "per-item") {
-        for (const item of delta.items) {
-          await this.dispatch(trigger, item);
+        for (const [index, item] of delta.items.entries()) {
+          await this.dispatch(trigger, item, `poll:${checkedAt}:${index}`);
         }
       } else {
-        await this.dispatch(trigger, delta.items as JsonValue);
+        await this.dispatch(trigger, delta.items as JsonValue, `poll:${checkedAt}:0`);
       }
       await this.store.appendLedger({ event: "pollinate.poll.detected", trigger_id: trigger.id, item_count: delta.items.length, at: nowIso() });
     }
@@ -120,8 +121,14 @@ export class PollEngine {
     await write;
   }
 
-  private async dispatch(trigger: Trigger, payload: JsonValue): Promise<void> {
-    const activation: Activation = { triggerId: trigger.id, source: "poll", payload, receivedAt: nowIso() };
+  private async dispatch(trigger: Trigger, payload: JsonValue, deliveryPart: string): Promise<void> {
+    const activation: Activation = {
+      triggerId: trigger.id,
+      source: "poll",
+      payload,
+      receivedAt: nowIso(),
+      metadata: { deliveryId: deliveryIdFor(trigger.id, deliveryPart) },
+    };
     await this.delivery.handle(trigger, activation);
   }
 

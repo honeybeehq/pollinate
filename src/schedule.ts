@@ -1,5 +1,5 @@
 import type { Activation, MissedFirePolicy, ScheduleState, ScheduleTiming, Trigger } from "./types.js";
-import { DeliveryManager } from "./delivery.js";
+import { DeliveryManager, deliveryIdFor } from "./delivery.js";
 import { PollinateStore } from "./store.js";
 import { nowIso, parseDuration, parseIsoDate } from "./time.js";
 
@@ -235,6 +235,7 @@ export class ScheduleEngine {
       source: "schedule",
       payload: { scheduled_at: scheduledAt.toISOString() },
       receivedAt: nowIso(),
+      metadata: { deliveryId: deliveryIdFor(trigger.id, `sched:${scheduledAt.toISOString()}`), stableDeliveryId: true },
     };
     const job = await this.delivery.handle(trigger, activation);
     await this.store.appendLedger({ event: "pollinate.schedule.fired", trigger_id: trigger.id, job_id: job?.id, at: nowIso() });

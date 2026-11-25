@@ -6,6 +6,7 @@ import { execShell, type ExecResult } from "./process.js";
 import { DEFAULT_HIVE_STARTING_WAIT_MS, execHive, withHiveStartingObserver, type HiveStartingObserver } from "./hive-exec.js";
 import { nowIso, parseDuration } from "./time.js";
 import { executeRouter } from "./router.js";
+import { activationDeliveryIds, admitDelivery, deliveryIdFor, withDeliveryId } from "./delivery.js";
 
 export type ActionExecutorOptions = {
   contextTimeoutMs: number;
@@ -16,10 +17,14 @@ export type ActionExecutorOptions = {
 
 export type ActionResult = { timedOut?: boolean; handle?: string; handles?: Record<string, string>; [key: string]: unknown };
 
-type ActionExecutionContext = {
+export type ActionExecutionContext = {
   triggerId: string;
   deliveryId: string;
+  jobId?: string;
+  attempt: number;
 };
+
+const FIRST_ATTEMPT = 1;
 
 export class ActionExecutor {
   constructor(
@@ -34,6 +39,7 @@ export class ActionExecutor {
       idPrefix: identity.idPrefix,
       uuid: identity.uuid,
       triggerId: trigger.id,
+      deliveryId: withDeliveryId(activation).metadata?.deliveryId,
       source: activation.source,
       status: "queued",
       cwd: trigger.cwd,
@@ -44,7 +50,8 @@ export class ActionExecutor {
     };
   }
 
-  async dryRun(trigger: Trigger, activation: Activation, batch: JsonValue[] = [activation.payload]): Promise<DryRunResult> {
+  async dryRun(trigger: Trigger, incoming: Activation, batch: JsonValue[] = [incoming.payload]): Promise<DryRunResult> {
+    const activation = withDeliveryId(incoming);
     if (trigger.router && !trigger.action) {
       return {
         triggerId: trigger.id,
@@ -55,12 +62,13 @@ export class ActionExecutor {
           event: JSON.stringify(activation.payload),
           batch: JSON.stringify(batch),
           batch_count: String(batch.length),
+          delivery_id: activation.metadata?.deliveryId ?? "",
         },
         action: trigger.router.onOpen,
         warnings: ["Router dry-run renders the configured onOpen action only; it does not normalize or route events."],
       };
     }
-    const resolved = await this.buildContext(trigger, activation, batch, trigger.cwd);
+    const resolved = await this.buildContext(trigger, activation, batch, trigger.cwd, { jobId: "dry-run", attempt: FIRST_ATTEMPT });
     if (!trigger.action) throw new Error(`Trigger ${trigger.id} has no action`);
     const rendered = this.renderJobInputs(trigger.action, trigger.cwd, resolved.context);
     return {
@@ -72,7 +80,10 @@ export class ActionExecutor {
     };
   }
 
-  async executeJob(job: Job, trigger: Trigger, activation: Activation, batch: JsonValue[]): Promise<Job> {
+  async executeJob(job: Job, trigger: Trigger, incoming: Activation, batch: JsonValue[]): Promise<Job> {
+    const activation = job.deliveryId && !incoming.metadata?.deliveryId
+      ? { ...incoming, metadata: { ...incoming.metadata, deliveryId: job.deliveryId } }
+      : withDeliveryId(incoming);
     const cancellation = await this.store.getJob(job.id);
     if (cancellation?.status === "cancelled") return cancellation;
     return withHiveStartingObserver(this.hiveStartingObserver(job), () =>
@@ -114,7 +125,8 @@ export class ActionExecutor {
     await this.store.updateJob(job.id, { status: "resolving-context" });
     try {
       const jobCwd = job.cwd ?? trigger.cwd;
-      const resolved = await this.buildContext(trigger, activation, batch, jobCwd);
+      const execution = this.executionContextFor(job, trigger, activation);
+      const resolved = await this.buildContext(trigger, activation, batch, jobCwd, execution);
       if (!job.action) throw new Error(`Job ${job.id} has no action`);
       const rendered = this.renderJobInputs(job.action, jobCwd, resolved.context);
       const warnings = resolved.warnings.concat(rendered.warnings);
@@ -126,10 +138,7 @@ export class ActionExecutor {
         startedAt: nowIso(),
       });
       await this.store.appendLedger({ event: "pollinate.job.started", job_id: job.id, trigger_id: trigger.id, action_kind: rendered.action.kind, cwd: rendered.cwd });
-      const result = await this.executeAction(rendered.action, rendered.cwd, {
-        triggerId: trigger.id,
-        deliveryId: activationDeliveryId(job, activation),
-      });
+      const result = await this.executeAction(rendered.action, rendered.cwd, execution);
       const completed = await this.store.updateJob(job.id, {
         status: result.timedOut ? "timed-out" : "completed",
         result,
@@ -169,6 +178,7 @@ export class ActionExecutor {
         event: JSON.stringify(activation.payload),
         batch: JSON.stringify(batch),
         batch_count: String(batch.length),
+        delivery_id: this.executionContextFor(job, trigger, activation).deliveryId,
       },
       startedAt: nowIso(),
     });
@@ -180,6 +190,7 @@ export class ActionExecutor {
         trigger,
         activation,
         cwd: running.cwd,
+        execution: this.executionContextFor(job, trigger, activation),
       });
       const completed = await this.store.updateJob(job.id, { status: "completed", result, completedAt: nowIso() });
       await this.store.appendLedger({
@@ -198,10 +209,22 @@ export class ActionExecutor {
     }
   }
 
-  private async buildContext(trigger: Trigger, activation: Activation, batch: JsonValue[], cwd?: string) {
+  private executionContextFor(job: Job, trigger: Trigger, activation: Activation): ActionExecutionContext {
+    return {
+      triggerId: trigger.id,
+      deliveryId: job.deliveryId ?? activation.metadata?.deliveryId ?? deliveryIdFor(trigger.id, `job:${job.uuid ?? job.id}`),
+      jobId: job.id,
+      attempt: FIRST_ATTEMPT,
+    };
+  }
+
+  private async buildContext(trigger: Trigger, activation: Activation, batch: JsonValue[], cwd: string | undefined, execution: Pick<ActionExecutionContext, "jobId" | "attempt">) {
     const resolved = await resolveContext(trigger, activation, {
       defaultTimeoutMs: this.options.contextTimeoutMs,
       cwd,
+      jobId: execution.jobId,
+      attempt: execution.attempt,
+      deliveryIds: activationDeliveryIds(activation),
       execution: this.options.execution,
       hiveStartingWaitMs: this.hiveStartingWaitMs,
     });
@@ -243,7 +266,7 @@ export class ActionExecutor {
       try {
         const response = await fetch(action.url, {
           method: action.method,
-          headers: action.headers,
+          headers: withDeliveryHeaders(action.headers, executionContext),
           body: action.body,
           signal: controller.signal,
         });
@@ -405,19 +428,27 @@ export async function fireTriggerNow(
   store: PollinateStore,
   trigger: Trigger,
   payload: JsonValue = {},
-  options: { executor?: ActionExecutor; source?: SourceKind } = {},
+  options: { executor?: ActionExecutor; source?: SourceKind; deliveryId?: string } = {},
 ): Promise<Job> {
   const executor = options.executor ?? (await createExecutor(store));
-  const activation: Activation = {
-    triggerId: trigger.id,
-    source: options.source ?? "manual",
-    payload,
-    receivedAt: nowIso(),
-  };
+  const activation = manualActivation(trigger, payload, options);
+  if (!(await admitDelivery(store, activation))) throw new DuplicateDeliveryError(activation.metadata?.deliveryId ?? "");
   const job = await executor.createQueuedJob(trigger, activation, [payload]);
   await store.saveJob(job);
   await store.appendLedger({ event: "pollinate.job.queued", job_id: job.id, trigger_id: trigger.id, queue_position: 0, at: nowIso() });
   return executor.executeJob(job, trigger, activation, [payload]);
+}
+
+export class DuplicateDeliveryError extends Error {
+  constructor(readonly deliveryId: string) {
+    super(`Delivery ${deliveryId} was already fired; not firing again`);
+  }
+}
+
+export function manualActivation(trigger: Trigger, payload: JsonValue, options: { source?: SourceKind; deliveryId?: string } = {}): Activation {
+  const activation: Activation = { triggerId: trigger.id, source: options.source ?? "manual", payload, receivedAt: nowIso() };
+  if (!options.deliveryId) return withDeliveryId(activation);
+  return { ...activation, metadata: { deliveryId: deliveryIdFor(trigger.id, options.deliveryId), stableDeliveryId: true } };
 }
 
 async function runSequence<T, R>(items: T[], fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -462,8 +493,16 @@ export function sourceKindForTrigger(trigger: Trigger, fallback: SourceKind = "m
   return trigger.source.kind === "manual" ? fallback : trigger.source.kind;
 }
 
-function activationDeliveryId(job: Job, activation: Activation): string {
-  const providerDeliveryId = activation.metadata?.deliveryId;
-  if (!providerDeliveryId) return job.uuid ?? job.id;
-  return `pollinate:${job.triggerId}:${activation.source}:${encodeURIComponent(providerDeliveryId)}`;
+export function withDeliveryHeaders(headers: Record<string, string> | undefined, execution?: ActionExecutionContext): Record<string, string> | undefined {
+  if (!execution) return headers;
+  const merged: Record<string, string> = { ...(headers ?? {}) };
+  const present = new Set(Object.keys(merged).map((key) => key.toLowerCase()));
+  const defaults: Record<string, string> = {
+    "Idempotency-Key": execution.deliveryId,
+    "X-Pollinate-Delivery": execution.deliveryId,
+    "X-Pollinate-Trigger": execution.triggerId,
+    "X-Pollinate-Attempt": String(execution.attempt),
+  };
+  for (const [key, value] of Object.entries(defaults)) if (!present.has(key.toLowerCase())) merged[key] = value;
+  return merged;
 }

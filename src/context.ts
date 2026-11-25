@@ -20,14 +20,29 @@ type RenderedContextSource =
 export async function resolveContext(
   trigger: Trigger,
   activation: Activation,
-  options: { defaultTimeoutMs: number; cwd?: string; execution?: ExecutionProfile; hiveStartingWaitMs?: number },
+  options: {
+    defaultTimeoutMs: number;
+    cwd?: string;
+    execution?: ExecutionProfile;
+    hiveStartingWaitMs?: number;
+    jobId?: string;
+    attempt?: number;
+    deliveryIds?: string[];
+  },
 ): Promise<ResolvedContext> {
+  const deliveryId = activation.metadata?.deliveryId ?? "";
   const context: Record<string, string> = {
     trigger_id: trigger.id,
     fired_at: new Date().toISOString(),
     source_kind: activation.source,
     event: JSON.stringify(activation.payload),
+    delivery_id: deliveryId,
+    delivery_ids: JSON.stringify(options.deliveryIds ?? (deliveryId ? [deliveryId] : [])),
+    job_id: options.jobId ?? "",
+    attempt: String(options.attempt ?? 1),
   };
+  const scheduledAt = scheduledAtOf(activation);
+  if (scheduledAt) context.scheduled_at = scheduledAt;
   const warnings: string[] = [];
   const resolver = trigger.context;
   if (!resolver) return { context, warnings };
@@ -207,4 +222,11 @@ function tokenizeArgv(input: string): string[] {
   if (quote) throw new Error(`Unterminated ${quote} quote in honeybee context query`);
   if (tokenStarted) args.push(current);
   return args;
+}
+
+function scheduledAtOf(activation: Activation): string | undefined {
+  if (activation.source !== "schedule") return undefined;
+  const payload = activation.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  return typeof payload.scheduled_at === "string" ? payload.scheduled_at : undefined;
 }

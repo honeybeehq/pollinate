@@ -18,10 +18,13 @@ import {
   writeJson,
 } from "./fsx.js";
 import { idFromPath, parseDaemonConfigToml, parseTriggerToml, triggerToToml } from "./config.js";
-import type { CursorState, DaemonConfig, DeliveryState, Job, JobStatus, LedgerEvent, RouterBinding, ScheduleState, Trigger } from "./types.js";
+import type { CursorState, DaemonConfig, DeliveriesSeen, DeliveryState, Job, JobStatus, LedgerEvent, RouterBinding, ScheduleState, Trigger } from "./types.js";
 import { nowIso } from "./time.js";
 import { allocateJobIdentity, jobUuidsOf, matchesJobReference, readJobIdIndexSnapshot, reconcileJobIdIndex, type JobIdentity } from "./job-ids.js";
 import { insertNewestFirst, jobFileNames, orderJobForWrite, readJobSummary, scanJobSummaries, type JobSummary } from "./job-scan.js";
+
+export const DELIVERIES_SEEN_PER_TRIGGER = 2_000;
+export const DELIVERIES_SEEN_MAX_AGE_MS = 72 * 60 * 60 * 1000;
 
 export type JobRetentionOptions = {
   /** Required opt-in retention window; terminal jobs newer than this are never deleted. */
@@ -112,6 +115,14 @@ export class PollinateStore {
 
   deliveryStatePath(): string {
     return join(stateDir(this.root), "delivery-state.json");
+  }
+
+  deliveriesSeenPath(): string {
+    return join(stateDir(this.root), "deliveries-seen.json");
+  }
+
+  deliveriesSeenLockPath(): string {
+    return join(stateDir(this.root), "deliveries-seen.lock");
   }
 
   cursorStatePath(): string {
@@ -243,6 +254,7 @@ export class PollinateStore {
     await withFileLock(this.triggerLockPath(id), async () => {
       await unlink(this.triggerPath(id));
     });
+    await this.forgetDeliveries(id);
     await this.appendLedger({ event: "pollinate.trigger.removed", trigger_id: id });
   }
 
@@ -266,6 +278,37 @@ export class PollinateStore {
 
   async writeDeliveryState(state: DeliveryState): Promise<void> {
     await writeJson(this.deliveryStatePath(), state, { sync: false });
+  }
+
+  async readDeliveriesSeen(): Promise<DeliveriesSeen> {
+    return readJsonOr<DeliveriesSeen>(this.deliveriesSeenPath(), {});
+  }
+
+  async hasSeenDelivery(triggerId: string, deliveryId: string, now = Date.now()): Promise<boolean> {
+    const seenAt = (await this.readDeliveriesSeen())[triggerId]?.[deliveryId];
+    return seenAt !== undefined && now - seenAt < DELIVERIES_SEEN_MAX_AGE_MS;
+  }
+
+  async claimDelivery(triggerId: string, deliveryId: string, now = Date.now()): Promise<boolean> {
+    await this.ensure();
+    return withFileLock(this.deliveriesSeenLockPath(), async () => {
+      const seen = await this.readDeliveriesSeen();
+      const seenAt = seen[triggerId]?.[deliveryId];
+      if (seenAt !== undefined && now - seenAt < DELIVERIES_SEEN_MAX_AGE_MS) return false;
+      seen[triggerId] = { ...(seen[triggerId] ?? {}), [deliveryId]: now };
+      await writeJson(this.deliveriesSeenPath(), pruneDeliveriesSeen(seen, now));
+      return true;
+    });
+  }
+
+  async forgetDeliveries(triggerId: string): Promise<void> {
+    await this.ensure();
+    await withFileLock(this.deliveriesSeenLockPath(), async () => {
+      const seen = await this.readDeliveriesSeen();
+      if (!seen[triggerId]) return;
+      delete seen[triggerId];
+      await writeJson(this.deliveriesSeenPath(), pruneDeliveriesSeen(seen, Date.now()));
+    });
   }
 
   async readCursorState(): Promise<CursorState> {
@@ -675,4 +718,16 @@ function ledgerLinesWithPartial(cache: LedgerCache): string[] {
 function ledgerLinesFromText(text: string): string[] {
   const parsed = splitLedgerText(text);
   return parsed.partial ? [...parsed.lines, parsed.partial] : parsed.lines;
+}
+
+function pruneDeliveriesSeen(seen: DeliveriesSeen, now: number): DeliveriesSeen {
+  const pruned: DeliveriesSeen = {};
+  for (const [triggerId, ids] of Object.entries(seen)) {
+    const fresh = Object.entries(ids)
+      .filter(([, seenAt]) => typeof seenAt === "number" && now - seenAt < DELIVERIES_SEEN_MAX_AGE_MS)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, DELIVERIES_SEEN_PER_TRIGGER);
+    if (fresh.length) pruned[triggerId] = Object.fromEntries(fresh);
+  }
+  return pruned;
 }

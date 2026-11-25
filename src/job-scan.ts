@@ -7,6 +7,7 @@ export type JobSummary = {
   id: string;
   uuid?: string;
   triggerId: string;
+  deliveryId?: string;
   status: JobStatus;
   queuedAt: string;
   startedAt?: string;
@@ -14,12 +15,12 @@ export type JobSummary = {
   bytes: number;
 };
 
-const SUMMARY_KEYS = ["id", "idPrefix", "uuid", "triggerId", "source", "status", "queuedAt", "startedAt", "completedAt"] as const;
+const SUMMARY_KEYS = ["id", "idPrefix", "uuid", "triggerId", "deliveryId", "source", "status", "queuedAt", "startedAt", "completedAt"] as const;
 const SUMMARY_KEY_SET = new Set<string>(SUMMARY_KEYS);
 const HEAD_BYTES = 4096;
 const SCAN_CONCURRENCY = 16;
 const TOP_LEVEL_STRING_FIELD = /^ {2}"([A-Za-z]+)": ("(?:[^"\\]|\\.)*"),?$/;
-const TOP_LEVEL_SUMMARY_NEEDLES = ["id", "uuid", "triggerId", "status", "queuedAt", "startedAt", "completedAt"].map(
+const TOP_LEVEL_SUMMARY_NEEDLES = ["id", "uuid", "triggerId", "deliveryId", "status", "queuedAt", "startedAt", "completedAt"].map(
   (key) => [key, Buffer.from(`\n  "${key}": "`)] as const,
 );
 
@@ -128,6 +129,7 @@ function summaryFromFields(fields: Record<string, string>, file: string, bytes: 
     id: fields.id,
     uuid: fields.uuid,
     triggerId: fields.triggerId,
+    deliveryId: fields.deliveryId,
     status: fields.status as JobStatus,
     queuedAt: fields.queuedAt,
     startedAt: fields.startedAt,
@@ -143,6 +145,7 @@ function summaryFromJob(job: Job, file: string, bytes: number): JobSummary | nul
     id: job.id,
     uuid: job.uuid,
     triggerId: job.triggerId,
+    deliveryId: job.deliveryId,
     status: job.status,
     queuedAt: job.queuedAt,
     startedAt: job.startedAt,

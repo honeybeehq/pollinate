@@ -1,4 +1,5 @@
-import type { Activation, DeliveryState, Job, JsonValue, Trigger } from "./types.js";
+import { createHash, randomUUID } from "node:crypto";
+import type { Activation, DeliveryState, Job, JsonValue, SourceKind, Trigger } from "./types.js";
 import { ActionExecutor } from "./actions.js";
 import { matchesFilter } from "./filter.js";
 import { PollinateStore } from "./store.js";
@@ -6,6 +7,55 @@ import { nowIso, parseDuration } from "./time.js";
 import { appendTextLine, daemonLogPath } from "./fsx.js";
 
 const DEBOUNCE_MAX_WAIT_MULTIPLIER = 6;
+
+export function deliveryIdFor(triggerId: string, part: string): string {
+  return `${triggerId}:${part}`;
+}
+
+export function fallbackDeliveryPart(source: SourceKind, activation: Pick<Activation, "payload" | "receivedAt">): string {
+  if (source === "schedule") {
+    const payload = activation.payload;
+    const scheduledAt = payload && typeof payload === "object" && !Array.isArray(payload) ? payload.scheduled_at : undefined;
+    return `sched:${typeof scheduledAt === "string" ? scheduledAt : activation.receivedAt}`;
+  }
+  if (source === "webhook") return `wh:${randomUUID()}`;
+  if (source === "poll") return `poll:${activation.receivedAt}:0`;
+  return `manual:${randomUUID()}`;
+}
+
+export function withDeliveryId(activation: Activation): Activation {
+  if (activation.metadata?.deliveryId) return activation;
+  return {
+    ...activation,
+    metadata: {
+      ...activation.metadata,
+      deliveryId: deliveryIdFor(activation.triggerId, fallbackDeliveryPart(activation.source, activation)),
+      stableDeliveryId: activation.source === "schedule",
+    },
+  };
+}
+
+export function batchDeliveryId(triggerId: string, memberIds: string[]): string {
+  const digest = createHash("sha256").update(memberIds.join("\n")).digest("hex").slice(0, 16);
+  return deliveryIdFor(triggerId, `batch:${digest}`);
+}
+
+export function activationDeliveryIds(activation: Activation): string[] {
+  const ids = activation.metadata?.deliveryIds;
+  if (ids?.length) return ids;
+  const id = activation.metadata?.deliveryId;
+  return id ? [id] : [];
+}
+
+export async function admitDelivery(store: PollinateStore, activation: Activation): Promise<boolean> {
+  const deliveryId = activation.metadata?.deliveryId;
+  if (!deliveryId || !activation.metadata?.stableDeliveryId) return true;
+  if (await store.claimDelivery(activation.triggerId, deliveryId)) return true;
+  await store.appendLedger({ event: "pollinate.delivery.duplicate", trigger_id: activation.triggerId, delivery_id: deliveryId, source: activation.source });
+  return false;
+}
+
+export type HandleOptions = { claimed?: boolean };
 
 type RuntimeState = {
   running: number;
@@ -35,8 +85,10 @@ export class DeliveryManager {
     }
   }
 
-  async handle(trigger: Trigger, activation: Activation): Promise<Job | null> {
+  async handle(trigger: Trigger, incoming: Activation, options: HandleOptions = {}): Promise<Job | null> {
     if (!trigger.enabled) return null;
+    const activation = withDeliveryId(incoming);
+    if (!options.claimed && !(await admitDelivery(this.store, activation))) return null;
     if (!matchesFilter(trigger.filter, activation.payload)) {
       await this.store.appendLedger({ event: "pollinate.delivery.filtered", trigger_id: trigger.id });
       return null;
@@ -106,11 +158,12 @@ export class DeliveryManager {
     const now = Date.now();
     const throttleUntil = state.throttleUntil ? new Date(state.throttleUntil).getTime() : 0;
     if (now >= throttleUntil) {
-      const batch = mode.collect && state.pendingBatch?.length ? [...state.pendingBatch.map((item) => item.payload), activation.payload] : [activation.payload];
+      const collected = mode.collect && state.pendingBatch?.length ? [...state.pendingBatch, activation] : undefined;
       this.persisted[trigger.id] = { ...state, throttleUntil: new Date(now + parseDuration(mode.interval)).toISOString(), pendingBatch: undefined, timerDueAt: undefined, timerKind: undefined };
       this.setTimer(trigger, parseDuration(mode.interval), "throttled");
       await this.persist();
-      return this.enqueue(trigger, activation, batch);
+      if (collected) return this.enqueue(trigger, batchActivation(trigger.id, collected), collected.map((item) => item.payload));
+      return this.enqueue(trigger, activation, [activation.payload]);
     }
     if (mode.collect) {
       state.pendingBatch = [...(state.pendingBatch ?? []), activation];
@@ -163,7 +216,7 @@ export class DeliveryManager {
     const state = this.persistedFor(trigger.id);
     const pending = state.pendingBatch ?? [];
     if (pending.length === 0) return null;
-    const activation = pending[pending.length - 1];
+    const activation = batchActivation(trigger.id, pending);
     const batch = pending.map((item) => item.payload);
     this.persisted[trigger.id] = {
       ...state,
@@ -316,4 +369,18 @@ export class DeliveryManager {
   private async persist(): Promise<void> {
     await this.store.writeDeliveryState(this.persisted);
   }
+}
+
+function batchActivation(triggerId: string, members: Activation[]): Activation {
+  const last = members[members.length - 1]!;
+  const memberIds = members.map((member) => member.metadata?.deliveryId ?? deliveryIdFor(triggerId, `legacy:${member.receivedAt}`));
+  return {
+    ...last,
+    metadata: {
+      ...last.metadata,
+      deliveryId: batchDeliveryId(triggerId, memberIds),
+      deliveryIds: memberIds,
+      stableDeliveryId: false,
+    },
+  };
 }

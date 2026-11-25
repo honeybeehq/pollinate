@@ -81,7 +81,16 @@ async function gcBinding(
   result: RouterGcResult,
 ): Promise<void> {
   const now = options.now ?? Date.now();
-  const deps: RouterDeps = { store: options.store, executor: options.executor, trigger, cwd: trigger.cwd };
+  const deps: RouterDeps = {
+    store: options.store,
+    executor: options.executor,
+    trigger,
+    cwd: trigger.cwd,
+    executionFor: (_subjectKey, phase) => {
+      const attempt = phase === "open" ? binding.openAttempts ?? 1 : 1;
+      return { triggerId: trigger.id, deliveryId: `gc:${binding.id}:${phase}:${attempt}`, attempt };
+    },
+  };
 
   if (binding.status === "active" || binding.status === "closing") {
     if (router.idleTtl && now - lastTouchMs(binding) >= parseDuration(router.idleTtl)) {

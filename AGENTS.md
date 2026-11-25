@@ -127,6 +127,7 @@ symlinks, then
   router-plugins/<name>.mjs       user-space router plugins
   state/schedule-state.json       next/last fire times
   state/delivery-state.json       throttle/batch/debounce queues
+  state/deliveries-seen.json      stable delivery ids already fired (dedup; see Delivery identity)
   state/cursors.json              poll cursors
   state/job-id-index.json         UUIDs used for visible job ID suffixes
   state/job-id-index.lock         lock for the job ID index
@@ -150,7 +151,7 @@ symlinks, then
 | Command | Purpose |
 |---|---|
 | `pol add / create / list / get / enable / disable / edit / remove` | trigger CRUD; `edit` validates the TOML on editor exit |
-| `pol trigger <id> [--payload '{…}'] [--dry-run]` | fire manually |
+| `pol trigger <id> [--payload '{…}'] [--delivery-id <id>] [--dry-run]` | fire manually; a repeated `--delivery-id` answers `duplicate` and does not fire |
 | `pol jobs [--last 100] / job <id> / job cancel <id>` | job inspection; `pol jobs` lists the newest 100 unless `--last <n>` (n ≥ 1; `--last 0` is refused) says otherwise, and says so (stderr with `--json`) when more exist |
 | `pol jobs gc [--max-age 14d] [--keep-last 50] [--max-per-trigger 500] [--max-total 20000] [--dry-run]` | remove terminal job files by age and by the per-trigger and total caps; unset flags come from `[retention]`, so the caps apply even when only `--max-age`/`--keep-last` are given (see Job retention) |
 | `pol bindings [--trigger <id>] / bindings get <id>` | router binding inspection |
@@ -164,7 +165,7 @@ symlinks, then
 
 Answering "why didn't my trigger fire?": check `pol ledger -n 200` for
 `delivery.filtered`, `router.open_filtered`, `webhook.rejected`,
-`webhook.duplicate`, `router.unbound`, or `delivery.throttled` events, then
+`webhook.duplicate`, `delivery.duplicate`, `router.unbound`, or `delivery.throttled` events, then
 `pol daemon logs` for daemon lifecycle and binding-GC lines.
 
 ## Trigger TOML schema
@@ -206,6 +207,7 @@ strategy = "hash" | "append-offset" | "jsonpath"  # jsonpath = "$.items[*].id"
 [trigger.source.webhook]
 path = "github/myrepo/pr"    # served at /hook/<path>
 secret = "env:HOOK_SECRET"   # literal or env:NAME; HMAC sha256 (sha1 for vercel)
+deliveryIdHeader = "x-event-id"  # optional; provider header carrying a stable delivery id
 [trigger.source.webhook.transform]   # optional jsonpath remap of the payload
 title = "$.pull_request.title"
 
@@ -245,7 +247,7 @@ kind = "command" | "http" | "emit" | "honeybee" | "sequence"
 | kind | fields |
 |---|---|
 | `command` | `command`, `cwd?`, `timeout?` — runs through the configured shell |
-| `http` | `method`, `url`, `headers?`, `body?`, `timeout?` |
+| `http` | `method`, `url`, `headers?`, `body?`, `timeout?` — also sends `Idempotency-Key` and `X-Pollinate-Delivery` (the delivery id), `X-Pollinate-Trigger` and `X-Pollinate-Attempt` unless `headers` sets them (case-insensitive) |
 | `emit` | `subject`, `payload?` — appends a ledger event only |
 | `honeybee` | `run = "spawn"\|"send"\|"kill"` (below) |
 | `sequence` | `mode = "serial"\|"parallel"`, `primary?`, `continueOnError?`, `actions = [{id, action}]` |
@@ -336,6 +338,10 @@ Plain (non-router) actions:
 | var | value |
 |---|---|
 | `trigger_id`, `source_kind`, `fired_at` | activation metadata |
+| `delivery_id` | the job's delivery id (see Delivery identity) |
+| `delivery_ids` | JSON array of member delivery ids (one entry unless batched) |
+| `job_id`, `attempt` | the job id; attempt number, starting at `1` |
+| `scheduled_at` | schedule triggers only: the occurrence being fired |
 | `event` | JSON of the (transformed) payload |
 | `batch`, `batch_count` | JSON array of batched payloads / count |
 | `<context vars>` | from `[trigger.context]` static + sources |
@@ -346,6 +352,7 @@ plus:
 | var | value |
 |---|---|
 | `event_kind`, `subject_key`, `binding_id` | routing metadata |
+| `delivery_id`, `attempt`, `job_id` | execution id: `<job delivery id>:<subject_key>:<open\|activity\|close>`; GC-driven runs use `gc:<binding id>:<open\|close>:<attempt>` (no `job_id`) |
 | `binding.target` (and `target`) | bound hive handle |
 | `binding.targets.<stepId>` | per-step handles for sequence/swarm onOpen |
 
@@ -372,9 +379,11 @@ it. Keep review bees read-only (`--allowedTools` with `gh pr view/diff/comment`,
 - Signatures: `x-hub-signature-256` / `x-pollinate-signature` / `x-signature`
   (HMAC-SHA256 hex), or `x-vercel-signature` (SHA1). No secret ⇒ any POST fires.
 - Rejected signatures ledger `pollinate.webhook.rejected` with a `reason`.
-- Redeliveries: repeats of `x-github-delivery` per trigger are accepted with
-  `{duplicate: true}` but not dispatched (ledger `pollinate.webhook.duplicate`).
-  The cache is in-memory; a daemon restart forgets old GUIDs.
+- Redeliveries: a repeated provider delivery id per trigger (see Delivery
+  identity) is accepted with `{duplicate: true}` but not dispatched (ledger
+  `pollinate.webhook.duplicate`). The record lives in
+  `state/deliveries-seen.json`, so it survives daemon restarts. Accepted
+  deliveries answer `{accepted: true, delivery_id}`.
 - Relay: `pol satellite run` on a public host forwards `/hook/*` to the local
   daemon's `/relay/*` with a timestamped HMAC (`[webhook.relay] secret`).
 
@@ -487,6 +496,30 @@ out of heap; launchd restarted it every 16 s for seven hours.
   [--max-per-trigger <n>] [--max-total <n>] [--dry-run]`. Flags default to the
   `[retention]` config; `--dry-run` reports what would be removed, per trigger.
 
+## Delivery identity
+
+Every activation, and so every job (`Job.deliveryId`), has a delivery id
+`<trigger_id>:<part>`:
+
+| source | part | deduped |
+|---|---|---|
+| schedule | `sched:<scheduled_at>` | yes |
+| webhook with a provider id | `wh:<id>` from the `deliveryIdHeader` header, else `x-github-delivery`, `svix-id`, `idempotency-key`, `x-pollinate-delivery` | yes |
+| webhook without one | `wh:<uuid>`; two identical bodies stay two deliveries | no |
+| poll | `poll:<checked_at>:<index>` | no |
+| `pol trigger --delivery-id <id>` | `<id>` | yes |
+| `pol trigger` | `manual:<uuid>` | no |
+| batched, debounced, throttle-collected job | `batch:<first 16 hex of sha256 of the member ids joined by newlines>` | no |
+
+Sequence steps run with `<delivery id>.s<n>`. Deduped ids are recorded in
+`state/deliveries-seen.json` (per trigger: newest 2,000 ids, 72 h; pruned on
+every write and when the trigger is removed). A repeat is not fired: webhooks
+answer `{duplicate: true}` and ledger `pollinate.webhook.duplicate`, other
+sources ledger `pollinate.delivery.duplicate {trigger_id, delivery_id, source}`.
+A crash between recording an id and running its job loses that delivery;
+a lost write of the record allows one duplicate. Receivers should key on
+`Idempotency-Key` / `{{delivery_id}}`.
+
 ## Ledger events
 
 Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
@@ -496,7 +529,7 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 - `pollinate.trigger.invalid` (a trigger file that fails to load, e.g. one
   using a removed action kind; once per file change, keyed on path, mtime and size)
 - `pollinate.job.{queued,started,completed,errored,cancelled,hive_starting}`
-- `pollinate.delivery.{filtered,throttled}`
+- `pollinate.delivery.{filtered,throttled,duplicate}`
 - `pollinate.schedule.{fired,missed,errored}` · `pollinate.poll.{checked,detected,errored}`
 - `pollinate.webhook.{received,rejected,duplicate}`
 - `pollinate.hook.{created,delivered,expired,gc_removed}`

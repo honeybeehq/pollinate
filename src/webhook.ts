@@ -1,7 +1,7 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import http, { IncomingMessage, ServerResponse } from "node:http";
 import type { Activation, JsonObject, JsonValue, Trigger, WebhookRelayConfig, WebhookSpec } from "./types.js";
-import { DeliveryManager } from "./delivery.js";
+import { DeliveryManager, deliveryIdFor } from "./delivery.js";
 import { PollinateStore } from "./store.js";
 import { selectJsonPath } from "./jsonpath.js";
 import { nowIso } from "./time.js";
@@ -9,7 +9,7 @@ import { resolveSecret } from "./secrets.js";
 import { validRelaySignature } from "./satellite.js";
 import { expireTemporaryHook, isExpiredTemporaryHook, recordWebhookDelivery } from "./hooks.js";
 
-const MAX_SEEN_DELIVERIES = 1_000;
+const PROVIDER_DELIVERY_HEADERS = ["x-github-delivery", "svix-id", "idempotency-key", "x-pollinate-delivery"];
 const MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
 const HEADERS_TIMEOUT_MS = 10_000;
@@ -20,8 +20,6 @@ const ROUTER_CREATION_LIMIT = 30;
 
 export class WebhookServer {
   private server?: http.Server;
-  /** Recently seen webhook delivery GUIDs (`<triggerId>:<x-github-delivery>`), insertion-ordered for eviction. */
-  private readonly seenDeliveries = new Set<string>();
   private readonly routerAdmission = new Map<string, number[]>();
 
   constructor(
@@ -141,9 +139,10 @@ export class WebhookServer {
         send(response, 400, { error: "invalid json" });
         return;
       }
-      const deliveryId = headerValue(request.headers["x-github-delivery"]);
-      if (deliveryId && this.isDuplicateDelivery(trigger.id, deliveryId)) {
-        send(response, 202, { accepted: true, duplicate: true, trigger_id: trigger.id });
+      const providerId = providerDeliveryId(trigger.source.webhook, request.headers);
+      const deliveryId = deliveryIdFor(trigger.id, `wh:${providerId ?? randomUUID()}`);
+      const duplicate = async () => {
+        send(response, 202, { accepted: true, duplicate: true, trigger_id: trigger.id, delivery_id: deliveryId });
         await this.store.appendLedger({
           event: "pollinate.webhook.duplicate",
           trigger_id: trigger.id,
@@ -151,17 +150,25 @@ export class WebhookServer {
           delivery_id: deliveryId,
           source_ip: request.socket.remoteAddress,
         });
+      };
+      if (providerId && (await this.store.hasSeenDelivery(trigger.id, deliveryId))) {
+        await duplicate();
         return;
       }
       if (!(await this.admitRouterDelivery(trigger, path, request, response))) return;
+      if (providerId && !(await this.store.claimDelivery(trigger.id, deliveryId))) {
+        await duplicate();
+        return;
+      }
       const dispatchTrigger = trigger;
       const transformed = trigger.router ? payload : applyWebhookTransform(trigger.source.webhook, payload);
       const updated = await recordWebhookDelivery(this.store, trigger);
       this.replaceTrigger(updated);
-      send(response, 202, { accepted: true, trigger_id: trigger.id });
+      send(response, 202, { accepted: true, trigger_id: trigger.id, delivery_id: deliveryId });
       await this.store.appendLedger({
         event: "pollinate.webhook.received",
         trigger_id: trigger.id,
+        delivery_id: deliveryId,
         path,
         source_ip: request.socket.remoteAddress,
         at: nowIso(),
@@ -170,7 +177,8 @@ export class WebhookServer {
       void this.dispatch(dispatchTrigger, transformed, request.socket.remoteAddress ?? "unknown", {
         path,
         headers: normalizedHeaders(request.headers),
-        ...(deliveryId ? { deliveryId } : {}),
+        deliveryId,
+        stableDeliveryId: Boolean(providerId),
       }).catch((error) =>
         this.store.appendLedger({
           event: "pollinate.webhook.rejected",
@@ -190,7 +198,7 @@ export class WebhookServer {
     trigger: Trigger,
     payload: JsonValue,
     _sourceIp: string,
-    webhook?: { path?: string; headers?: Record<string, string>; deliveryId?: string },
+    webhook?: { path?: string; headers?: Record<string, string>; deliveryId?: string; stableDeliveryId?: boolean },
   ): Promise<void> {
     const activation: Activation = {
       triggerId: trigger.id,
@@ -199,28 +207,16 @@ export class WebhookServer {
       receivedAt: nowIso(),
       metadata: webhook
         ? {
-            ...(webhook.deliveryId ? { deliveryId: webhook.deliveryId } : {}),
+            ...(webhook.deliveryId ? { deliveryId: webhook.deliveryId, stableDeliveryId: webhook.stableDeliveryId } : {}),
             webhook: { path: webhook.path, headers: webhook.headers },
           }
         : undefined,
     };
-    await this.delivery.handle(trigger, activation);
+    await this.delivery.handle(trigger, activation, { claimed: true });
   }
 
   private replaceTrigger(updated: Trigger): void {
     this.triggers = this.triggers.map((trigger) => (trigger.id === updated.id ? updated : trigger));
-  }
-
-  private isDuplicateDelivery(triggerId: string, deliveryId: string): boolean {
-    const key = `${triggerId}:${deliveryId}`;
-    if (this.seenDeliveries.has(key)) return true;
-    this.seenDeliveries.add(key);
-    while (this.seenDeliveries.size > MAX_SEEN_DELIVERIES) {
-      const oldest = this.seenDeliveries.values().next().value;
-      if (oldest === undefined) break;
-      this.seenDeliveries.delete(oldest);
-    }
-    return false;
   }
 
   private async ledgerRejection(triggerId: string, path: string, reason: string, request: IncomingMessage): Promise<void> {
@@ -305,6 +301,15 @@ function validHexHmacSignature(algorithm: "sha1" | "sha256", secret: string, raw
   const a = Buffer.from(expected, "hex");
   const b = Buffer.from(received, "hex");
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function providerDeliveryId(spec: WebhookSpec, headers: IncomingMessage["headers"]): string | undefined {
+  const names = spec.deliveryIdHeader ? [spec.deliveryIdHeader.toLowerCase(), ...PROVIDER_DELIVERY_HEADERS] : PROVIDER_DELIVERY_HEADERS;
+  for (const name of names) {
+    const value = headerValue(headers[name])?.trim();
+    if (value) return value;
+  }
+  return undefined;
 }
 
 function headerValue(value: string | string[] | undefined): string | undefined {

@@ -1,5 +1,5 @@
 import { renderAction } from "./templates.js";
-import type { ActionResult } from "./actions.js";
+import type { ActionExecutionContext, ActionResult } from "./actions.js";
 import { matchesFilter } from "./filter.js";
 import { getRouterPlugin } from "./router-plugins/index.js";
 import type { Activation, Action, CanonicalRouterEvent, JsonValue, RouterBinding, RouterConfig, Trigger } from "./types.js";
@@ -7,18 +7,22 @@ import type { PollinateStore } from "./store.js";
 import { nowIso } from "./time.js";
 
 export type RouterActionExecutor = {
-  executeAction(action: Action, cwd?: string): Promise<ActionResult>;
+  executeAction(action: Action, cwd?: string, execution?: ActionExecutionContext): Promise<ActionResult>;
 };
+
+export type RouterPhase = "open" | "activity" | "close";
 
 export type RouterDeps = {
   store: PollinateStore;
   executor: RouterActionExecutor;
   trigger: Trigger;
   cwd?: string;
+  executionFor?: (subjectKey: string, phase: RouterPhase) => ActionExecutionContext;
 };
 
 export type ExecuteRouterOptions = RouterDeps & {
   activation: Activation;
+  execution?: ActionExecutionContext;
 };
 
 export type RouterEventResult =
@@ -35,8 +39,12 @@ export async function executeRouter(options: ExecuteRouterOptions): Promise<{ pl
   const input = routerInput(options.activation);
   const events = await plugin.normalize(input);
   const results: RouterEventResult[] = [];
+  const execution = options.execution;
+  const scoped: ExecuteRouterOptions = execution
+    ? { ...options, executionFor: (subjectKey, phase) => ({ ...execution, deliveryId: `${execution.deliveryId}:${subjectKey}:${phase}` }) }
+    : options;
   for (const event of events) {
-    results.push(await handleRouterEvent(options, router, event));
+    results.push(await handleRouterEvent(scoped, router, event));
   }
   return { plugin: plugin.name, events: results };
 }
@@ -123,8 +131,9 @@ export async function createBinding(
   });
 
   try {
-    const rendered = renderRouterAction(router.onOpen, event, pending);
-    const result = await deps.executor.executeAction(rendered, deps.cwd);
+    const execution = deps.executionFor?.(event.subjectKey, "open");
+    const rendered = renderRouterAction(router.onOpen, event, pending, execution);
+    const result = await deps.executor.executeAction(rendered, deps.cwd, execution);
     const handles = result.handles && isStringRecord(result.handles) ? result.handles : undefined;
     const handle = typeof result.handle === "string" ? result.handle : handles ? Object.values(handles)[0] : honeybeeSpawnName(rendered);
     if (!handle) throw new Error("Router onOpen action did not produce a target handle");
@@ -178,9 +187,10 @@ async function routeToBinding(
   event: CanonicalRouterEvent,
   binding: RouterBinding,
 ): Promise<RouterEventResult> {
-  const action = renderRouterAction(router.onActivity, event, binding);
+  const execution = deps.executionFor?.(event.subjectKey, "activity");
+  const action = renderRouterAction(router.onActivity, event, binding, execution);
   try {
-    await deps.executor.executeAction(action, deps.cwd);
+    await deps.executor.executeAction(action, deps.cwd, execution);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await deps.store.saveRouterBinding({ ...binding, updatedAt: nowIso(), lastEventKind: event.kind, error: message });
@@ -223,8 +233,9 @@ export async function closeBinding(
 ): Promise<RouterEventResult> {
   const closing = { ...binding, status: "closing" as const, updatedAt: nowIso(), lastEventKind: event.kind };
   await deps.store.saveRouterBinding(closing);
-  const action = renderRouterAction(router.onClose ?? defaultCloseAction(), event, closing);
-  await deps.executor.executeAction(action, deps.cwd);
+  const execution = deps.executionFor?.(event.subjectKey, "close");
+  const action = renderRouterAction(router.onClose ?? defaultCloseAction(), event, closing, execution);
+  await deps.executor.executeAction(action, deps.cwd, execution);
   const closed = { ...closing, status: "closed" as const, updatedAt: nowIso(), lastActivityAt: nowIso() };
   await deps.store.saveRouterBinding(closed);
   await deps.store.appendLedger({
@@ -238,9 +249,10 @@ export async function closeBinding(
   return { subjectKey: event.subjectKey, kind: event.kind, outcome: "closed", target: binding.target!.handle };
 }
 
-function renderRouterAction(action: Action, event: CanonicalRouterEvent, binding: RouterBinding): Action {
+function renderRouterAction(action: Action, event: CanonicalRouterEvent, binding: RouterBinding, execution?: ActionExecutionContext): Action {
   const context: Record<string, unknown> = {
     ...event.payload,
+    ...(execution ? { delivery_id: execution.deliveryId, attempt: String(execution.attempt), ...(execution.jobId ? { job_id: execution.jobId } : {}) } : {}),
     event_kind: event.kind,
     subject_key: event.subjectKey,
     binding_id: binding.id,

@@ -268,6 +268,7 @@ function normalizeWebhook(raw: AnyRecord): WebhookSpec {
     path: requiredString(raw.path, "trigger.source.webhook.path").replace(/^\/+/, ""),
     secret: optionalString(raw.secret),
     transform: stringRecord(asOptionalRecord(raw.transform)),
+    deliveryIdHeader: optionalString(raw.deliveryIdHeader ?? raw.delivery_id_header)?.toLowerCase(),
   };
 }
 

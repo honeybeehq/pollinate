@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PollinateStore, type JobRetentionResult } from "./store.js";
-import { ActionExecutor, createExecutor, fireTriggerNow } from "./actions.js";
+import { ActionExecutor, createExecutor, DuplicateDeliveryError, fireTriggerNow, manualActivation } from "./actions.js";
 import { parseDuration, sleep, nowIso } from "./time.js";
 import { parseTriggerToml, removedActionMessage, removedActionMessageIn, slugify } from "./config.js";
 import { shellQuote } from "./process.js";
@@ -255,20 +255,25 @@ async function cmdEdit(store: PollinateStore, args: ParsedArgs): Promise<void> {
 }
 
 async function cmdTrigger(store: PollinateStore, args: ParsedArgs): Promise<void> {
-  const id = requiredArg(args.rest[0], "Usage: pollinate trigger <id> [--payload '{...}'] [--dry-run]");
+  const id = requiredArg(args.rest[0], "Usage: pollinate trigger <id> [--payload '{...}'] [--delivery-id <id>] [--dry-run]");
   const trigger = await store.requireTrigger(id);
   const payload = parsePayload(stringFlag(args, "payload") ?? "{}");
-  const activation: Activation = { triggerId: trigger.id, source: "manual", payload, receivedAt: nowIso() };
+  const deliveryId = stringFlag(args, "delivery-id");
   const executor = await newExecutor(store);
   if (args.flags["dry-run"]) {
-    const dryRun = await executor.dryRun(trigger, activation, [payload]);
+    const dryRun = await executor.dryRun(trigger, manualActivation(trigger, payload, { deliveryId }), [payload]);
     print(args, dryRun, renderDryRun(trigger, dryRun));
     return;
   }
-  const completed = await runWithSpinner(args, `firing ${c.bold(trigger.id)}…`, () =>
-    fireTriggerNow(store, trigger, payload, { executor }),
-  );
-  print(args, completed, renderJobOutcome(completed));
+  try {
+    const completed = await runWithSpinner(args, `firing ${c.bold(trigger.id)}…`, () =>
+      fireTriggerNow(store, trigger, payload, { executor, deliveryId }),
+    );
+    print(args, completed, renderJobOutcome(completed));
+  } catch (error) {
+    if (!(error instanceof DuplicateDeliveryError)) throw error;
+    print(args, { duplicate: true, trigger_id: trigger.id, delivery_id: error.deliveryId }, say.ok(`duplicate delivery ${c.bold(error.deliveryId)}; not fired again`));
+  }
 }
 
 type DryRunResult = Awaited<ReturnType<ActionExecutor["dryRun"]>>;
@@ -458,6 +463,7 @@ function renderJob(job: Job): string {
     "",
     fields([
       ["trigger", c.bold(job.triggerId)],
+      job.deliveryId ? ["delivery", c.dim(job.deliveryId)] : null,
       ["source", sourceLabel(job.source)],
       ["queued", timestampField(job.queuedAt)],
       job.startedAt ? ["started", timestampField(job.startedAt)] : null,
@@ -1911,7 +1917,7 @@ async function printHelp(): Promise<void> {
   out.push("");
   out.push(
     helpSection("Fire & inspect", [
-      ["trigger <id> [--dry-run]", "fire now; --payload '{…}' to pass data"],
+      ["trigger <id> [--dry-run]", "fire now; --payload '{…}' to pass data, --delivery-id <id> to fire once per id"],
       ["jobs [--status <s>] [--last 100]", "list recent jobs"],
       ["jobs gc [--max-age 14d] [--keep-last 50] [--max-per-trigger 500] [--max-total 20000] [--dry-run]", "remove terminal job files by age and by the configured per-trigger and total caps (flags override config)"],
       ["job <jobId> | job cancel <id>", "inspect or cancel a job"],
