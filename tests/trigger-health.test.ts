@@ -390,10 +390,11 @@ describe("poll backoff", () => {
 
   test("ledgers the backoff on poll.errored, records poll failures, and returns to the interval on success", async () => {
     await withTempStore(async (store, root) => {
-      const flag = `${root}/ok`;
+      const feed = join(root, "feed.json");
+      await writeFile(feed, "down");
       const trig = trigger({
         id: "poll-flaky",
-        source: { kind: "poll", poll: { interval: "40ms", emit: "per-poll", fetch: { kind: "command", command: `test -f '${flag}' && echo '[]' || { echo down >&2; exit 1; }` }, cursor: { strategy: "hash" } } },
+        source: { kind: "poll", poll: { interval: "40ms", emit: "per-poll", fetch: { kind: "file", path: feed }, cursor: { strategy: "jsonpath", jsonpath: "$[*].id" } } },
       });
       const monitor = monitorFor(store, [trig]);
       const delivery = new DeliveryManager(store, executor(store), monitor);
@@ -403,12 +404,13 @@ describe("poll backoff", () => {
       try {
         const errored = await waitFor(() => ledgerEvents(store, "pollinate.poll.errored"), (events) => events.length >= 4);
         expect(errored.slice(0, 4).map((event) => [event.consecutive_errors, event.next_check_in_ms])).toEqual([[1, 40], [2, 40], [3, 80], [4, 160]]);
-        await import("node:fs/promises").then((fs) => fs.writeFile(flag, ""));
+        await writeFile(feed, "[]");
         await waitFor(() => ledgerEvents(store, "pollinate.trigger.recovered"), (events) => events.length === 1, 5_000);
         expect((await ledgerEvents(store, "pollinate.trigger.failed")).every((event) => event.kind === "poll")).toBe(true);
-        const checkedAfter = (await ledgerEvents(store, "pollinate.poll.checked")).length;
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        expect((await ledgerEvents(store, "pollinate.poll.checked")).length).toBeGreaterThan(checkedAfter + 2);
+        const erroredBeforeRelapse = (await ledgerEvents(store, "pollinate.poll.errored")).length;
+        await writeFile(feed, "down");
+        const relapse = await waitFor(() => ledgerEvents(store, "pollinate.poll.errored"), (events) => events.length > erroredBeforeRelapse);
+        expect([relapse[erroredBeforeRelapse]?.consecutive_errors, relapse[erroredBeforeRelapse]?.next_check_in_ms]).toEqual([1, 40]);
       } finally {
         await poll.stop();
       }

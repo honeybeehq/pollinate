@@ -378,6 +378,16 @@ async function waitForLedgerCount(store: PollinateStore, event: string, count: n
   throw new Error(`Timed out waiting for ${count} ${event} ledger entries`);
 }
 
+async function waitForPersistedNextFireAt(store: PollinateStore, triggerId: string, expected: string): Promise<string | undefined> {
+  let persisted: string | undefined;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    persisted = (await store.readScheduleState())[triggerId]?.nextFireAt;
+    if (persisted === expected) return persisted;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return persisted;
+}
+
 function cronTrigger(id: string, missedFirePolicy: MissedFirePolicy): Trigger {
   return trigger({ id, source: { kind: "schedule", timing: { type: "cron", expression: "* * * * *", timezone: "UTC", missedFirePolicy } } });
 }
@@ -441,7 +451,7 @@ describe("missed fires", () => {
         const [missed] = await waitForLedgerCount(store, "pollinate.schedule.missed", 1);
         expect(missed).toMatchObject({ trigger_id: "cron-skip", policy: "skip", missed_count: 3, detected: "tick" });
         expect(await store.listJobs()).toHaveLength(0);
-        expect((await store.readScheduleState())["cron-skip"]?.nextFireAt).toBe("2026-11-25T07:44:00.000Z");
+        expect(await waitForPersistedNextFireAt(store, "cron-skip", "2026-11-25T07:44:00.000Z")).toBe("2026-11-25T07:44:00.000Z");
         vi.setSystemTime(new Date("2026-11-25T07:44:00.100Z"));
         const jobs = await waitForTerminalJobs(store, 1);
         expect(scheduledPayloads(jobs)).toEqual([{ scheduled_at: "2026-11-25T07:44:00.000Z", missed: 0, late_ms: 100 }]);
