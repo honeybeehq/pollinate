@@ -102,18 +102,20 @@ kind = "emit"
 subject = "test.inbox"
 `;
 
-const SLOW_TOML = `
+function gatedToml(gate: string): string {
+  return `
 [trigger]
-id = "slow"
+id = "gated"
 [trigger.source]
 kind = "manual"
 [trigger.delivery]
 maxConcurrent = 1
 [trigger.action]
 kind = "command"
-command = "sleep 2"
+command = "while [ ! -e '${gate}' ]; do sleep 0.02; done"
 timeout = "5s"
 `;
+}
 
 const BROKEN_POLL_TOML = `
 [trigger]
@@ -140,18 +142,20 @@ describe("pol through the daemon socket", () => {
       const posted = await fetch(added.json.webhook.localUrl, { method: "POST", body: "{}", headers: { "content-type": "application/json" } });
       expect(posted.status).toBe(202);
 
-      expect((await pol(root, "add", await writeToml(root, "slow", SLOW_TOML))).json).toMatchObject({ id: "slow", via: "daemon" });
-      const first = pol(root, "trigger", "slow");
-      const second = pol(root, "trigger", "slow");
-      await waitForJob(store, "slow", "running");
-      const queued = await waitForJob(store, "slow", "queued");
+      const gate = join(root, "gate");
+      expect((await pol(root, "add", await writeToml(root, "gated", gatedToml(gate)))).json).toMatchObject({ id: "gated", via: "daemon" });
+      const first = pol(root, "trigger", "gated");
+      const second = pol(root, "trigger", "gated");
+      await waitForJob(store, "gated", "running");
+      const queued = await waitForJob(store, "gated", "queued");
 
       const cancelled = await pol(root, "job", "cancel", queued.id);
       expect(cancelled.json).toMatchObject({ id: queued.id, status: "cancelled", via: "daemon" });
+      await writeFile(gate, "");
       const outcomes = [(await first).json, (await second).json].sort((a, b) => a.status.localeCompare(b.status));
       expect(outcomes).toMatchObject([
         { id: queued.id, status: "cancelled", via: "daemon" },
-        { triggerId: "slow", status: "completed", via: "daemon" },
+        { triggerId: "gated", status: "completed", via: "daemon" },
       ]);
 
       expect((await pol(root, "disable", "inbox")).json).toMatchObject({ id: "inbox", enabled: false, via: "daemon" });
@@ -193,11 +197,13 @@ describe("pol through the daemon socket", () => {
       expect(missing.code).toBe(1);
       expect(missing.json).toMatchObject({ code: "not_found" });
 
-      await pol(root, "add", await writeToml(root, "slow", SLOW_TOML));
-      await pol(root, "disable", "slow");
-      const disabled = await pol(root, "trigger", "slow");
-      expect(disabled.json).toMatchObject({ triggerId: "slow", status: "completed", via: "files" });
-      expect(await store.listJobs({ triggerId: "slow" })).toHaveLength(1);
+      const gate = join(root, "gate");
+      await writeFile(gate, "");
+      await pol(root, "add", await writeToml(root, "gated", gatedToml(gate)));
+      await pol(root, "disable", "gated");
+      const disabled = await pol(root, "trigger", "gated");
+      expect(disabled.json).toMatchObject({ triggerId: "gated", status: "completed", via: "files" });
+      expect(await store.listJobs({ triggerId: "gated" })).toHaveLength(1);
     });
   });
 });
