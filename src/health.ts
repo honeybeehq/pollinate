@@ -4,7 +4,7 @@ import { deliveryIdFor } from "./delivery.js";
 import { appendTextLine, daemonLogPath } from "./fsx.js";
 import type { InvalidTrigger, PollinateStore } from "./store.js";
 import { nowIso, parseDuration } from "./time.js";
-import type { Action, Activation, FailureKind, OnFailurePolicy, RetryPolicy, Trigger, TriggerHealth, TriggerHealthEntry } from "./types.js";
+import type { Action, Activation, FailureKind, Job, OnFailurePolicy, RetryPolicy, Trigger, TriggerHealth, TriggerHealthEntry } from "./types.js";
 
 export const FAILURE_ERROR_MAX_CHARS = 2_000;
 export const DEFAULT_ON_FAILURE_AFTER = 1;
@@ -70,6 +70,11 @@ export function failureVars(triggerId: string, triggerName: string, entry: Trigg
   };
 }
 
+export function notificationStampOf(job: Pick<Job, "triggerId" | "deliveryId">): string | undefined {
+  const prefix = `${job.triggerId}:failure:`;
+  return job.deliveryId?.startsWith(prefix) ? job.deliveryId.slice(prefix.length) : undefined;
+}
+
 export function notificationRetryOn(action: Action): string[] {
   return [...new Set([...defaultRetryOn(action), "exit", "timeout"])];
 }
@@ -77,6 +82,7 @@ export function notificationRetryOn(action: Action): string[] {
 export class TriggerHealthMonitor implements HealthRecorder {
   private entries = new Map<string, TriggerHealthEntry>();
   private readonly notifications = new Set<Promise<void>>();
+  private readonly notificationJobs = new Set<string>();
   private readonly shutdownController = new AbortController();
 
   constructor(
@@ -105,7 +111,7 @@ export class TriggerHealthMonitor implements HealthRecorder {
       const at = nowIso();
       const error = cutFailureError(failure.error);
       const policy = resolveOnFailure(trigger?.onFailure, this.options.defaults);
-      const decision = { notify: false };
+      const decision: { notify: boolean; previousNotifiedAt?: string } = { notify: false };
       const health = await this.store.updateTriggerHealth(triggerId, (current) => {
         const streak = current?.consecutiveFailures ?? 0;
         const next: TriggerHealthEntry = {
@@ -117,7 +123,10 @@ export class TriggerHealthMonitor implements HealthRecorder {
           lastError: error,
         };
         decision.notify = policy !== undefined && notificationDue(next, policy, Date.parse(at));
-        if (decision.notify) next.notifiedAt = at;
+        if (decision.notify) {
+          decision.previousNotifiedAt = current?.notifiedAt;
+          next.notifiedAt = at;
+        }
         return next;
       });
       this.remember(health);
@@ -131,7 +140,7 @@ export class TriggerHealthMonitor implements HealthRecorder {
         ...(failure.deliveryId ? { delivery_id: failure.deliveryId } : {}),
         consecutive: entry.consecutiveFailures,
       });
-      if (decision.notify && policy) this.startNotification(triggerId, trigger?.name ?? triggerId, policy, entry, failure);
+      if (decision.notify && policy) this.startNotification(triggerId, trigger?.name ?? triggerId, policy, entry, failure, decision.previousNotifiedAt);
     } catch (error) {
       await this.log(`recording a ${failure.kind} failure for ${triggerId} failed: ${messageOf(error)}`);
     }
@@ -170,6 +179,16 @@ export class TriggerHealthMonitor implements HealthRecorder {
     }
   }
 
+  ownsNotification(jobId: string): boolean {
+    return this.notificationJobs.has(jobId);
+  }
+
+  async notificationInterrupted(job: Job, error: string): Promise<void> {
+    await this.notificationErrored({ trigger_id: job.triggerId, job_id: job.id, error });
+    const stamp = notificationStampOf(job);
+    if (stamp) await this.releaseCooldown(job.triggerId, stamp, undefined);
+  }
+
   async idle(): Promise<void> {
     while (this.notifications.size) await Promise.allSettled([...this.notifications]);
   }
@@ -182,16 +201,33 @@ export class TriggerHealthMonitor implements HealthRecorder {
     this.entries = new Map(Object.entries(health));
   }
 
-  private startNotification(triggerId: string, triggerName: string, policy: ResolvedOnFailure, entry: TriggerHealthEntry, failure: TriggerFailure): void {
-    const run = this.runNotification(triggerId, triggerName, policy, entry, failure).catch((error) =>
-      this.notificationErrored({ trigger_id: triggerId, error: messageOf(error) }),
-    );
+  private startNotification(
+    triggerId: string,
+    triggerName: string,
+    policy: ResolvedOnFailure,
+    entry: TriggerHealthEntry,
+    failure: TriggerFailure,
+    previousNotifiedAt: string | undefined,
+  ): void {
+    const notifiedAt = entry.notifiedAt ?? nowIso();
+    const run = this.runNotification(triggerId, triggerName, policy, entry, failure, notifiedAt)
+      .then((delivered) => (delivered ? undefined : this.releaseCooldown(triggerId, notifiedAt, previousNotifiedAt)))
+      .catch(async (error) => {
+        await this.notificationErrored({ trigger_id: triggerId, error: messageOf(error) });
+        await this.releaseCooldown(triggerId, notifiedAt, previousNotifiedAt);
+      });
     this.notifications.add(run);
     void run.finally(() => this.notifications.delete(run));
   }
 
-  private async runNotification(triggerId: string, triggerName: string, policy: ResolvedOnFailure, entry: TriggerHealthEntry, failure: TriggerFailure): Promise<void> {
-    const at = entry.notifiedAt ?? nowIso();
+  private async runNotification(
+    triggerId: string,
+    triggerName: string,
+    policy: ResolvedOnFailure,
+    entry: TriggerHealthEntry,
+    failure: TriggerFailure,
+    at: string,
+  ): Promise<boolean> {
     const vars = failureVars(triggerId, triggerName, entry, failure);
     const notifier = notificationTrigger(triggerId, triggerName, policy.action, vars, this.options.notificationRetry ?? NOTIFICATION_RETRY, at);
     const activation: Activation = {
@@ -202,11 +238,21 @@ export class TriggerHealthMonitor implements HealthRecorder {
       metadata: { deliveryId: deliveryIdFor(triggerId, `failure:${at}`) },
     };
     const job = await this.executor.createQueuedJob(notifier, activation, [vars]);
+    this.notificationJobs.add(job.id);
+    try {
+      return await this.deliverNotification(job, notifier, activation, vars);
+    } finally {
+      this.notificationJobs.delete(job.id);
+    }
+  }
+
+  private async deliverNotification(job: Job, notifier: Trigger, activation: Activation, vars: Record<string, string>): Promise<boolean> {
+    const triggerId = job.triggerId;
     await this.store.saveJob(job);
     await this.store.appendLedger({ event: "pollinate.job.queued", job_id: job.id, trigger_id: triggerId, source: "failure", queue_position: 0, at: nowIso() });
     let current = await this.executor.executeJob(job, notifier, activation, [vars]);
     while (current.status === "retrying") {
-      if (!(await this.waitUntil(current.nextAttemptAt))) return;
+      if (!(await this.waitUntil(current.nextAttemptAt))) return true;
       current = await this.executor.executeJob(job, notifier, activation, [vars]);
     }
     if (current.status === "errored" || current.status === "timed-out") {
@@ -216,6 +262,21 @@ export class TriggerHealthMonitor implements HealthRecorder {
         error: current.status === "timed-out" ? "action timed out" : (current.error ?? "notification failed"),
         attempts: current.attempt,
       });
+      return false;
+    }
+    return true;
+  }
+
+  private async releaseCooldown(triggerId: string, notifiedAt: string, previousNotifiedAt: string | undefined): Promise<void> {
+    try {
+      const health = await this.store.updateTriggerHealth(triggerId, (current) => {
+        if (!current || current.notifiedAt !== notifiedAt) return current;
+        const { notifiedAt: _undelivered, ...rest } = current;
+        return previousNotifiedAt ? { ...rest, notifiedAt: previousNotifiedAt } : rest;
+      });
+      this.remember(health);
+    } catch (error) {
+      await this.log(`releasing the onFailure cooldown of ${triggerId} failed: ${messageOf(error)}`);
     }
   }
 

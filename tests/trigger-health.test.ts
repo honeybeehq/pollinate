@@ -1,7 +1,10 @@
+import { writeFile } from "node:fs/promises";
 import http from "node:http";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { ActionExecutor } from "../src/actions.js";
 import { parseDaemonConfigToml, parseTriggerToml, triggerToToml } from "../src/config.js";
+import { PollinateDaemon } from "../src/daemon.js";
 import { DeliveryManager } from "../src/delivery.js";
 import { FAILURE_ERROR_MAX_CHARS, notificationDue, resolveOnFailure, TriggerHealthMonitor, type HealthRecorder, type TriggerFailure } from "../src/health.js";
 import { PollEngine, pollDelayMs } from "../src/poll.js";
@@ -298,6 +301,82 @@ describe("trigger health", () => {
       expect(Object.keys(await store.readTriggerHealth()).sort()).toEqual(["kept", "orphan"]);
       expect((await store.pruneOrphanedTriggerState()).files["trigger-health.json"]).toEqual({ before: 2, after: 1 });
       expect(Object.keys(await store.readTriggerHealth())).toEqual(["kept"]);
+    });
+  });
+});
+
+describe("undelivered notifications release the cooldown", () => {
+  test("a notification that gives up does not start the cooldown, so the next failure is delivered", async () => {
+    await withServer([500, 500, 500, 200], async (url, bodies) => {
+      await withTempStore(async (store) => {
+        const trig = failingCommand("hook-down", { onFailure: { cooldown: "1h", action: { kind: "http", method: "POST", url, body: "{{event}}" } } });
+        const monitor = monitorFor(store, [trig]);
+        await monitor.recordFailure("hook-down", { kind: "job", error: "first" });
+        await monitor.idle();
+        expect(bodies).toHaveLength(3);
+        expect(await ledgerEvents(store, "pollinate.trigger.on_failure_errored")).toHaveLength(1);
+        const released = (await store.readTriggerHealth())["hook-down"]!;
+        expect(released.consecutiveFailures).toBe(1);
+        expect(released.notifiedAt).toBeUndefined();
+
+        await monitor.recordFailure("hook-down", { kind: "job", error: "second" });
+        await monitor.idle();
+        expect(bodies).toHaveLength(4);
+        expect(JSON.parse(bodies[3]!)).toMatchObject({ failure_error: "second", consecutive_failures: "2" });
+        const notes = await notificationJobs(store);
+        expect(notes.map((job) => job.status).sort()).toEqual(["completed", "errored"]);
+        expect((await store.readTriggerHealth())["hook-down"]!.notifiedAt).toBe((await store.readTriggerHealth())["hook-down"]!.lastFailureAt);
+      });
+    });
+  });
+
+  test("a failed notification restores the earlier notification time of the streak", async () => {
+    await withServer([200, 500], async (url, bodies) => {
+      await withTempStore(async (store) => {
+        const trig = failingCommand("flaky-hook", { onFailure: { cooldown: "100ms", action: { kind: "http", method: "POST", url } } });
+        const monitor = monitorFor(store, [trig]);
+        await monitor.recordFailure("flaky-hook", { kind: "job", error: "one" });
+        await monitor.idle();
+        const delivered = (await store.readTriggerHealth())["flaky-hook"]!.notifiedAt;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        await monitor.recordFailure("flaky-hook", { kind: "job", error: "two" });
+        await monitor.idle();
+        expect(bodies).toHaveLength(4);
+        expect((await store.readTriggerHealth())["flaky-hook"]!.notifiedAt).toBe(delivered);
+      });
+    });
+  });
+
+  test("a notification interrupted by a daemon restart is marked errored and releases the cooldown at startup", async () => {
+    await withTempStore(async (store, root) => {
+      await writeFile(join(root, "pollinate.toml"), `[webhook]\nbind = "127.0.0.1"\nport = 0\n[defaults]\ntickMs = 50\ntriggerReloadMs = 50\n`);
+      const trig = failingCommand("restarted", { source: { kind: "webhook", webhook: { path: "restarted" } }, onFailure: EMIT_NOTIFY });
+      await store.saveTrigger(trig);
+      const stamp = new Date(Date.now() - 2_000).toISOString();
+      await store.updateTriggerHealth("restarted", () => ({ consecutiveFailures: 1, firstFailedAt: stamp, lastFailureAt: stamp, lastFailureKind: "job", lastError: "boom", notifiedAt: stamp }));
+      await store.saveJob({
+        id: "RE.abc",
+        triggerId: "restarted",
+        deliveryId: `restarted:failure:${stamp}`,
+        source: "failure",
+        status: "retrying",
+        context: {},
+        queuedAt: stamp,
+        attempt: 1,
+        nextAttemptAt: new Date(Date.now() + 10_000).toISOString(),
+      });
+      const daemon = new PollinateDaemon(store);
+      await daemon.start();
+      try {
+        const job = await waitFor(() => store.getJob("RE.abc"), (current) => current?.status === "errored");
+        expect(job?.error).toMatch(/daemon restarted mid-execution/);
+        await waitFor(() => ledgerEvents(store, "pollinate.trigger.on_failure_errored"), (events) => events.length === 1);
+        await waitFor(() => store.readTriggerHealth(), (health) => health.restarted?.notifiedAt === undefined);
+        expect((await store.readTriggerHealth()).restarted).toMatchObject({ consecutiveFailures: 1, lastError: "boom" });
+        expect(await ledgerEvents(store, "pollinate.trigger.failed")).toHaveLength(0);
+      } finally {
+        await daemon.stop();
+      }
     });
   });
 });

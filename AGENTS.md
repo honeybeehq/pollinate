@@ -714,8 +714,11 @@ config, so only the default applies to it.
   delivery id `<trigger_id>:failure:<notifiedAt>`. It never counts as a
   failure or success of the trigger and never triggers `onFailure` itself.
 - If it cannot be delivered: `pollinate.trigger.on_failure_errored {trigger_id,
-  job_id, error, attempts}`. A daemon restart in the middle marks it errored
-  and ledgers the same event; it is not resumed.
+  job_id, error, attempts}`. A daemon restart in the middle marks it errored at
+  startup (whatever its age) and ledgers the same event; it is not resumed.
+- An undelivered notification does not start the cooldown: `notifiedAt` goes
+  back to its value before that notification (it is cleared after a restart),
+  so the next failure notifies again.
 
 Poll backoff: after three failed checks in a row the next check waits twice the
 interval, doubling per further failure up to 2^16 times the interval; the first

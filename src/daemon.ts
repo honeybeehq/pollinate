@@ -402,12 +402,13 @@ export class PollinateDaemon {
     let recovered = 0;
     for (const listed of jobs) {
       try {
-        if (this.delivery?.ownsJob(listed.id)) continue;
+        if (this.delivery?.ownsJob(listed.id) || this.health?.ownsNotification(listed.id)) continue;
         const job = await this.store.getJob(listed.id);
         if (!job || !NON_TERMINAL_JOB_STATUSES.includes(job.status)) continue;
+        const notification = job.source === "failure";
         const touchedAt = job.nextAttemptAt ?? job.startedAt ?? job.queuedAt;
         const touchedMs = new Date(touchedAt).getTime();
-        if (Number.isFinite(touchedMs) && now - touchedMs < staleMs) continue;
+        if (!notification && Number.isFinite(touchedMs) && now - touchedMs < staleMs) continue;
         if (await this.delivery?.adoptOrphan(job)) {
           recovered += 1;
           continue;
@@ -423,8 +424,8 @@ export class PollinateDaemon {
           error,
           recovered_from: previousStatus,
         });
-        if (job.source === "failure") {
-          await this.store.appendLedger({ event: "pollinate.trigger.on_failure_errored", trigger_id: job.triggerId, job_id: job.id, error });
+        if (notification) {
+          await this.health?.notificationInterrupted(job, error);
         } else if (job.action) {
           await this.health?.recordFailure(job.triggerId, { kind: "job", error, jobId: job.id, deliveryId: job.deliveryId });
         }

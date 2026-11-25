@@ -387,11 +387,15 @@ export class PollinateStore {
     return readJsonOr<TriggerHealth>(this.triggerHealthPath(), {});
   }
 
-  async updateTriggerHealth(triggerId: string, update: (current: TriggerHealthEntry | undefined) => TriggerHealthEntry): Promise<TriggerHealth> {
+  async updateTriggerHealth(triggerId: string, update: (current: TriggerHealthEntry | undefined) => TriggerHealthEntry | undefined): Promise<TriggerHealth> {
     await this.ensure();
     return withFileLock(this.triggerHealthLockPath(), async () => {
       const health = await this.readTriggerHealth();
-      health[triggerId] = update(health[triggerId]);
+      const current = health[triggerId];
+      const next = update(current);
+      if (next === current) return health;
+      if (next) health[triggerId] = next;
+      else delete health[triggerId];
       await writeJson(this.triggerHealthPath(), health, { sync: false });
       return health;
     });
