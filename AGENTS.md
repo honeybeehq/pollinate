@@ -11,7 +11,8 @@ everything here is otherwise only discoverable by reading the source.
 - Binaries: `pollinate` and `pol` (identical). Source of truth: `src/cli.ts`.
 - Store root: `~/.pollinate`, overridable with `POLLINATE_STORE_ROOT`.
 - Add `--json` to any command for machine-readable output. Errors with `--json`
-  print `{"error": "..."}` to stderr and exit 1.
+  print `{"error": "..."}` to stderr and exit 1. Header values are redacted
+  in every `--json` output (see Bounds and redaction).
 - Dev loop: `pnpm build` (tsc, then `scripts/write-build-info.mjs`), `pnpm test`
   (build + vitest), `pnpm check` (build + test typecheck + lint + test).
 - `pol --version` (or `-V`) prints `pollinate <version> (<12-char commit>)`, with
@@ -148,7 +149,7 @@ symlinks, then
   ledger.jsonl                    append-only event log (the source of truth)
   ledger.jsonl.1                  previous ledger generation (size-based rotation, see Job retention and Events stream)
   daemon.log                      daemon lifecycle + GC log (pol daemon logs)
-  daemon.log.1                    previous daemon.log (pol doctor --fix rotates it past 10 MB)
+  daemon.log.1                    previous daemon.log (rotated past 10 MB by the daemon and pol doctor --fix)
   daemon.out.log                  macOS launchd stdout log
   daemon.err.log                  macOS launchd stderr log
   pollinate.toml                  daemon config
@@ -275,8 +276,8 @@ kind = "command" | "http" | "emit" | "honeybee" | "sequence"
 
 | kind | fields |
 |---|---|
-| `command` | `command`, `cwd?`, `timeout?` — runs through the configured shell |
-| `http` | `method`, `url`, `headers?`, `body?`, `timeout?` — also sends `Idempotency-Key` and `X-Pollinate-Delivery` (the delivery id), `X-Pollinate-Trigger` and `X-Pollinate-Attempt` unless `headers` sets them (case-insensitive) |
+| `command` | `command`, `cwd?`, `timeout?` — runs through the configured shell; the job keeps the last 1 MB of stdout and of stderr |
+| `http` | `method`, `url`, `headers?`, `body?`, `timeout?` — also sends `Idempotency-Key` and `X-Pollinate-Delivery` (the delivery id), `X-Pollinate-Trigger` and `X-Pollinate-Attempt` unless `headers` sets them (case-insensitive); the job keeps the first 64 KB of the response body |
 | `emit` | `subject`, `payload?` — appends a ledger event only |
 | `honeybee` | `run = "spawn"\|"send"\|"stop"` (`"kill"` is an alias of `"stop"`; below) |
 | `sequence` | `mode = "serial"\|"parallel"`, `primary?`, `continueOnError?`, `actions = [{id, action}]` |
@@ -684,6 +685,47 @@ Both commands redact secrets in all output: values under keys that look like
 secrets (`secret`, `token`, `password`, `authorization`, `cookie`, `api_key`,
 `signature`, …), every value under a `headers` key, and bearer tokens,
 `Authorization:`-style pairs and GitHub/OpenAI/Slack token shapes inside text.
+
+## Idle cost
+
+Every `defaults.triggerReloadMs` (1 s) the daemon lists `triggers/` and stats
+each file. It parses only files whose inode, mtime or size changed since the
+last pass and keeps the rest from memory; the temporary-trigger GC works from
+the same list. When no file changed, nothing else happens. Any change, an
+invalid file included, reloads the engines and ledgers
+`pollinate.daemon.triggers_reloaded`. On a store with 800 trigger files (790
+spent one-shot schedules) the idle daemon uses about 3 s of CPU per 10
+minutes, down from about 77 s.
+
+A trigger file without `updatedAt` (or `createdAt`) gets the file's mtime when
+loaded. Before, it got the load time, so the trigger looked changed on every
+pass and the daemon reloaded every second.
+
+## Bounds and redaction
+
+- Child processes (command actions, command polls and context sources, hive
+  calls): the last 1 MB of stdout and of stderr is kept. When more was
+  written, the result carries `stdoutDroppedBytes` / `stderrDroppedBytes`
+  (bytes dropped from the front). A command printing 500 MB completes with the
+  daemon under 200 MB RSS.
+- `http` actions: the job's `result.body` holds the first 64 KB of the
+  response; when the body is longer the rest is not read and the result
+  carries `bodyTruncated: true` and `bodyKeptBytes: 65536`. The error of a
+  non-2xx answer still quotes its first 500 characters.
+- `daemon.log` is renamed to `daemon.log.1` (replacing the previous one) when
+  a write finds it over 10 MB.
+- `daemon.out.log` and `daemon.err.log` (launchd captures): at daemon start,
+  a file over 10 MB is cut in place to its last 1 MB, starting at a line
+  boundary (copy-truncate, because launchd holds them open in append mode).
+  `daemon.log` gets a `trimmed <file> from <size> to its last <kept>` line.
+  `pol doctor --fix` uses the same rotation (`rotateDaemonLogs` in
+  `src/fsx.ts`).
+- Header values are redacted to `<redacted>`: every `headers` table in a job
+  file's `action`, and every `headers` key in any `--json` output
+  (`pol list`, `pol get`, `pol job`, `pol jobs`, `pol trigger`, `pol ledger`
+  including `--follow`, …). Trigger files and `state/delivery-state.json` keep
+  the real values; retries and resumed jobs run from those, never from the
+  job file.
 
 ## Webhooks
 

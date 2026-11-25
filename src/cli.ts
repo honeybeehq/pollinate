@@ -19,6 +19,7 @@ import { ApiClientError, PollinateClient } from "./client.js";
 import type { PutTriggerResponse } from "./api-types.js";
 import { listRouterPlugins, routerPluginTemplate } from "./router-plugins/index.js";
 import { GITHUB_PR_ROUTER_EVENTS, installGithubWebhook } from "./providers/github.js";
+import { redactHeaderMap } from "./redact.js";
 import { resolveSecret } from "./secrets.js";
 import {
   daemonLogs,
@@ -1200,13 +1201,7 @@ async function cmdLedger(store: PollinateStore, args: ParsedArgs): Promise<void>
     const ledger = await store.readLedger(lines);
     // --json emits parsed event objects (not raw JSON strings) so consumers get
     // objects, matching the NDJSON objects that --follow --json streams. (LAB-119)
-    const parsed = ledger.map((line) => {
-      try {
-        return JSON.parse(line) as unknown;
-      } catch {
-        return line;
-      }
-    });
+    const parsed = ledger.map(parseLedgerLine);
     const human = ledger.length ? ledger.map(renderLedgerLine).join("\n") : c.dim("Ledger is empty.");
     print(args, parsed, human);
     return;
@@ -1214,9 +1209,20 @@ async function cmdLedger(store: PollinateStore, args: ParsedArgs): Promise<void>
   let seen = (await store.readLedger()).length;
   for (;;) {
     const ledger = await store.readLedger();
-    for (const line of ledger.slice(seen)) console.log(args.json ? line : renderLedgerLine(line));
+    for (const line of ledger.slice(seen)) {
+      if (args.json) printJsonLine(parseLedgerLine(line));
+      else console.log(renderLedgerLine(line));
+    }
     seen = ledger.length;
     await sleep(1_000);
+  }
+}
+
+function parseLedgerLine(line: string): unknown {
+  try {
+    return JSON.parse(line) as unknown;
+  } catch {
+    return line;
   }
 }
 
@@ -1944,7 +1950,7 @@ function redactForJson(value: unknown, path: string[] = []): unknown {
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>).map(([key, item]) => [
       key,
-      shouldRedactSecret(path, key, item) ? redactSecret(String(item)) : redactForJson(item, [...path, key]),
+      shouldRedactSecret(path, key, item) ? redactSecret(String(item)) : key === "headers" ? redactHeaderMap(item) : redactForJson(item, [...path, key]),
     ]),
   );
 }

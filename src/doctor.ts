@@ -1,10 +1,25 @@
-import { access, constants, open, readdir, readFile, realpath, rename, stat } from "node:fs/promises";
+import { access, constants, open, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { PollinateStore, TRIGGER_STATE_FILES, type TriggerStateFile } from "./store.js";
 import { DEFAULT_DAEMON_CONFIG, idFromPath, parseTriggerToml } from "./config.js";
 import { crashLoopStatus, readDaemonRuns } from "./daemon-health.js";
-import { daemonConfigPath, daemonLockPath, daemonLogPath, isDaemonLockStale, jobsDir, ledgerPath, readDaemonLock, readJsonOr, readTextOrNull, stateDir, triggerDir, withFileLock, writeJson } from "./fsx.js";
+import {
+  daemonConfigPath,
+  daemonLockPath,
+  isDaemonLockStale,
+  jobsDir,
+  LOG_MAX_BYTES,
+  ledgerPath,
+  readDaemonLock,
+  readJsonOr,
+  readTextOrNull,
+  rotateDaemonLogs,
+  stateDir,
+  triggerDir,
+  withFileLock,
+  writeJson,
+} from "./fsx.js";
 import { probeHive, triggerUsesHive, type HiveProbe } from "./hive-exec.js";
 import { DEFAULT_BINDING_RETENTION } from "./router-gc.js";
 import { execArgv } from "./process.js";
@@ -34,8 +49,6 @@ export type DoctorReport = {
   fixes?: DoctorFix[];
 };
 
-export const DOCTOR_LOG_MAX_BYTES = 10 * 1024 * 1024;
-export const DOCTOR_LOG_KEEP_BYTES = 1024 * 1024;
 const REPEATED_FAILURES = 3;
 const HIVE_HEALTH_TIMEOUT_MS = 5_000;
 const HIVE_HEALTH_STARTING_EXIT = 75;
@@ -506,8 +519,8 @@ async function checkState(ctx: Context): Promise<void> {
 
   for (const name of LOG_FILES) {
     const size = await sizeOf(join(root, name));
-    if (size > DOCTOR_LOG_MAX_BYTES) {
-      add(ctx, "state", "log-size", "warning", `${name} is ${formatBytes(size)} (over ${formatBytes(DOCTOR_LOG_MAX_BYTES)})`, { fixable: true, details: { file: name, bytes: size } });
+    if (size > LOG_MAX_BYTES) {
+      add(ctx, "state", "log-size", "warning", `${name} is ${formatBytes(size)} (over ${formatBytes(LOG_MAX_BYTES)})`, { fixable: true, details: { file: name, bytes: size } });
     }
   }
 
@@ -636,38 +649,14 @@ function isExpiredClosed(binding: RouterBinding, retentionMs: number): boolean {
 }
 
 export async function rotateLogs(root: string): Promise<DoctorFix[]> {
-  const fixes: DoctorFix[] = [];
-  const daemonLog = daemonLogPath(root);
-  const daemonLogSize = await sizeOf(daemonLog);
-  if (daemonLogSize > DOCTOR_LOG_MAX_BYTES) {
-    await rename(daemonLog, `${daemonLog}.1`);
-    fixes.push({ action: "rotate-log", message: `rotated daemon.log (${formatBytes(daemonLogSize)}) to daemon.log.1`, details: { file: "daemon.log", bytes: daemonLogSize } });
-  }
-  for (const name of ["daemon.out.log", "daemon.err.log"]) {
-    const path = join(root, name);
-    const size = await sizeOf(path);
-    if (size <= DOCTOR_LOG_MAX_BYTES) continue;
-    const kept = await copyTruncateToTail(path, DOCTOR_LOG_KEEP_BYTES);
-    fixes.push({ action: "rotate-log", message: `cut ${name} from ${formatBytes(size)} to its last ${formatBytes(kept)}`, details: { file: name, bytes: size, keptBytes: kept } });
-  }
-  return fixes;
-}
-
-async function copyTruncateToTail(path: string, keepBytes: number): Promise<number> {
-  const handle = await open(path, "r+");
-  try {
-    const { size } = await handle.stat();
-    const start = Math.max(0, size - keepBytes);
-    const tail = Buffer.alloc(size - start);
-    await handle.read(tail, 0, tail.length, start);
-    const firstNewline = start > 0 ? tail.indexOf(0x0a) : -1;
-    const kept = firstNewline >= 0 && firstNewline < tail.length - 1 ? tail.subarray(firstNewline + 1) : tail;
-    await handle.truncate(0);
-    await handle.write(kept, 0, kept.length, 0);
-    return kept.length;
-  } finally {
-    await handle.close();
-  }
+  return (await rotateDaemonLogs(root)).map((rotation) => ({
+    action: "rotate-log",
+    message:
+      rotation.keptBytes === undefined
+        ? `rotated ${rotation.file} (${formatBytes(rotation.bytes)}) to ${rotation.file}.1`
+        : `cut ${rotation.file} from ${formatBytes(rotation.bytes)} to its last ${formatBytes(rotation.keptBytes)}`,
+    details: rotation,
+  }));
 }
 
 export type WhyOutcome = "fired" | "filtered" | "throttled" | "duplicate" | "dropped" | "errored";

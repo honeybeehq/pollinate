@@ -1,7 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { defaultRetryOn, type ActionExecutor } from "./actions.js";
 import { deliveryIdFor } from "./delivery.js";
-import { appendTextLine, daemonLogPath } from "./fsx.js";
+import { appendDaemonLogLine } from "./fsx.js";
 import type { InvalidTrigger, PollinateStore } from "./store.js";
 import { nowIso, parseDuration } from "./time.js";
 import type { Action, Activation, FailureKind, Job, OnFailurePolicy, RetryPolicy, Trigger, TriggerHealth, TriggerHealthEntry } from "./types.js";
@@ -301,7 +301,7 @@ export class TriggerHealthMonitor implements HealthRecorder {
 
   private async log(message: string): Promise<void> {
     try {
-      await appendTextLine(daemonLogPath(this.store.root), `${nowIso()} trigger health: ${message}`);
+      await appendDaemonLogLine(this.store.root, `${nowIso()} trigger health: ${message}`);
     } catch {
       return;
     }

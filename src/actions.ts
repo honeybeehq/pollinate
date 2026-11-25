@@ -408,7 +408,7 @@ export class ActionExecutor {
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         let response: Response;
-        let body: string;
+        let body: HttpBodyHead;
         try {
           response = await fetch(action.url, {
             method: action.method,
@@ -416,18 +416,18 @@ export class ActionExecutor {
             body: action.body,
             signal: controller.signal,
           });
-          body = await response.text();
+          body = await readHttpBodyHead(response, HTTP_BODY_KEEP_BYTES);
         } catch (error) {
           throw new ActionFailure(error instanceof Error ? error.message : String(error), [controller.signal.aborted ? "timeout" : "transport"]);
         }
         if (!response.ok) {
           throw new ActionFailure(
-            `HTTP ${response.status}: ${body.slice(0, 500)}`,
+            `HTTP ${response.status}: ${body.text.slice(0, 500)}`,
             [`status:${response.status}`, `status:${Math.floor(response.status / 100)}xx`],
             parseRetryAfterMs(response.headers.get("retry-after")),
           );
         }
-        return { status: response.status, body };
+        return { status: response.status, body: body.text, ...(body.truncated ? { bodyTruncated: true, bodyKeptBytes: HTTP_BODY_KEEP_BYTES } : {}) };
       } finally {
         clearTimeout(timer);
       }
@@ -677,6 +677,28 @@ export function parseV2SpawnBeeId(stdout: string): string | undefined {
 }
 
 const HIVE_HANDLE_RE = /^[A-Za-z0-9._:-]+$/;
+
+export const HTTP_BODY_KEEP_BYTES = 64 * 1024;
+
+type HttpBodyHead = { text: string; truncated: boolean };
+
+async function readHttpBodyHead(response: Response, limit: number): Promise<HttpBodyHead> {
+  if (!response.body) return { text: "", truncated: false };
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let kept = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return { text: Buffer.concat(chunks).toString("utf8"), truncated: false };
+    if (kept + value.length > limit) {
+      chunks.push(value.subarray(0, limit - kept));
+      await reader.cancel().catch(() => undefined);
+      return { text: Buffer.concat(chunks).toString("utf8"), truncated: true };
+    }
+    chunks.push(value);
+    kept += value.length;
+  }
+}
 
 export function isValidHiveHandle(value: string | undefined): value is string {
   // The trailing-colon exclusion skips prefix lines like "warning:" or "Error:".

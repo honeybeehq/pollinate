@@ -7,7 +7,11 @@ export type ExecResult = {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  stdoutDroppedBytes?: number;
+  stderrDroppedBytes?: number;
 };
+
+export const CHILD_OUTPUT_TAIL_BYTES = 1024 * 1024;
 
 export type ExecOptions = { cwd?: string; timeoutMs?: number; input?: string; execution?: ExecutionProfile };
 
@@ -42,8 +46,8 @@ export function execArgv(file: string, args: string[], options: ExecOptions = {}
 
 function collectChild(child: ChildProcessWithoutNullStreams, options: ExecOptions): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
+    const stdout = new OutputTail(CHILD_OUTPUT_TAIL_BYTES);
+    const stderr = new OutputTail(CHILD_OUTPUT_TAIL_BYTES);
     let timedOut = false;
     const timer = options.timeoutMs
       ? setTimeout(() => {
@@ -55,22 +59,52 @@ function collectChild(child: ChildProcessWithoutNullStreams, options: ExecOption
         }, options.timeoutMs)
       : undefined;
 
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
     child.on("error", reject);
     child.on("close", (exitCode, signal) => {
       if (timer) clearTimeout(timer);
-      resolve({ exitCode, signal, stdout, stderr, timedOut });
+      const out = stdout.finish();
+      const err = stderr.finish();
+      resolve({
+        exitCode,
+        signal,
+        stdout: out.text,
+        stderr: err.text,
+        timedOut,
+        ...(out.droppedBytes > 0 ? { stdoutDroppedBytes: out.droppedBytes } : {}),
+        ...(err.droppedBytes > 0 ? { stderrDroppedBytes: err.droppedBytes } : {}),
+      });
     });
     if (options.input !== undefined) child.stdin.end(options.input);
     else child.stdin.end();
   });
+}
+
+class OutputTail {
+  private chunks: Buffer[] = [];
+  private keptBytes = 0;
+  private droppedBytes = 0;
+
+  constructor(private readonly limit: number) {}
+
+  push(chunk: Buffer): void {
+    this.chunks.push(chunk);
+    this.keptBytes += chunk.length;
+    while (this.chunks.length > 1) {
+      const oldest = this.chunks[0];
+      if (!oldest || this.keptBytes - oldest.length < this.limit) break;
+      this.chunks.shift();
+      this.keptBytes -= oldest.length;
+      this.droppedBytes += oldest.length;
+    }
+  }
+
+  finish(): { text: string; droppedBytes: number } {
+    const kept = Buffer.concat(this.chunks);
+    const excess = Math.max(0, kept.length - this.limit);
+    return { text: kept.subarray(excess).toString("utf8"), droppedBytes: this.droppedBytes + excess };
+  }
 }
 
 export function shellQuote(value: string): string {

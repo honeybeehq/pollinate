@@ -1,3 +1,4 @@
+import { closeSync, fstatSync, ftruncateSync, openSync, readSync, writeSync } from "node:fs";
 import { chmod, link, mkdir, open, readFile, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -402,5 +403,67 @@ async function quarantineCorruptJson(path: string, error: unknown): Promise<void
     if (isEnoent(renameError)) return;
     const renameMessage = renameError instanceof Error ? renameError.message : String(renameError);
     console.warn(`[pollinate] Corrupt JSON at ${path}: ${message}; failed to quarantine: ${renameMessage}`);
+  }
+}
+
+export const LOG_MAX_BYTES = 10 * 1024 * 1024;
+export const LOG_KEEP_BYTES = 1024 * 1024;
+export const CAPTURED_LOG_FILES = ["daemon.out.log", "daemon.err.log"] as const;
+
+export type LogRotation = { file: string; bytes: number; keptBytes?: number };
+
+let daemonLogWrites: Promise<void> = Promise.resolve();
+
+export function appendDaemonLogLine(root: string, line: string): Promise<void> {
+  const write = daemonLogWrites.then(async () => {
+    await rotateDaemonLogIfLarge(root);
+    await appendTextLine(daemonLogPath(root), line);
+  });
+  daemonLogWrites = write.catch(() => undefined);
+  return write;
+}
+
+export async function rotateDaemonLogs(root: string): Promise<LogRotation[]> {
+  const rotated = await rotateDaemonLogIfLarge(root);
+  return [...(rotated ? [rotated] : []), ...trimCapturedLogs(root)];
+}
+
+export async function rotateDaemonLogIfLarge(root: string): Promise<LogRotation | undefined> {
+  const path = daemonLogPath(root);
+  const info = await stat(path).catch(() => undefined);
+  if (!info || info.size <= LOG_MAX_BYTES) return undefined;
+  await rename(path, `${path}.1`);
+  return { file: "daemon.log", bytes: info.size };
+}
+
+export function trimCapturedLogs(root: string): LogRotation[] {
+  const trimmed: LogRotation[] = [];
+  for (const file of CAPTURED_LOG_FILES) {
+    const cut = trimLogToTail(join(root, file));
+    if (cut) trimmed.push({ file, ...cut });
+  }
+  return trimmed;
+}
+
+function trimLogToTail(path: string): { bytes: number; keptBytes: number } | undefined {
+  let fd: number;
+  try {
+    fd = openSync(path, "r+");
+  } catch (error) {
+    if (isEnoent(error)) return undefined;
+    throw error;
+  }
+  try {
+    const { size } = fstatSync(fd);
+    if (size <= LOG_MAX_BYTES) return undefined;
+    const tail = Buffer.alloc(LOG_KEEP_BYTES);
+    const read = readSync(fd, tail, 0, LOG_KEEP_BYTES, size - LOG_KEEP_BYTES);
+    const lineStart = tail.subarray(0, read).indexOf(10);
+    const kept = lineStart >= 0 && lineStart < read - 1 ? tail.subarray(lineStart + 1, read) : tail.subarray(0, read);
+    ftruncateSync(fd, 0);
+    writeSync(fd, kept, 0, kept.length, 0);
+    return { bytes: size, keptBytes: kept.length };
+  } finally {
+    closeSync(fd);
   }
 }

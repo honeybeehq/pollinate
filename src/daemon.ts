@@ -11,14 +11,14 @@ import { nowIso, parseDuration } from "./time.js";
 import {
   acquireDaemonLock,
   apiSocketPath,
-  appendTextLine,
+  appendDaemonLogLine,
   ensureStoreSchema,
   DAEMON_LOCK_HEARTBEAT_MS,
   daemonLockPath,
-  daemonLogPath,
   refreshDaemonLock,
   releaseDaemonLock,
   rotateLedgerIfLarge,
+  trimCapturedLogs,
   type DaemonLock,
   type DaemonLockHolder,
 } from "./fsx.js";
@@ -167,13 +167,14 @@ export class PollinateDaemon {
     } else if (restarts.uncleanExits > 0) {
       await this.log(`previous daemon run exited uncleanly (${restarts.uncleanExits} unclean exits in the last hour)`);
     }
+    await this.trimCapturedLogs();
     const startedAtMs = Date.now();
     this.startedAt = new Date(startedAtMs).toISOString();
     this.reloadedAt = this.startedAt;
     const config = await this.store.daemonConfig();
     await gcTemporaryHooks(this.store);
     await this.pruneOrphanedTriggerState();
-    const { triggers, invalid } = await this.store.loadTriggerFiles();
+    const { triggers, invalid, signature } = await this.store.loadTriggerFiles();
     const executor = new ActionExecutor(this.store, executorOptionsFor(config));
     this.config = config;
     this.store.onJobAllocated = (triggerId) => this.noteJobAllocated(triggerId);
@@ -197,7 +198,7 @@ export class PollinateDaemon {
     await this.schedule.start();
     await this.poll.start();
     await this.health.syncTriggerFiles(triggers, invalid);
-    this.triggerSignature = signatureForTriggers(triggers);
+    this.triggerSignature = signature;
     this.reloadTimer = setInterval(() => {
       this.inBackground("trigger reload", this.reloadTriggers());
     }, config.defaults.triggerReloadMs);
@@ -266,6 +267,16 @@ export class PollinateDaemon {
     this.hiveStatus = probe.path ? { path: probe.path, version: probe.version } : null;
     await this.store.appendLedger({ event: "pollinate.hive.probed", ...probe });
     if (!probe.ok) await this.log(`hive probe failed for ${probe.path ?? config.honeybee.bin ?? "hive"}: ${probe.error ?? "unknown error"}`);
+  }
+
+  private async trimCapturedLogs(): Promise<void> {
+    try {
+      for (const cut of trimCapturedLogs(this.store.root)) {
+        await this.log(`trimmed ${cut.file} from ${formatMb(cut.bytes)} to its last ${formatMb(cut.keptBytes ?? 0)}`);
+      }
+    } catch (error) {
+      await this.log(`trimming daemon.out.log / daemon.err.log failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private async pruneOrphanedTriggerState(): Promise<void> {
@@ -343,14 +354,16 @@ export class PollinateDaemon {
         this.daemonConfigSignature = configSignature;
         await this.log("pollinate.toml changed; restart the daemon to apply webhook, defaults, relay, or execution-profile changes");
       }
-      await gcTemporaryHooks(this.store, { hasLiveJobs: (triggerId) => this.delivery?.hasLiveJobs(triggerId) ?? false });
-      const { triggers, invalid } = await this.store.loadTriggerFiles();
-      const signature = signatureForTriggers(triggers);
-      if (signature === this.triggerSignature) {
-        await this.health?.syncTriggerFiles(triggers, invalid);
-        return;
-      }
-      this.triggerSignature = signature;
+      let scan = await this.store.scanTriggerFiles();
+      const removed = await gcTemporaryHooks(this.store, {
+        triggers: scan.triggers,
+        hasLiveJobs: (triggerId) => this.delivery?.hasLiveJobs(triggerId) ?? false,
+      });
+      if (removed.length > 0) scan = await this.store.scanTriggerFiles();
+      if (scan.signature === this.triggerSignature) return;
+      this.triggerSignature = scan.signature;
+      const triggers = scan.triggers.map((trigger) => structuredClone(trigger));
+      const invalid = scan.invalid;
       this.setTriggers(triggers);
       this.reloadedAt = nowIso();
       await this.health?.syncTriggerFiles(triggers, invalid);
@@ -409,7 +422,7 @@ export class PollinateDaemon {
       if (stored) triggers.push(stored);
       triggers.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
       this.setTriggers(triggers);
-      this.triggerSignature = signatureForTriggers(triggers);
+      this.triggerSignature = this.store.restampTriggerFile(this.triggerSignature, id);
       this.reloadedAt = nowIso();
       const checksPoll = stored !== null && fetchedPoll !== undefined && stored.enabled && stored.source.kind === "poll";
       const check = checksPoll ? poll.adoptChecked(this.triggers, stored, fetchedPoll) : undefined;
@@ -558,7 +571,7 @@ export class PollinateDaemon {
 
   private async log(message: string): Promise<void> {
     try {
-      await appendTextLine(daemonLogPath(this.store.root), `${nowIso()} ${message}`);
+      await appendDaemonLogLine(this.store.root, `${nowIso()} ${message}`);
     } catch {
       // Logging must never take the daemon down.
     }
@@ -617,13 +630,6 @@ function formatMb(bytes: number): string {
 function describeHolder(holder: DaemonLockHolder | null): string {
   if (!holder) return "";
   return `, started ${holder.startedAt ?? "unknown"}, heartbeat ${holder.heartbeatAt}`;
-}
-
-function signatureForTriggers(triggers: Array<{ id: string; updatedAt: string; enabled: boolean }>): string {
-  return triggers
-    .map((trigger) => `${trigger.id}:${trigger.updatedAt}:${trigger.enabled}`)
-    .sort()
-    .join("|");
 }
 
 function signatureForConfig(config: DaemonConfig): string {

@@ -108,11 +108,12 @@ export async function recordWebhookDelivery(store: PollinateStore, trigger: Trig
 export type TemporaryTriggerGcOptions = {
   now?: number;
   hasLiveJobs?: (triggerId: string) => boolean;
+  triggers?: readonly Trigger[];
 };
 
 export async function gcTemporaryHooks(store: PollinateStore, options: TemporaryTriggerGcOptions = {}): Promise<string[]> {
   const now = options.now ?? Date.now();
-  const triggers = await store.loadTriggers();
+  const triggers = options.triggers ?? (await store.scanTriggerFiles()).triggers;
   const candidates = triggers
     .filter((trigger) => trigger.lifecycle?.temporary && lifecycleEnded(trigger, now))
     .filter((trigger) => !options.hasLiveJobs?.(trigger.id))

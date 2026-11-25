@@ -54,10 +54,10 @@ export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
   honeybee: {},
 };
 
-export function parseTriggerToml(text: string, fallbackId?: string): Trigger {
+export function parseTriggerToml(text: string, fallbackId?: string, fallbackTimestamp?: string): Trigger {
   const doc = parse(text) as AnyRecord;
   const rawTrigger = asRecord(doc.trigger, "trigger");
-  return normalizeTrigger(rawTrigger, fallbackId);
+  return normalizeTrigger(rawTrigger, fallbackId, fallbackTimestamp);
 }
 
 export function parseTriggerRecord(raw: Record<string, unknown>, fallbackId?: string): Trigger {
@@ -160,8 +160,8 @@ export function slugify(value: string): string {
   return slug || "trigger";
 }
 
-function normalizeTrigger(raw: AnyRecord, fallbackId?: string): Trigger {
-  const now = new Date().toISOString();
+function normalizeTrigger(raw: AnyRecord, fallbackId?: string, fallbackTimestamp?: string): Trigger {
+  const now = fallbackTimestamp ?? new Date().toISOString();
   const name = stringOr(raw.name, fallbackId ?? "trigger");
   const id = stringOr(raw.id, fallbackId ?? slugify(name));
   const source = normalizeSource(asRecord(raw.source, "trigger.source"));

@@ -4,7 +4,7 @@ import { ActionExecutor, retryPolicyFor } from "./actions.js";
 import { matchesFilter } from "./filter.js";
 import { PollinateStore } from "./store.js";
 import { nowIso, parseDuration } from "./time.js";
-import { appendTextLine, daemonLogPath } from "./fsx.js";
+import { appendDaemonLogLine } from "./fsx.js";
 import { lifecycleEnded } from "./hooks.js";
 import type { HealthRecorder } from "./health.js";
 
@@ -646,7 +646,7 @@ export class DeliveryManager {
   private async logAsyncError(operation: string, trigger: Trigger, error: unknown): Promise<void> {
     try {
       const message = error instanceof Error ? error.message : String(error);
-      await appendTextLine(daemonLogPath(this.store.root), `${nowIso()} delivery ${operation} failed for ${trigger.id}: ${message}`);
+      await appendDaemonLogLine(this.store.root, `${nowIso()} delivery ${operation} failed for ${trigger.id}: ${message}`);
     } catch {
       return;
     }

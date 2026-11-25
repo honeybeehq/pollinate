@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readdirSync, statSync, type Stats } from "node:fs";
 import { open, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -22,6 +23,7 @@ import type { CursorState, DaemonConfig, DeliveriesSeen, DeliveryState, Job, Job
 import { nowIso } from "./time.js";
 import { allocateJobIdentity, jobUuidsOf, matchesJobReference, readJobIdIndexSnapshot, reconcileJobIdIndex, type JobIdentity } from "./job-ids.js";
 import { insertNewestFirst, jobFileNames, orderJobForWrite, readJobSummary, scanJobSummaries, type JobSummary } from "./job-scan.js";
+import { redactHeaderValues } from "./redact.js";
 
 export const DELIVERIES_SEEN_PER_TRIGGER = 2_000;
 export const DELIVERIES_SEEN_MAX_AGE_MS = 72 * 60 * 60 * 1000;
@@ -80,7 +82,11 @@ type InvalidTriggerFile = { path: string; signature: string; message: string };
 
 export type InvalidTrigger = { id: string; path: string; error: string };
 
-export type LoadedTriggerFiles = { triggers: Trigger[]; invalid: InvalidTrigger[] };
+export type LoadedTriggerFiles = { triggers: Trigger[]; invalid: InvalidTrigger[]; signature: string };
+
+export type TriggerFileScan = { signature: string; triggers: readonly Trigger[]; invalid: InvalidTrigger[] };
+
+type CachedTriggerFile = { ino: number; mtimeMs: number; size: number; trigger?: Trigger; error?: string };
 
 export class TriggerExistsError extends Error {
   constructor(readonly triggerId: string) {
@@ -98,6 +104,8 @@ export class PollinateStore {
   private ledgerCache?: LedgerCache;
   private ledgerRead: Promise<unknown> = Promise.resolve();
   private readonly warnedInvalidTriggers = new Map<string, string>();
+  private readonly triggerFileCache = new Map<string, CachedTriggerFile>();
+  private reportedInvalidSignature?: string;
   onJobAllocated?: (triggerId: string) => void;
 
   constructor(root = storeRoot()) {
@@ -168,11 +176,11 @@ export class PollinateStore {
     return parseDaemonConfigToml(await readTextOrNull(daemonConfigPath(this.root)));
   }
 
-  private async readStoredTrigger(path: string): Promise<Trigger> {
+  private async readStoredTrigger(path: string, info: Stats): Promise<Trigger> {
     const fileId = idFromPath(path);
     assertStoreId("trigger", fileId);
     const text = await readFile(path, "utf8");
-    const parsed = parseTriggerToml(text, fileId);
+    const parsed = parseTriggerToml(text, fileId, info.mtime.toISOString());
     if (parsed.id !== fileId) {
       console.warn(`[pollinate] Trigger id "${parsed.id}" in ${path} does not match filename id "${fileId}"; using filename id`);
       return { ...parsed, id: fileId };
@@ -184,7 +192,8 @@ export class PollinateStore {
     const path = this.triggerPath(id);
     const text = await readTextOrNull(path);
     if (text === null) return null;
-    const parsed = parseTriggerToml(text, id);
+    const modifiedAt = (await stat(path).catch(() => undefined))?.mtime.toISOString();
+    const parsed = parseTriggerToml(text, id, modifiedAt);
     if (parsed.id !== id) {
       console.warn(`[pollinate] Trigger id "${parsed.id}" in ${path} does not match filename id "${id}"; using filename id`);
       return { ...parsed, id };
@@ -213,37 +222,80 @@ export class PollinateStore {
 
   async loadTriggerFiles(): Promise<LoadedTriggerFiles> {
     await this.ensure();
-    const entries = await readdir(triggerDir(this.root)).catch(() => []);
+    const scan = await this.scanTriggerFiles();
+    return { triggers: scan.triggers.map((trigger) => structuredClone(trigger)), invalid: scan.invalid, signature: scan.signature };
+  }
+
+  async scanTriggerFiles(): Promise<TriggerFileScan> {
+    const dir = triggerDir(this.root);
+    const names = triggerFileNames(dir);
+    const present = new Set(names);
+    for (const name of this.triggerFileCache.keys()) if (!present.has(name)) this.triggerFileCache.delete(name);
     const triggers: Trigger[] = [];
     const seen = new Set<string>();
     const invalid: InvalidTriggerFile[] = [];
-    for (const entry of entries.filter((item) => item.endsWith(".toml")).sort()) {
-      const path = join(triggerDir(this.root), entry);
-      try {
-        const trigger = await this.readStoredTrigger(path);
-        if (seen.has(trigger.id)) {
-          console.warn(`[pollinate] Skipping duplicate trigger id "${trigger.id}" from ${path}`);
-          continue;
-        }
-        seen.add(trigger.id);
-        triggers.push(trigger);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        const info = await stat(path).catch(() => undefined);
-        if (!info) continue;
-        invalid.push({
-          path,
-          signature: `${info.mtimeMs}:${info.size}`,
-          message: error instanceof Error ? error.message : String(error),
-        });
+    const signature: string[] = [];
+    for (const name of names) {
+      const path = join(dir, name);
+      const cached = await this.cachedTriggerFile(name, path);
+      if (!cached) continue;
+      signature.push(triggerFileStamp(name, cached));
+      if (!cached.trigger) {
+        invalid.push({ path, signature: `${cached.mtimeMs}:${cached.size}`, message: cached.error ?? "unreadable trigger file" });
+        continue;
       }
+      if (seen.has(cached.trigger.id)) {
+        console.warn(`[pollinate] Skipping duplicate trigger id "${cached.trigger.id}" from ${path}`);
+        continue;
+      }
+      seen.add(cached.trigger.id);
+      triggers.push(cached.trigger);
     }
     await this.reportInvalidTriggerFiles(invalid);
-    return { triggers, invalid: invalid.map((file) => ({ id: idFromPath(file.path), path: file.path, error: file.message })) };
+    return {
+      signature: signature.sort().join("|"),
+      triggers,
+      invalid: invalid.map((file) => ({ id: idFromPath(file.path), path: file.path, error: file.message })),
+    };
+  }
+
+  restampTriggerFile(signature: string, id: string): string {
+    const name = `${assertStoreId("trigger", id)}.toml`;
+    const entries = signature ? signature.split("|").filter((entry) => !entry.startsWith(`${name}:`)) : [];
+    const info = statSync(join(triggerDir(this.root), name), { throwIfNoEntry: false });
+    if (info?.isFile()) entries.push(triggerFileStamp(name, info));
+    return entries.sort().join("|");
+  }
+
+  private async cachedTriggerFile(name: string, path: string): Promise<CachedTriggerFile | undefined> {
+    const info = statSync(path, { throwIfNoEntry: false });
+    if (!info?.isFile()) {
+      this.triggerFileCache.delete(name);
+      return undefined;
+    }
+    const cached = this.triggerFileCache.get(name);
+    if (cached && cached.ino === info.ino && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached;
+    const fresh: CachedTriggerFile = { ino: info.ino, mtimeMs: info.mtimeMs, size: info.size };
+    try {
+      fresh.trigger = await this.readStoredTrigger(path, info);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.triggerFileCache.delete(name);
+        return undefined;
+      }
+      fresh.error = error instanceof Error ? error.message : String(error);
+    }
+    this.triggerFileCache.set(name, fresh);
+    return fresh;
   }
 
   private async reportInvalidTriggerFiles(invalid: InvalidTriggerFile[]): Promise<void> {
-    if (invalid.length === 0) return;
+    if (invalid.length === 0) {
+      this.reportedInvalidSignature = undefined;
+      return;
+    }
+    const reported = invalid.map((file) => `${file.path}:${file.signature}`).join("|");
+    if (reported === this.reportedInvalidSignature) return;
     for (const file of invalid) {
       if (this.warnedInvalidTriggers.get(file.path) === file.signature) continue;
       this.warnedInvalidTriggers.set(file.path, file.signature);
@@ -253,11 +305,15 @@ export class PollinateStore {
     const recorded = await readJsonOr<Record<string, string>>(statePath, {});
     const unrecorded = invalid.filter((file) => recorded[file.path] !== file.signature);
     const stale = Object.keys(recorded).some((path) => !invalid.some((file) => file.path === path));
-    if (unrecorded.length === 0 && !stale) return;
+    if (unrecorded.length === 0 && !stale) {
+      this.reportedInvalidSignature = reported;
+      return;
+    }
     await writeJson(statePath, Object.fromEntries(invalid.map((file) => [file.path, file.signature])));
     for (const file of unrecorded) {
       await this.appendLedger({ event: "pollinate.trigger.invalid", trigger_id: idFromPath(file.path), path: file.path, error: file.message });
     }
+    this.reportedInvalidSignature = reported;
   }
 
   async getTrigger(id: string): Promise<Trigger | null> {
@@ -455,7 +511,7 @@ export class PollinateStore {
   async saveJob(job: Job): Promise<void> {
     await this.ensure();
     assertStoreId("job", job.id);
-    await writeJson(this.jobPath(job.id), orderJobForWrite(job));
+    await writeJson(this.jobPath(job.id), orderJobForWrite(job.action ? { ...job, action: redactHeaderValues(job.action) } : job));
   }
 
   async getRouterBinding(triggerId: string, subjectKey: string): Promise<RouterBinding | null> {
@@ -892,4 +948,19 @@ function pruneDeliveriesSeen(seen: DeliveriesSeen, now: number): DeliveriesSeen 
     if (fresh.length) pruned[triggerId] = Object.fromEntries(fresh);
   }
   return pruned;
+}
+
+function triggerFileStamp(name: string, file: { ino: number; mtimeMs: number; size: number }): string {
+  return `${name}:${file.ino}:${file.mtimeMs}:${file.size}`;
+}
+
+function triggerFileNames(dir: string): string[] {
+  try {
+    return readdirSync(dir)
+      .filter((name) => name.endsWith(".toml"))
+      .sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
 }
