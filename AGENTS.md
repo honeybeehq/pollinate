@@ -12,7 +12,7 @@ everything here is otherwise only discoverable by reading the source.
 - Store root: `~/.pollinate`, overridable with `POLLINATE_STORE_ROOT`.
 - Add `--json` to any command for machine-readable output. Errors with `--json`
   print `{"error": "..."}` to stderr and exit 1. Header values are redacted
-  in every `--json` output (see Bounds and redaction).
+  in every `--json` output and API answer (see Bounds and redaction).
 - Dev loop: `pnpm build` (tsc, then `scripts/write-build-info.mjs`), `pnpm test`
   (build + vitest), `pnpm check` (build + test typecheck + lint + test).
 - `pol --version` (or `-V`) prints `pollinate <version> (<12-char commit>)`, with
@@ -727,11 +727,13 @@ pass and the daemon reloaded every second.
   `pol doctor --fix` uses the same rotation (`rotateDaemonLogs` in
   `src/fsx.ts`).
 - Header values are redacted to `<redacted>`: every `headers` table in a job
-  file's `action`, and every `headers` key in any `--json` output
-  (`pol list`, `pol get`, `pol job`, `pol jobs`, `pol trigger`, `pol ledger`
-  including `--follow`, …). Trigger files and `state/delivery-state.json` keep
-  the real values; retries and resumed jobs run from those, never from the
-  job file.
+  file's `action`; every `headers` key in any `--json` output (`pol list`,
+  `pol get`, `pol job`, `pol jobs`, `pol trigger`, `pol ledger` including
+  `--follow`, …); and every trigger or job in an API answer (`GET`, `PUT`,
+  `PATCH /v1/triggers…`, `POST /v1/triggers/:id/fire`, `GET /v1/jobs…`,
+  `POST /v1/jobs/:id/cancel`). Trigger files and `state/delivery-state.json`
+  keep the real values; retries and resumed jobs run from those, never from
+  the job file.
 
 ## Webhooks
 

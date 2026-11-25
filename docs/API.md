@@ -10,6 +10,8 @@ directory) is trusted, the same as whoever can write the store.
 - Ready test: `GET /v1/health` answers once schedules, polls and webhooks run.
 - Writes made through the API reach the engines before the answer. Writes made
   to trigger files are still picked up by the 1 s file reload.
+- Header values are redacted: every `headers` table in a trigger or job in an
+  answer reads `"<redacted>"`. The stored trigger keeps the real values.
 - `pol add`, `remove`, `enable`, `disable`, `trigger` and `job cancel` use this
   API when the daemon answers and fall back to files only when it cannot be
   reached or answers `503`/`501` (see Local API in AGENTS.md).

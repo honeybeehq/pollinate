@@ -18,6 +18,7 @@ import {
   type WebhookRoute,
 } from "./api-types.js";
 import type { PollCheck } from "./poll.js";
+import { redactHeaderValues } from "./redact.js";
 import { API_VERSION, readBuildInfo, type BuildInfo } from "./version.js";
 import type { DaemonConfig, Job, JobStatus, JsonValue, SourceKind, Trigger } from "./types.js";
 
@@ -271,7 +272,7 @@ export class ApiServer {
         consecutiveFailures: health[trigger.id]?.consecutiveFailures ?? 0,
         deliveries: trigger.lifecycle?.deliveries ?? 0,
       };
-      return { ...trigger, state };
+      return redactHeaderValues({ ...trigger, state });
     });
   }
 
@@ -303,7 +304,7 @@ export class ApiServer {
     };
     const applied = await this.host.applyTrigger(id, write, fetchedPoll);
     const loaded = this.host.trigger(id) ?? applied.stored;
-    const response: PutTriggerResponse = { trigger: loaded, created, loaded: true };
+    const response: PutTriggerResponse = { trigger: redactHeaderValues(loaded), created, loaded: true };
     if (loaded.source.kind === "schedule") response.schedule = { nextFireAt: loaded.enabled ? (this.host.scheduleState(id).nextFireAt ?? null) : null };
     const route = this.webhookRoute(loaded);
     if (route) response.webhook = route;
@@ -355,7 +356,7 @@ export class ApiServer {
         deliveryId: deliveryId ?? null,
       });
     }
-    return { job: fired.job };
+    return { job: redactHeaderValues(fired.job) };
   }
 
   private async listJobs(query: URLSearchParams): Promise<{ jobs: Job[] }> {
@@ -370,7 +371,7 @@ export class ApiServer {
       ...(triggerId ? { triggerId } : {}),
       last: limit,
     });
-    return { jobs };
+    return { jobs: redactHeaderValues(jobs) };
   }
 
   private async getJob(id: string): Promise<{ job: Job }> {
@@ -378,7 +379,7 @@ export class ApiServer {
       throw ambiguousOr(error);
     });
     if (!job) throw new ApiError("not_found", `no job "${id}"`);
-    return { job };
+    return { job: redactHeaderValues(job) };
   }
 
   private async cancelJob(id: string): Promise<{ job: Job }> {
@@ -386,7 +387,7 @@ export class ApiServer {
       if (error instanceof Error && error.message.startsWith("No job found")) throw new ApiError("not_found", `no job "${id}"`);
       throw ambiguousOr(error);
     });
-    return { job };
+    return { job: redactHeaderValues(job) };
   }
 
   private requireLoaded(id: string): Trigger {
