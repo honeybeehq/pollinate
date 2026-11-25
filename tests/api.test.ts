@@ -89,18 +89,21 @@ async function leaveStaleSocket(path: string): Promise<void> {
   await new Promise((resolve) => child.once("exit", resolve));
 }
 
-function slowDeliveryInit(daemon: PollinateDaemon, delayMs: () => number): { nextInit(): Promise<void> } {
-  const delivery = (daemon as unknown as { delivery: { init(triggers: unknown[]): Promise<void> } }).delivery;
+type InitWaiter = { triggerId: string; wake: () => void };
+
+function slowDeliveryInit(daemon: PollinateDaemon, delayMs: () => number): { nextInit(triggerId: string): Promise<void> } {
+  const delivery = (daemon as unknown as { delivery: { init(triggers: Array<{ id: string }>): Promise<void> } }).delivery;
   const init = delivery.init.bind(delivery);
-  let waiters: Array<() => void> = [];
+  let waiters: InitWaiter[] = [];
   delivery.init = async (triggers) => {
-    const entered = waiters;
-    waiters = [];
-    for (const wake of entered) wake();
+    const ids = new Set(triggers.map((trigger) => trigger.id));
+    const entered = waiters.filter((waiter) => ids.has(waiter.triggerId));
+    waiters = waiters.filter((waiter) => !entered.includes(waiter));
+    for (const waiter of entered) waiter.wake();
     await new Promise((resolve) => setTimeout(resolve, delayMs()));
     await init(triggers);
   };
-  return { nextInit: () => new Promise<void>((resolve) => waiters.push(resolve)) };
+  return { nextInit: (triggerId) => new Promise<void>((wake) => waiters.push({ triggerId, wake })) };
 }
 
 async function ledger(root: string): Promise<Array<Record<string, unknown>>> {
@@ -335,7 +338,7 @@ describe("local API v1", () => {
       async ({ socket, store, root, daemon }) => {
         const slow = slowDeliveryInit(daemon, () => 150);
         for (let round = 0; round < 3; round += 1) {
-          const reloading = slow.nextInit();
+          const reloading = slow.nextInit(`cli${round}`);
           await writeFile(join(root, "triggers", `cli${round}.toml`), webhookToml(`cli${round}`, `cli-${round}`));
           await reloading;
           const put = await call(socket, "PUT", `/v1/triggers/api${round}`, { toml: webhookToml(`api${round}`, `api-${round}`) });
