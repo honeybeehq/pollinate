@@ -98,7 +98,7 @@ triggerReloadMs = 1000
 ## Execution Profile
 
 Commands run by pollinate can use a configured shell and environment. This applies to
-poll command fetches, context command sources, and command/honeybee/hermes actions:
+poll command fetches, context command sources, and command/honeybee actions:
 
 ```toml
 [execution]
@@ -263,13 +263,18 @@ command = "echo auditing {{repo}} from {{trigger_id}}"
 timeout = "30s"
 ```
 
-Supported action kinds are `command`, `http`, `honeybee`, `hermes`, `emit`, and
-`sequence`.
+Supported action kinds are `command`, `http`, `honeybee`, `emit`, and
+`sequence`. Honeybee actions use the hive v2 grammar: `run = "spawn"`
+(`hive spawn <name> --agent <bee>`, then `hive send` for `message`),
+`run = "send"` (`hive send <target> <message>`) and `run = "kill"`
+(`hive stop <target>`). `pol add` and `pol create` refuse the removed kinds
+`hermes` and honeybee `run = "buz" | "comb" | "flow" | "loop"` and name the
+replacement; see `AGENTS.md` → "Action kinds".
 Supported delivery modes are `immediate`, `throttled`, `batched`, and `debounced`.
 
 `cwd` is a trigger-level default working directory for command-backed work. Poll
-command fetches, context command sources, command actions, Honeybee/Hermes CLI
-actions, and queued jobs inherit it unless a lower-level `cwd` is set.
+command fetches, context command sources, command actions, Honeybee actions,
+and queued jobs inherit it unless a lower-level `cwd` is set.
 
 ## Router Triggers
 
@@ -346,10 +351,7 @@ pollinate routers list
 ```
 
 Use `honeybee` `run = "send"` for activity that must wake the target bee and
-be handled as a normal prompt. `run = "buz"` is useful for addressed messaging,
-but queue/passive tiers depend on Hive buz delivery policy and daemon behavior;
-they are not a substitute for direct prompt delivery when the router is expected
-to make the bee react immediately. GitHub comments containing
+be handled as a normal prompt. GitHub comments containing
 `<!-- pollinate-router -->` are ignored by the `github-pr` router plugin; include
 that hidden marker in PR comments posted by router-controlled bees to avoid
 routing their own output back into the same target.
@@ -367,7 +369,7 @@ pollinate create repo-changed \
   --max-concurrent 2 \
   --action emit \
   --subject repo.changed \
-  --payload '{"repo":"{{repo}}"}' \
+  --payload '{{event}}' \
   --transform repo='$.repository.name'
 ```
 
